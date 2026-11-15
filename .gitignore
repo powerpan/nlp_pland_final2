@@ -1,0 +1,18 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.env
+.env.*
+!.env.example
+# runtime state (profiles, memories, workspaces) lives under PLAND_HOME, never in git
+.pland/
+eval_runs/
+.DS_Store
+.claude/
+# motion-styles video project: dependencies and renders
+pland-promo/node_modules/
+pland-promo/out/
+pland-promo/music/score.wav
+pland-promo/assets/score.m4a
