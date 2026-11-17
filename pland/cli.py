@@ -45,6 +45,17 @@ def cmd_chat(args) -> int:
         rt.shutdown()
 
 
+def cmd_serve(args) -> int:
+    import uvicorn
+
+    from .server.app import create_app
+
+    app = create_app()
+    console.print(f"PlanD web UI on http://{args.host}:{args.port}")
+    uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pland", description="PlanD")
     commands = parser.add_subparsers(dest="cmd", required=True)
@@ -52,6 +63,9 @@ def build_parser() -> argparse.ArgumentParser:
     chat.add_argument("-q", "--query")
     chat.add_argument("--session")
     chat.set_defaults(fn=cmd_chat)
+    serve = commands.add_parser("serve", help="Start the local Web UI")
+    serve.add_argument("--port", type=int, default=8765)
+    serve.set_defaults(fn=cmd_serve, host="127.0.0.1")
     return parser
 
 

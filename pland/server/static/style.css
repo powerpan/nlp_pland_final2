@@ -1,0 +1,10 @@
+:root { color-scheme: light dark; font: 1rem/1.45 system-ui, sans-serif; }
+body { max-width: 48rem; margin: auto; padding: 1rem; }
+.toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: .75rem; }
+button, select, input, textarea { font: inherit; }
+button { padding: .25em .6em; }
+#messages { list-style: none; padding: 0; }
+#messages li { border-block-start: 1px solid GrayText; padding: .6rem 0; }
+#messages p { white-space: pre-wrap; overflow-wrap: anywhere; margin: .25rem 0; }
+form { display: grid; justify-items: start; gap: .5rem; }
+textarea { box-sizing: border-box; width: 100%; }

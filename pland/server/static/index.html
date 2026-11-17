@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PlanD</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="app.js"></script>
+</head>
+<body>
+  <header><h1>PlanD</h1></header>
+  <main>
+    <section class="toolbar">
+      <label>Conversation <select id="chats"></select></label>
+      <button id="new-chat" type="button">New chat</button>
+    </section>
+    <p id="status" role="status"></p>
+    <ol id="messages" aria-label="Conversation transcript"></ol>
+    <form id="composer">
+      <label for="input">Message</label>
+      <textarea id="input" required rows="3"></textarea>
+      <button id="send" type="submit">Send</button>
+    </form>
+  </main>
+</body>
+</html>
