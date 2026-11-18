@@ -1,4 +1,4 @@
-"""SQLite persistence for profile transcripts, notes history and the run event log."""
+"""SQLite persistence for profile transcripts, memory, events and the model-call ledger."""
 
 from __future__ import annotations
 
@@ -30,6 +30,21 @@ CREATE TABLE IF NOT EXISTS messages (
     created REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
+CREATE TABLE IF NOT EXISTS experiences (
+    id TEXT PRIMARY KEY,
+    task TEXT NOT NULL,
+    outcome TEXT NOT NULL,                  -- success | partial | failure
+    summary TEXT NOT NULL,
+    lessons TEXT NOT NULL DEFAULT '[]',
+    procedure TEXT,
+    tags TEXT NOT NULL DEFAULT '[]',
+    session_id TEXT,
+    created REAL NOT NULL,
+    uses INTEGER NOT NULL DEFAULT 0,
+    helpful INTEGER NOT NULL DEFAULT 0,
+    unhelpful INTEGER NOT NULL DEFAULT 0,
+    last_used REAL
+);
 CREATE TABLE IF NOT EXISTS memory_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,
@@ -52,6 +67,23 @@ CREATE TABLE IF NOT EXISTS events (
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
+CREATE TABLE IF NOT EXISTS llm_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    root_run TEXT NOT NULL,
+    run_id TEXT,
+    profile TEXT,
+    session_id TEXT,
+    purpose TEXT NOT NULL,                  -- turn | reflection | compaction | wrapup
+    model TEXT,
+    prompt_tokens INTEGER NOT NULL,
+    cached_tokens INTEGER NOT NULL,
+    completion_tokens INTEGER NOT NULL,
+    duration REAL NOT NULL,
+    ok INTEGER NOT NULL,
+    error TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_llm_calls_root ON llm_calls(root_run);
 """
 
 

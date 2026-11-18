@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ..memory import MemoryError_, NotesMemory, SkillStore
+from ..memory import ExperienceStore, MemoryError_, NotesMemory, SkillStore
 from .registry import ToolContext, ToolError, obj, tool
 
 
@@ -36,6 +36,22 @@ def memory_tool(ctx: ToolContext, a):
         raise ToolError(str(exc))
     ctx.emit("memory.changed", store=target, action=action)
     return msg
+
+
+@tool(
+    "recall_experience",
+    "Search your past task experiences (successes, failures, lessons, procedures) for something relevant to a query.",
+    obj({"query": {"type": "string"}, "k": {"type": "integer", "minimum": 1, "maximum": 8}}, ["query"]),
+    "memory",
+)
+def recall_experience(ctx: ToolContext, a):
+    store = ExperienceStore(ctx.profile)
+    hits = store.search(a["query"], int(a.get("k") or 4), min_coverage=0.15)
+    if not hits:
+        return "No relevant past experience."
+    store.mark_used([e.id for e, _ in hits], ctx.session_id)
+    ctx.agent.used_experience_ids.update(e.id for e, _ in hits)
+    return "\n\n".join(f"(score {s}) {e.render()}" for e, s in hits)
 
 
 @tool(
