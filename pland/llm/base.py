@@ -39,12 +39,27 @@ class ToolCall:
 class Usage:
     prompt_tokens: int = 0
     completion_tokens: int = 0
-    cached_tokens: int = 0
+    cached_tokens: int = 0  # prompt tokens served from DeepSeek's prefix cache
+    calls: int = 0
 
     def add(self, other: "Usage") -> None:
         self.prompt_tokens += other.prompt_tokens
         self.completion_tokens += other.completion_tokens
         self.cached_tokens += other.cached_tokens
+        self.calls += other.calls
+
+    @property
+    def weighted_tokens(self) -> float:
+        """Budget accounting: cache hits count as 0.1 token (they cost ~2% of a miss)."""
+        miss = max(0, self.prompt_tokens - self.cached_tokens)
+        return miss + 0.1 * self.cached_tokens + self.completion_tokens
+
+    @property
+    def cost_usd(self) -> float:
+        """Estimate at DeepSeek list prices used in the project guide (per 1M tokens: hit $0.006,
+        miss $0.30, output $1.20). Check the official price page for current numbers."""
+        miss = max(0, self.prompt_tokens - self.cached_tokens)
+        return (self.cached_tokens * 0.006 + miss * 0.30 + self.completion_tokens * 1.20) / 1_000_000
 
 
 @dataclass
@@ -78,4 +93,5 @@ class LLMClient(Protocol):
         *,
         json_mode: bool = False,
         max_tokens: int | None = None,
+        temperature: float | None = None,
     ) -> LLMResponse: ...

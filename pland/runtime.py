@@ -6,6 +6,7 @@ import threading
 from pathlib import Path
 from typing import Any, Callable
 
+from .budget import Ledger
 from .config import AgentSettings, pland_home
 from .events import EventBus
 from .hitl import HITLChannel, NoHumanHITL
@@ -22,6 +23,7 @@ class Runtime:
         self.profiles = ProfileManager(self.root)
         self.shared = shared_db(self.root)
         self.bus = EventBus(self.shared)
+        self.ledger = Ledger(self.shared)
         self.default_hitl: HITLChannel = hitl or NoHumanHITL()
         self._locks: dict[tuple[str, str], threading.Lock] = {}
         self._locks_guard = threading.Lock()

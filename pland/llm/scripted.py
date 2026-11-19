@@ -46,7 +46,7 @@ class ScriptedLLM:
         self.total_usage = Usage()
         self.calls = 0
 
-    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None) -> LLMResponse:
+    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None, temperature=None) -> LLMResponse:
         with self._lock:
             self.requests.append({"messages": [dict(m) for m in messages], "tools": tools, "json_mode": json_mode})
             self.calls += 1

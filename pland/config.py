@@ -111,10 +111,10 @@ class ModelConfig:
     # and a profile can turn it on (`model.thinking: true`) for planning-heavy bots.
     thinking: bool = False
     reasoning_effort: str | None = None
-    temperature: float | None = 0.3
+    temperature: float | None = 0.0  # used only with thinking disabled
     max_tokens: int | None = 8192
-    timeout: float = 180.0
-    max_retries: int = 4
+    timeout: float = 300.0
+    max_retries: int = 3
 
     def resolved(self) -> "ModelConfig":
         load_dotenv()
@@ -150,6 +150,10 @@ class ApprovalConfig:
 @dataclass
 class SandboxConfig:
     backend: str = "local"  # local | docker
+    # OS-level confinement of the local backend: "auto" uses macOS Seatbelt (sandbox-exec) when
+    # available — file reads/writes limited to the workspace (+ room shared folder) and the
+    # toolchain; "off" runs commands with the full rights of the OS user.
+    os_sandbox: str = "auto"
     command_timeout: float = 120.0
     max_output_chars: int = 20000
     docker_image: str = "python:3.11-slim"
@@ -164,7 +168,12 @@ class AgentSettings:
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     max_iterations: int = 40
-    toolsets: list[str] = field(default_factory=lambda: ["files", "code", "memory"])
+    toolsets: list[str] = field(default_factory=lambda: ["files", "code", "web", "git", "memory", "plan"])
+    reflection: bool = True
+    experience_top_k: int = 3
+    # Per run. Cache hits count 0.1 token.
+    max_run_calls: int = 120
+    max_run_tokens: int = 3_000_000
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "AgentSettings":

@@ -56,6 +56,29 @@ def cmd_serve(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    from .config import ModelConfig, default_provider, pland_home
+    from .llm.guard import ForbiddenProviderError, check_endpoint
+    from .sandbox import DockerBackend
+
+    cfg = ModelConfig(provider=default_provider()).resolved()
+    console.print(f"PLAND_HOME      {pland_home()}")
+    console.print(f"provider        {cfg.provider}  model={cfg.model}  base_url={cfg.base_url}")
+    console.print(f"api key         {'set' if cfg.api_key else '[red]MISSING[/] (add it to .env)'}")
+    try:
+        check_endpoint(cfg.provider, cfg.base_url)
+        console.print("provider guard  [green]ok[/] (only DeepSeek/HKGAI endpoints are allowed)")
+    except ForbiddenProviderError as exc:
+        console.print(f"provider guard  [red]{exc}[/]")
+    console.print(f"docker          {'[green]available[/]' if DockerBackend.available() else 'not available (local backend only)'}")
+    if args.probe:
+        from .probe import run_probe
+
+        ok = run_probe(console)
+        return 0 if ok else 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pland", description="PlanD")
     commands = parser.add_subparsers(dest="cmd", required=True)
@@ -66,6 +89,9 @@ def build_parser() -> argparse.ArgumentParser:
     serve = commands.add_parser("serve", help="Start the local Web UI")
     serve.add_argument("--port", type=int, default=8765)
     serve.set_defaults(fn=cmd_serve, host="127.0.0.1")
+    doctor = commands.add_parser("doctor", help="Check provider and sandbox configuration")
+    doctor.add_argument("--probe", action="store_true")
+    doctor.set_defaults(fn=cmd_doctor)
     return parser
 
 

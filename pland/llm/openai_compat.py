@@ -18,7 +18,9 @@ from ..config import ModelConfig
 from .base import LLMError, LLMResponse, ToolCall, Usage
 from .guard import check_endpoint
 
-_RETRY_STATUS = {408, 409, 429, 500, 502, 503, 504}
+# Per the project's DeepSeek guide: retry only transient failures (429, 5xx, timeouts) with 1/2/4 s
+# backoff, at most 3 times; 400/401/402/403 fail immediately.
+_RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 
 
 class OpenAICompatClient:
@@ -40,7 +42,7 @@ class OpenAICompatClient:
         self.total_usage = Usage()
         self.calls = 0
 
-    def _payload(self, messages, tools, json_mode, max_tokens) -> dict[str, Any]:
+    def _payload(self, messages, tools, json_mode, max_tokens, temperature=None) -> dict[str, Any]:
         cfg = self.cfg
         payload: dict[str, Any] = {
             "model": cfg.model,
@@ -57,12 +59,13 @@ class OpenAICompatClient:
             payload["thinking"] = {"type": "enabled" if cfg.thinking else "disabled"}
             if cfg.thinking and cfg.reasoning_effort:
                 payload["reasoning_effort"] = cfg.reasoning_effort
-        if cfg.temperature is not None and not cfg.thinking:
-            payload["temperature"] = cfg.temperature
+        temp = cfg.temperature if temperature is None else temperature
+        if not cfg.thinking and temp is not None:
+            payload["temperature"] = temp
         return payload
 
-    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None) -> LLMResponse:
-        payload = self._payload(messages, tools, json_mode, max_tokens)
+    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None, temperature=None) -> LLMResponse:
+        payload = self._payload(messages, tools, json_mode, max_tokens, temperature)
         headers = {"Authorization": f"Bearer {self.cfg.api_key}", "Content-Type": "application/json"}
         last_err: Exception | None = None
         for attempt in range(self.cfg.max_retries + 1):
@@ -81,7 +84,7 @@ class OpenAICompatClient:
                 if not retryable:
                     raise last_err
             if attempt < self.cfg.max_retries:
-                time.sleep(min(30.0, (2 ** attempt) + random.random()))
+                time.sleep((2 ** attempt) + random.random() * 0.25)
         assert last_err is not None
         raise last_err
 
@@ -103,6 +106,7 @@ class OpenAICompatClient:
             completion_tokens=int(u.get("completion_tokens") or 0),
             cached_tokens=int(u.get("prompt_cache_hit_tokens") or (u.get("prompt_tokens_details") or {}).get("cached_tokens") or 0),
         )
+        usage.calls = 1
         with self._lock:
             self.total_usage.add(usage)
             self.calls += 1

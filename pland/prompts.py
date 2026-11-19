@@ -17,6 +17,7 @@ WORK_RULES = """\
 # How you work
 - Use available tools to do the task. Verify your work before claiming success.
 - Relative file paths resolve inside your private workspace.
+- Use todo to plan tasks with three or more steps.
 - If an essential detail is missing, explain what you need from the user.
 - In your final answer, summarize your result, give evidence, and state what remains open.
 """
@@ -26,7 +27,8 @@ MEMORY_RULES = """\
 # Memory
 You keep bounded personal notes (shown below as a snapshot taken at session start). Use the `memory` tool to save
 durable facts: user preferences, environment details, conventions, and lessons that will matter in future tasks.
-Do not save one-off task details.
+Do not save one-off task details or paths inside your workspace. Relevant past experiences may be attached to a
+task; apply their lessons.
 Save a skill (skill_save) when you work out a reusable multi-step procedure.
 """
 
@@ -47,6 +49,9 @@ def build_system_prompt(profile: "Profile", *,
         + (" (commands run inside an isolated container; /workspace is your workspace)" if backend_name == "docker" else ""),
         f"- Your private workspace: {ws}",
     ]
+    if platform.system() == "Darwin" and backend_name != "docker":
+        env.append("- Shell is macOS (BSD userland): `sed -i ''`, no GNU `timeout`/`cat -A`; use `python3` for portable "
+                   "scripting. Python 3 with pytest is on PATH.")
     parts.append("\n".join(env))
     parts.append(WORK_RULES)
     tool_names = tool_names or set()
@@ -55,7 +60,8 @@ def build_system_prompt(profile: "Profile", *,
         parts.append(MEMORY_RULES + "\n" + notes.render())
         skills = SkillStore(profile).list()
         if skills:
-            parts.append("# Your skills (read with skill_view)\n" + "\n".join(f"- {s['name']}: {s['description']}" for s in skills))
+            parts.append("# Your skills (read the relevant one with skill_view before starting a matching task)\n"
+                         + "\n".join(f"- {s['name']}: {s['description']}" for s in skills))
     if extra:
         parts.append(extra)
     return "\n\n".join(p for p in parts if p)
