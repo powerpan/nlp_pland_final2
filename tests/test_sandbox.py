@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from pland.config import SandboxConfig
-from pland.sandbox import LocalBackend, PathPolicy, PolicyError, check_command, scan_python
+from pland.sandbox import DockerBackend, LocalBackend, PathPolicy, PolicyError, check_command, scan_python
 
 
 def test_path_policy_blocks_escape_and_symlinks(tmp_path):
@@ -62,3 +64,20 @@ def test_local_backend_scrubs_secrets_and_times_out(tmp_path, monkeypatch):
     assert r.timed_out
     r = b.run_python("import os; print(os.environ.get('DEEPSEEK_API_KEY'))", tmp_path)
     assert r.stdout.strip() == "None"
+
+
+@pytest.mark.skipif(not DockerBackend.available() or os.environ.get("PLAND_SKIP_DOCKER"), reason="docker not available")
+def test_docker_backend_isolation(tmp_path):
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    (ws / "in.txt").write_text("data")
+    b = DockerBackend(SandboxConfig(backend="docker", docker_network="none"), "pytest", ws)
+    try:
+        r = b.run("cat in.txt && echo out > out.txt && ls /Users /home/remote 2>&1 | head -1", ws)
+        assert r.exit_code == 0 and r.stdout.startswith("data")
+        assert "No such file" in r.stdout
+        assert (ws / "out.txt").read_text().strip() == "out"
+        r = b.run_python("import urllib.request\ntry:\n    urllib.request.urlopen('http://1.1.1.1', timeout=3)\n    print('net')\nexcept Exception:\n    print('nonet')", ws)
+        assert r.stdout.strip() == "nonet"
+    finally:
+        b.shutdown()

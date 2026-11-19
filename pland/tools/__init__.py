@@ -1,12 +1,14 @@
-"""Built-in file, code, and memory tools."""
+"""Built-in tools. Toolsets: files, code, web, git, memory, plan, hitl."""
 
-_loaded = False
+from importlib import import_module
+from importlib.util import find_spec
 
 
 def load_builtin_tools() -> None:
-    global _loaded
-    if _loaded:
-        return
-    from . import code, files, memory_tools  # noqa: F401  (registration side effects)
+    from . import code, files, git, memory_tools, web  # noqa: F401  (registration side effects)
 
-    _loaded = True
+    # These modules become available as subsequent packages are applied.
+    for name in ('plan', 'hitl_tools'):
+        module = f"{__package__}.{name}"
+        if find_spec(module) is not None:
+            import_module(module)

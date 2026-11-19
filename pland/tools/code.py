@@ -6,7 +6,28 @@ from ..sandbox import check_command, scan_python
 from .registry import ToolContext, ToolError, obj, tool
 
 
+def _link_room_shared(ctx: ToolContext) -> None:
+    """Make `shared/` usable from shell commands too: in a room context the workspace gets a `shared`
+    symlink to the room's shared folder (re-pointed if the agent last worked in another room). File tools
+    only follow it while the room context is active; outside it the link resolves outside the allowed roots."""
+    shared = ctx.mounts.get("shared")
+    if shared is None or ctx.backend.isolated:
+        return
+    link = ctx.workspace / "shared"
+    try:
+        if link.is_symlink():
+            if link.resolve() == shared.resolve():
+                return
+            link.unlink()
+        elif link.exists():
+            return  # a real folder named shared/ exists: leave the agent's data alone
+        link.symlink_to(shared.resolve(), target_is_directory=True)
+    except OSError:
+        pass
+
+
 def _cwd(ctx: ToolContext, raw: str | None):
+    _link_room_shared(ctx)
     path = ctx.paths.resolve(raw or ".")
     if not path.is_dir():
         raise ToolError(f"cwd {raw!r} is not a directory")

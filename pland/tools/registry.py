@@ -94,8 +94,48 @@ def select_tools(toolsets: list[str], exclude: set[str] | None = None) -> list[T
     return [t for t in TOOLS.values() if t.toolset in toolsets and t.name not in exclude]
 
 
+_COERCE = {"integer": int, "number": float}
+
+
+def validate_args(schema: dict[str, Any], args: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Model-produced arguments are untrusted: drop unknown keys, coerce scalar types, enforce required."""
+    props = schema.get("properties", {})
+    notes: list[str] = []
+    clean: dict[str, Any] = {}
+    for key, val in args.items():
+        spec = props.get(key)
+        if spec is None:
+            notes.append(f"ignored unknown argument '{key}'")
+            continue
+        typ = spec.get("type")
+        if typ in _COERCE and isinstance(val, str):
+            try:
+                val = _COERCE[typ](val.strip())
+            except ValueError:
+                raise ToolError(f"argument '{key}' must be a {typ}")
+        elif typ == "boolean" and isinstance(val, str):
+            val = val.strip().lower() in {"true", "1", "yes"}
+        elif typ == "array" and isinstance(val, str):
+            try:
+                parsed = json.loads(val)
+                val = parsed if isinstance(parsed, list) else [val]
+            except json.JSONDecodeError:
+                val = [val]
+        elif typ == "string" and val is not None and not isinstance(val, str):
+            val = json.dumps(val, ensure_ascii=False) if isinstance(val, (dict, list)) else str(val)
+        if "enum" in spec and val not in spec["enum"]:
+            raise ToolError(f"argument '{key}' must be one of {spec['enum']}")
+        clean[key] = val
+    missing = [k for k in schema.get("required", []) if clean.get(k) in (None, "")]
+    if missing:
+        raise ToolError(f"missing required argument(s): {', '.join(missing)}")
+    return clean, notes
+
+
 def execute(t: Tool, ctx: ToolContext, args: dict[str, Any]) -> str:
+    notes: list[str] = []
     try:
+        args, notes = validate_args(t.parameters, args)
         result = t.handler(ctx, args)
     except ToolError as exc:
         return f"ERROR: {exc}"
@@ -106,6 +146,5 @@ def execute(t: Tool, ctx: ToolContext, args: dict[str, Any]) -> str:
     except Exception as exc:  # unexpected bug inside a tool: report it to the model, keep the run alive
         tb = traceback.format_exc(limit=3)
         return f"ERROR: tool '{t.name}' crashed: {type(exc).__name__}: {exc}\n{tb}"
-    if isinstance(result, str):
-        return result
-    return json.dumps(result, ensure_ascii=False, indent=1, default=str)
+    text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False, indent=1, default=str)
+    return ("NOTE: " + "; ".join(notes) + "\n" + text) if notes else text

@@ -1,15 +1,24 @@
-"""Host execution backend with a filtered environment and timeout.
+"""Execution backends for shell commands and Python code.
 
-This backend is not an operating-system sandbox. Use it for trusted local work.
+* `LocalBackend` runs on the host inside the profile's workspace with a scrubbed environment,
+  a wall-clock timeout, process-group kill and POSIX resource limits. It is NOT an OS sandbox: a
+  process can still read files the OS user can read. Dangerous commands therefore go through the
+  approval layer first.
+* `DockerBackend` runs inside one long-lived, hardened container per profile (all capabilities
+  dropped, no-new-privileges, pids/memory/cpu limits, optional `--network none`), with only that
+  profile's workspace (and, in a room, the room's shared folder) bind-mounted. The container is the
+  security boundary here.
 """
 
 from __future__ import annotations
 
+import hashlib
 import os
 import shlex
 import signal
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +65,10 @@ def scrub_env(extra: dict[str, str] | None = None) -> dict[str, str]:
         elif any(h in k.upper() for h in _SECRET_HINTS):
             continue
     env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    # Put the platform's own Python (3.10+, with pytest) first so `python3`/`pytest` work out of the box.
+    py_bin = str(Path(sys.executable).parent)
+    env["PATH"] = py_bin + os.pathsep + env["PATH"]
+    env.pop("VIRTUAL_ENV", None)
     env["PYTHONUNBUFFERED"] = "1"
     env["PYTHONDONTWRITEBYTECODE"] = "1"
     env["GIT_TERMINAL_PROMPT"] = "0"
@@ -129,9 +142,109 @@ class LocalBackend(Backend):
         return self._exec([self.python, "-I", "-"], cwd, timeout or self.cfg.command_timeout, scrub_env(), stdin=code)
 
 
+class DockerBackend(Backend):
+    name = "docker"
+    isolated = True
+
+    def __init__(self, cfg: SandboxConfig, profile_name: str, workspace: Path):
+        self.cfg = cfg
+        self.profile_name = profile_name
+        self.workspace = workspace.resolve()
+        self._lock = threading.Lock()
+        self._containers: dict[str, str] = {}
+
+    @staticmethod
+    def available() -> bool:
+        try:
+            r = subprocess.run(["docker", "info", "--format", "{{.ServerVersion}}"], capture_output=True, text=True, timeout=15)
+            return r.returncode == 0
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+
+    def _container_for(self, mounts: dict[str, Path] | None) -> str:
+        key = "|".join(f"{k}={v}" for k, v in sorted((mounts or {}).items()))
+        with self._lock:
+            name = self._containers.get(key)
+            if name and self._alive(name):
+                return name
+            # Keep each profile workspace and mount set in its own container.
+            ident = f"{self.workspace}|{key}"
+            suffix = int(hashlib.sha1(ident.encode()).hexdigest()[:6], 16)
+            name = f"pland-{self.profile_name}-{suffix}"
+            subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+            argv = [
+                "docker", "run", "-d", "--name", name,
+                "--label", "pland=1",
+                "--cap-drop", "ALL",
+                "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
+                "--security-opt", "no-new-privileges",
+                "--pids-limit", "256",
+                "--memory", self.cfg.docker_memory,
+                "--cpus", self.cfg.docker_cpus,
+                "--network", self.cfg.docker_network,
+                "--tmpfs", "/tmp:rw,nosuid,size=512m",
+                "-v", f"{self.workspace}:/workspace",
+                "-w", "/workspace",
+            ]
+            for alias, path in (mounts or {}).items():
+                # nested mount: the room's shared folder appears as ./shared inside the workspace
+                argv += ["-v", f"{path.resolve()}:/workspace/{alias}"]
+            argv += [self.cfg.docker_image, "sleep", "infinity"]
+            r = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                raise RuntimeError(f"failed to start sandbox container: {r.stderr.strip()[:500]}")
+            self._containers[key] = name
+            return name
+
+    @staticmethod
+    def _alive(name: str) -> bool:
+        r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", name], capture_output=True, text=True)
+        return r.returncode == 0 and r.stdout.strip() == "true"
+
+    def _container_cwd(self, cwd: Path, mounts: dict[str, Path] | None) -> str:
+        cwd = cwd.resolve()
+        if cwd == self.workspace or self.workspace in cwd.parents:
+            return "/workspace/" + cwd.relative_to(self.workspace).as_posix()
+        for alias, path in (mounts or {}).items():
+            path = path.resolve()
+            if cwd == path or path in cwd.parents:
+                return f"/workspace/{alias}/" + cwd.relative_to(path).as_posix()
+        return "/workspace"
+
+    def _exec(self, argv: list[str], timeout: float, stdin: str | None = None) -> ExecResult:
+        start = time.time()
+        try:
+            r = subprocess.run(argv, input=stdin, capture_output=True, text=True, errors="replace", timeout=timeout)
+            return ExecResult(r.returncode, r.stdout, r.stderr, False, time.time() - start)
+        except subprocess.TimeoutExpired as exc:
+            return ExecResult(-9, (exc.stdout or "") if isinstance(exc.stdout, str) else "",
+                              f"[killed after {timeout:.0f}s timeout]", True, time.time() - start)
+
+    def run(self, command, cwd, *, timeout=None, env=None, mounts=None) -> ExecResult:
+        name = self._container_for(mounts)
+        argv = ["docker", "exec", "-w", self._container_cwd(cwd, mounts)]
+        for k, v in (env or {}).items():
+            argv += ["-e", f"{k}={v}"]
+        argv += [name, "bash", "-c", command]
+        return self._exec(argv, timeout or self.cfg.command_timeout)
+
+    def run_python(self, code, cwd, *, timeout=None, mounts=None) -> ExecResult:
+        name = self._container_for(mounts)
+        argv = ["docker", "exec", "-i", "-w", self._container_cwd(cwd, mounts), name, "python", "-"]
+        return self._exec(argv, timeout or self.cfg.command_timeout, stdin=code)
+
+    def shutdown(self) -> None:
+        with self._lock:
+            for name in self._containers.values():
+                subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
+            self._containers.clear()
+
+
 def make_backend(cfg: SandboxConfig, profile_name: str, workspace: Path) -> Backend:
+    if cfg.backend == "docker":
+        return DockerBackend(cfg, profile_name, workspace)
     if cfg.backend != "local":
-        raise ValueError("this stage supports only the local backend")
+        raise ValueError(f"unknown sandbox backend {cfg.backend!r} (use local or docker)")
     return LocalBackend(cfg)
 
 
