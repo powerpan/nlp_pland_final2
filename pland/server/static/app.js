@@ -29,6 +29,7 @@ function report(error) {
 
 function switchChat(next) {
   session = next;
+  $('stop').disabled = true;
   $('send').disabled = !session;
   status.textContent = '';
   $('messages').replaceChildren();
@@ -50,6 +51,8 @@ async function refresh() {
     return row;
   });
   $('messages').replaceChildren(...nodes);
+  $('stop').disabled = !data.busy;
+  refreshModelStatus().catch(() => {});
   status.textContent = data.busy ? 'Agent is working…' : '';
   $('send').disabled = data.busy;
   clearTimeout(timer);
@@ -85,4 +88,59 @@ $('composer').addEventListener('submit', async (event) => {
   } catch (error) { report(error); }
 });
 
-loadChats().catch(report);
+const bots = $('bots');
+const profilePath = () => `/api/profiles/${encodeURIComponent(profile)}`;
+
+async function loadBots(preferred = profile) {
+  const rows = await api('GET', '/api/profiles');
+  bots.replaceChildren(...rows.map(({name, title}) => new Option(title, name)));
+  if (rows.some(({name}) => name === preferred)) bots.value = preferred;
+  profile = bots.value;
+  $('remove-bot').disabled = profile === 'default';
+  switchChat(undefined);
+  await loadChats();
+}
+
+async function refreshModelStatus() {
+  const [config, usage] = await Promise.all([api('GET', '/api/status'), api('GET', '/api/usage')]);
+  $('provider').textContent = [config.provider, config.model, config.api_key_set ? 'Key set' : 'Key missing',
+    `${usage.calls ?? 0} model calls`].filter(Boolean).join(' · ');
+}
+
+function on(id, action) {
+  $(id).addEventListener('click', () => action().catch(report));
+}
+
+bots.addEventListener('change', () => loadBots(bots.value).catch(report));
+on('new-bot', async () => {
+  const title = window.prompt('Bot title')?.trim();
+  if (!title) return;
+  const bot = await api('POST', '/api/profiles', {title});
+  await loadBots(bot.name);
+});
+on('rename-bot', async () => {
+  const title = window.prompt('Bot title', bots.selectedOptions[0].text)?.trim();
+  if (!title) return;
+  await api('PATCH', profilePath(), {title});
+  await loadBots();
+});
+on('remove-bot', async () => {
+  if (!window.confirm('Remove this bot and its saved state?')) return;
+  await api('DELETE', profilePath());
+  await loadBots('default');
+});
+on('bot-chat', async () => {
+  const path = profilePath();
+  const data = await api('GET', `${path}/bot-chat`);
+  if (profilePath() !== path) return;
+  if (![...chats.options].some(({value}) => value === data.session_id)) {
+    chats.add(new Option('Bot Chat', data.session_id));
+  }
+  chats.value = data.session_id;
+  switchChat(data.session_id);
+});
+on('stop', async () => {
+  if (session) await api('POST', route(`/${encodeURIComponent(session)}/stop`));
+});
+loadBots().catch(report);
+refreshModelStatus().catch(report);

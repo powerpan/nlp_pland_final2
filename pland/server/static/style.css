@@ -8,3 +8,5 @@ button { padding: .25em .6em; }
 #messages p { white-space: pre-wrap; overflow-wrap: anywhere; margin: .25rem 0; }
 form { display: grid; justify-items: start; gap: .5rem; }
 textarea { box-sizing: border-box; width: 100%; }
+.toolbar + .toolbar { margin-block-start: .75rem; }
+#provider, #status { color: GrayText; }

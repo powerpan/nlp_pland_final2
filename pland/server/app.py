@@ -14,7 +14,8 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
 from .. import __version__
-from ..config import load_dotenv
+from ..config import ModelConfig, default_provider, load_dotenv
+from ..profiles import slugify
 from ..runtime import Runtime
 from ..sessions import SessionStore
 
@@ -166,6 +167,33 @@ def display_items(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return items
 
 
+class ProfileIn(BaseModel):
+    name: str | None = None
+    title: str | None = None
+    description: str = ""
+    soul: str | None = None
+    bot: bool = True
+    model: str | None = None
+    thinking: bool | None = None
+    backend: str | None = None
+    toolsets: list[str] | None = None
+    clone_from: str | None = None
+    avatar: str | None = None
+
+class ProfilePatch(BaseModel):
+    title: str | None = None
+    description: str | None = None
+    soul: str | None = None
+    bot: bool | None = None
+    avatar: str | None = None
+    model: str | None = None
+    thinking: bool | None = None
+    backend: str | None = None
+    toolsets: list[str] | None = None
+    approvals: str | None = None
+    max_iterations: int | None = None
+
+
 def create_app(runtime: Runtime | None = None) -> FastAPI:
     load_dotenv()
     rt = runtime or Runtime()
@@ -191,13 +219,11 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     def profile(name):
-        if name != "default":
-            raise HTTPException(404, "unknown profile")
-        return rt.profiles.get("default")
+        return rt.profiles.get(name)
 
     @app.get("/api/profiles/{name}/sessions")
     def list_sessions(name: str):
-        return [session.to_dict() for session in SessionStore(profile(name)).list(kinds=("chat",))]
+        return [session.to_dict() for session in SessionStore(profile(name)).list(kinds=("chat", "bot_chat"))]
 
     @app.post("/api/profiles/{name}/sessions", status_code=201)
     def create_session(name: str, body: SessionIn):
@@ -243,6 +269,57 @@ def create_app(runtime: Runtime | None = None) -> FastAPI:
         if not session.title:
             store.update(sid, title=" ".join(text.split())[:60])
         return {"accepted": True, "profile": name, "session_id": sid}
+
+    @app.get("/api/status")
+    def status():
+        provider = default_provider()
+        cfg = ModelConfig(provider=provider).resolved()
+        return {"provider": provider, "model": cfg.model, "api_key_set": bool(cfg.api_key)}
+
+    @app.get("/api/usage")
+    def usage():
+        return rt.ledger.totals()
+
+    @app.get("/api/profiles")
+    def list_profiles():
+        return [prof.summary() for prof in rt.profiles.list()]
+
+    @app.post("/api/profiles", status_code=201)
+    def create_profile(body: ProfileIn):
+        title = (body.title or body.name or "").strip()
+        name = (body.name or slugify(title)).strip()
+        if not title or not name:
+            raise HTTPException(400, "name or title is required")
+        if rt.profiles.exists(name):
+            raise HTTPException(409, "profile already exists")
+        return rt.profiles.create(name, title=title, description=body.description, bot=True).summary()
+
+    @app.patch("/api/profiles/{name}")
+    def patch_profile(name: str, body: ProfilePatch):
+        profile(name)
+        changes = body.model_dump(include={"title", "description"}, exclude_none=True)
+        return rt.profiles.update(name, **changes).summary()
+
+    @app.delete("/api/profiles/{name}")
+    def delete_profile(name: str):
+        profile(name)
+        with guard:
+            if name == "default" or any(bot == name for bot, _ in active):
+                raise HTTPException(409, "cannot remove this profile now")
+        rt.profiles.delete(name)
+        return {"deleted": name}
+
+    @app.post("/api/profiles/{name}/sessions/{sid}/stop")
+    def stop_session(name: str, sid: str):
+        SessionStore(profile(name)).get(sid)
+        rt.cancel(name, sid)
+        return {"stopping": True}
+
+    @app.get("/api/profiles/{name}/bot-chat")
+    def bot_chat(name: str):
+        prof = profile(name)
+        sid = prof.canonical_chat_id()
+        return {"session_id": sid}
 
     app.mount("/", StaticFiles(directory=STATIC_DIR, html=True), name="ui")
     return app

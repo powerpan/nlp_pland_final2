@@ -8,11 +8,19 @@
   <script defer src="app.js"></script>
 </head>
 <body>
-  <header><h1>PlanD</h1></header>
+  <header><h1>PlanD</h1><p id="provider" role="status"></p></header>
   <main>
+    <section class="toolbar" aria-label="Bot management">
+      <label>Bot <select id="bots"></select></label>
+      <button id="new-bot" type="button">New bot</button>
+      <button id="rename-bot" type="button">Rename bot</button>
+      <button id="remove-bot" type="button">Remove bot</button>
+    </section>
     <section class="toolbar">
       <label>Conversation <select id="chats"></select></label>
       <button id="new-chat" type="button">New chat</button>
+      <button id="bot-chat" type="button">Bot Chat</button>
+      <button id="stop" type="button" disabled>Stop</button>
     </section>
     <p id="status" role="status"></p>
     <ol id="messages" aria-label="Conversation transcript"></ol>
