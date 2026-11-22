@@ -1,8 +1,9 @@
-"""Single-agent tool loop with planning, per-run budgets, and experience retrieval."""
+"""Single-agent tool loop with resumable sessions and background reflection."""
 
 from __future__ import annotations
 
 import json
+import os
 import time
 import traceback
 from dataclasses import dataclass, field
@@ -83,6 +84,7 @@ class Agent:
         self.profile = profile
         self.session_id = session_id
         self.hitl = hitl or runtime.default_hitl
+        self.role = "main"
         self.settings = settings or profile.settings()
         self.sessions = SessionStore(profile)
         self.system_extra = system_extra
@@ -218,7 +220,7 @@ class Agent:
                 f"{block}\n</relevant_past_experience>"), ids
 
     # ------------------------------------------------------------------ main loop
-    def run(self, text: str, *, meta: dict[str, Any] | None = None,
+    def run(self, text: str | None, *, meta: dict[str, Any] | None = None,
             max_iterations: int | None = None) -> RunResult:
         self.run_id = new_id("r_")
         start = time.time()
@@ -236,13 +238,18 @@ class Agent:
         final_text = ""
         status = "completed"
         error = None
+        task_text = text or ""
         try:
+            self.sessions.patch_meta(self.session_id, {"pid": os.getpid()})
             self.sessions.update(self.session_id, status="running")
             self._ensure_system()
-            self.emit("run.started", text=text[:2000])
-            content, _ = self._with_experience(text)
-            self.sessions.append(self.session_id, {"role": "user", "content": content},
-                                 meta={"display": text, **(meta or {})})
+            self.emit("run.started", text=(text or "")[:2000])
+            if text is not None:
+                content, _ = self._with_experience(text)
+                self.sessions.append(self.session_id, {"role": "user", "content": content},
+                                     meta={"display": text, **(meta or {})})
+            else:
+                task_text = self._last_user_text()
             iterations, tool_calls, final_text, status = self._loop(usage, max_iterations or self.settings.max_iterations)
         except Cancelled:
             status, final_text = "cancelled", "(stopped by user)"
@@ -273,16 +280,47 @@ class Agent:
         result = RunResult(self.run_id, self.session_id, self.profile.name, status, final_text, iterations, tool_calls,
                            time.time() - start, usage, error, budget=self.budget.snapshot())
         trivial = final_text.strip().lower().strip(" .") in {"[pass]", "pass", "[silent]"}
-        if self.reflect_enabled and status != "cancelled" and text.strip() and not trivial:
-            try:
-                from .reflection import reflect
-
-                result.experience_ids = reflect(self, text, result)
-            except Exception as exc:  # reflection must never break the task result
-                self.emit("reflection.failed", error=str(exc))
         self.emit("run.finished", status=status, text=final_text[:4000], iterations=iterations, tool_calls=tool_calls,
                   duration=round(result.duration, 2), error=error)
+        if self.reflect_enabled and status != "cancelled" and task_text.strip() and not trivial:
+            snapshot = self._llm_messages()  # reflect on this run only, even if the session moves on
+
+            def _reflect() -> None:
+                try:
+                    from .reflection import reflect
+
+                    result.experience_ids = reflect(self, task_text, result, messages=snapshot)
+                except Exception as exc:  # reflection must never break the task result
+                    self.emit("reflection.failed", error=str(exc))
+
+            if self.settings.background_reflection:
+                # Like Hermes' background review: the answer is returned now, learning happens afterwards.
+                self.runtime.track_reflection(self.runtime.spawn(_reflect, name="reflection"))
+            else:
+                _reflect()
         return result
+
+    def resume(self) -> RunResult:
+        """Continue a session whose last run was interrupted (e.g. the process died while waiting
+        for a human). Dangling tool calls are executed (re-asking the human if needed) first."""
+        return self.run(None)
+
+    def _last_user_text(self) -> str:
+        for r in reversed(self.sessions.records(self.session_id)):
+            if r["message"].get("role") == "user":
+                return r["meta"].get("display") or r["message"].get("content", "")
+        return ""
+
+    def _pending_tool_calls(self) -> list[dict[str, Any]]:
+        msgs = self.sessions.messages(self.session_id)
+        for i in range(len(msgs) - 1, -1, -1):
+            m = msgs[i]
+            if m.get("role") == "assistant" and m.get("tool_calls"):
+                answered = {x.get("tool_call_id") for x in msgs[i + 1 :] if x.get("role") == "tool"}
+                return [tc for tc in m["tool_calls"] if tc["id"] not in answered]
+            if m.get("role") in {"user", "assistant"}:
+                return []
+        return []
 
     def _run_tool_calls(self, calls: list[dict[str, Any]]) -> int:
         n = 0
@@ -344,6 +382,9 @@ class Agent:
 
     def _loop(self, usage: Usage, max_iter: int) -> tuple[int, int, str, str]:
         iterations = tool_calls = 0
+        pending = self._pending_tool_calls()
+        if pending:
+            tool_calls += self._run_tool_calls(pending)
         schemas = [t.schema() for t in self.tools.values()]
         while iterations < max_iter:
             self._check_cancel()

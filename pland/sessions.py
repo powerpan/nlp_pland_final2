@@ -1,7 +1,10 @@
-"""Persist a profile’s sessions and conversation transcript."""
+"""Per-profile conversation sessions. The transcript *is* the run state: a run that pauses for a
+human (clarification/approval) or crashes can be resumed from the stored messages alone."""
 
 from __future__ import annotations
 
+import re
+import threading
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
@@ -90,7 +93,20 @@ class SessionStore:
         params.append(sid)
         self.db.execute(f"UPDATE sessions SET {', '.join(sets)} WHERE id=?", params)
 
+    def patch_meta(self, sid: str, changes: dict[str, Any] | None = None, fn=None) -> dict[str, Any]:
+        """Atomic read-modify-write of a session's metadata (runs, background reflection, room driver
+        and tools may update the same session from different threads)."""
+        with _meta_lock(self.profile.name, sid):
+            meta = dict(self.get(sid).meta)
+            if changes:
+                meta.update(changes)
+            if fn is not None:
+                fn(meta)
+            self.update(sid, meta=meta)
+            return meta
+
     def delete(self, sid: str) -> None:
+        self.db.execute("DELETE FROM messages_fts WHERE session_id=?", (sid,))
         self.db.execute("DELETE FROM messages WHERE session_id=?", (sid,))
         self.db.execute("DELETE FROM sessions WHERE id=?", (sid,))
 
@@ -101,7 +117,12 @@ class SessionStore:
             (sid, message.get("role", "user"), dumps(message), dumps(meta or {}), now()),
         )
         self.db.execute("UPDATE sessions SET updated=? WHERE id=?", (now(), sid))
-        return int(cur.lastrowid)
+        mid = int(cur.lastrowid)
+        text = _searchable(message, meta)
+        if text:
+            self.db.execute("INSERT INTO messages_fts(content, session_id, msg_id, role) VALUES (?,?,?,?)",
+                            (text, sid, mid, message.get("role", "user")))
+        return mid
 
     def messages(self, sid: str) -> list[dict[str, Any]]:
         rows = self.db.query("SELECT body FROM messages WHERE session_id=? ORDER BY id", (sid,))
@@ -116,8 +137,91 @@ class SessionStore:
             for r in rows
         ]
 
+    # ----------------------------------------------------------------- search (Hermes-style session_search)
+    def ensure_index(self) -> None:
+        """Backfill the full-text index for databases created before it existed."""
+        if self.db.one("SELECT 1 FROM messages_fts LIMIT 1") or not self.db.one("SELECT 1 FROM messages LIMIT 1"):
+            return
+        for r in self.db.query("SELECT id, session_id, role, body, meta FROM messages ORDER BY id"):
+            text = _searchable(loads(r["body"], {}), loads(r["meta"], {}))
+            if text:
+                self.db.execute("INSERT INTO messages_fts(content, session_id, msg_id, role) VALUES (?,?,?,?)",
+                                (text, r["session_id"], r["id"], r["role"]))
+
+    def search(self, query: str, *, limit: int = 5, exclude: str | None = None) -> list[dict[str, Any]]:
+        """Full-text search over this profile's past messages (trigram index, works for CJK too).
+        Returns at most one hit per session, best first."""
+        self.ensure_index()
+        terms = [t for t in _FTS_TERM.findall(query or "") if len(t) >= 3]
+        rows: list[dict[str, Any]] = []
+        if terms:
+            match = " OR ".join('"' + t.replace('"', '""') + '"' for t in terms[:12])
+            rows = self.db.query(
+                "SELECT session_id, msg_id, role, snippet(messages_fts, 0, '«', '»', '…', 12) AS snip, bm25(messages_fts) AS score"
+                " FROM messages_fts WHERE messages_fts MATCH ? ORDER BY score LIMIT 200", (match,))
+        elif query and query.strip():
+            rows = self.db.query("SELECT session_id, msg_id, role, substr(content,1,200) AS snip, 0 AS score FROM messages_fts"
+                                 " WHERE content LIKE ? ORDER BY msg_id DESC LIMIT 200", (f"%{query.strip()}%",))
+        out, seen = [], set()
+        for r in rows:
+            sid = r["session_id"]
+            if sid == exclude or sid in seen:
+                continue
+            seen.add(sid)
+            try:
+                sess = self.get(sid)
+            except KeyError:
+                continue
+            out.append({"session_id": sid, "title": sess.title, "kind": sess.kind, "when": sess.updated,
+                        "match_message_id": int(r["msg_id"]), "role": r["role"], "snippet": r["snip"]})
+            if len(out) >= limit:
+                break
+        return out
+
+    def window(self, sid: str, around_id: int, size: int = 4) -> list[dict[str, Any]]:
+        before = self.db.query("SELECT id, role, body, meta FROM messages WHERE session_id=? AND id<=? ORDER BY id DESC LIMIT ?",
+                               (sid, around_id, size + 1))
+        after = self.db.query("SELECT id, role, body, meta FROM messages WHERE session_id=? AND id>? ORDER BY id LIMIT ?",
+                              (sid, around_id, size))
+        rows = list(reversed(before)) + after
+        out = []
+        for r in rows:
+            text = _searchable(loads(r["body"], {}), loads(r["meta"], {}))
+            if text:
+                out.append({"id": r["id"], "role": r["role"], "text": text[:1500]})
+        return out
+
     def replace_messages(self, sid: str, messages: list[dict[str, Any]]) -> None:
         """Used by context compaction: rewrite a session's working transcript."""
+        self.db.execute("DELETE FROM messages_fts WHERE session_id=?", (sid,))
         self.db.execute("DELETE FROM messages WHERE session_id=?", (sid,))
         for m in messages:
             self.append(sid, m)
+
+
+_META_LOCKS: dict[tuple[str, str], threading.Lock] = {}
+_META_GUARD = threading.Lock()
+
+
+def _meta_lock(profile: str, sid: str) -> threading.Lock:
+    with _META_GUARD:
+        return _META_LOCKS.setdefault((profile, sid), threading.Lock())
+
+
+_FTS_TERM = re.compile(r"[A-Za-z0-9_./-]+|[\u3400-\u9fff\uf900-\ufaff]+")
+
+
+def _searchable(message: dict[str, Any], meta: dict[str, Any] | None) -> str:
+    """Text worth indexing: what the user typed (not the experience-augmented prompt), assistant replies,
+    and the head of tool results (facts discovered by tools). System prompts are not indexed."""
+    role = message.get("role")
+    if role == "system":
+        return ""
+    if role == "user":
+        return str((meta or {}).get("display") or message.get("content") or "")[:4000]
+    if role == "tool":
+        return str(message.get("content") or "")[:2000]
+    text = str(message.get("content") or "")
+    for tc in message.get("tool_calls") or []:
+        text += f"\n[{tc['function']['name']}] {tc['function'].get('arguments', '')[:300]}"
+    return text[:4000]

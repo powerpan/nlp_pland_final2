@@ -69,12 +69,52 @@ def skill_view(ctx: ToolContext, a):
 
 @tool(
     "skill_save",
-    "Save or update a skill: a reusable, step-by-step procedure for a kind of task you expect to repeat.",
-    obj({"name": {"type": "string", "description": "kebab-case id"}, "description": {"type": "string"},
-         "content": {"type": "string", "description": "Markdown procedure"}}, ["name", "description", "content"]),
+    "Save or update a skill: a reusable procedure for a kind of task you expect to repeat. Write the content with "
+    "these sections: '## When to Use', '## Procedure' (numbered steps), '## Pitfalls', '## Verification'. "
+    "Update an existing skill (same name) instead of creating near-duplicates.",
+    obj({"name": {"type": "string", "description": "kebab-case id"}, "description": {"type": "string",
+         "description": "one line: what it does and when it applies"},
+         "content": {"type": "string", "description": "Markdown body with the four sections"}}, ["name", "description", "content"]),
     "memory",
 )
 def skill_save(ctx: ToolContext, a):
     msg = SkillStore(ctx.profile).save(a["name"], a["description"], a["content"], ctx.session_id)
     ctx.emit("memory.changed", store="skill", action="save", name=a["name"])
     return msg
+
+
+@tool(
+    "session_search",
+    "Search your own past conversations (all your sessions, full text, no summarization). Pass `query` to find "
+    "sessions where something was discussed; pass `session_id` + `around_message_id` to read more around a hit. "
+    "Use it for 'did we do X before / what did the user say about Y' questions; memory notes hold only key facts.",
+    obj({"query": {"type": "string"}, "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+         "session_id": {"type": "string"}, "around_message_id": {"type": "integer"},
+         "window": {"type": "integer", "minimum": 1, "maximum": 20}}),
+    "memory",
+)
+def session_search(ctx: ToolContext, a):
+    from ..sessions import SessionStore
+    import time as _time
+
+    store = SessionStore(ctx.profile)
+    if a.get("session_id") and a.get("around_message_id"):
+        msgs = store.window(a["session_id"], int(a["around_message_id"]), int(a.get("window") or 4))
+        if not msgs:
+            raise ToolError("no messages there")
+        return "\n".join(f"#{m['id']} [{m['role']}] {m['text']}" for m in msgs)
+    if not a.get("query"):
+        raise ToolError("pass a query, or session_id + around_message_id")
+    hits = store.search(a["query"], limit=int(a.get("limit") or 4), exclude=ctx.session_id)
+    ctx.emit("memory.session_search", query=a["query"][:200], hits=len(hits))
+    if not hits:
+        return "No past conversation matched."
+    blocks = []
+    for i, h in enumerate(hits):
+        when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(h["when"]))
+        lines = [f"session {h['session_id']} · {h['kind']} · {when} · {h['title'][:80]!r}", f"  match #{h['match_message_id']}: {h['snippet']}"]
+        if i == 0:  # the best hit gets its surrounding context, the rest stay compact (Hermes-style)
+            for m in store.window(h["session_id"], h["match_message_id"], 2):
+                lines.append(f"    #{m['id']} [{m['role']}] {m['text'][:500]}")
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks) + "\n\n(use session_id + around_message_id to read more)"

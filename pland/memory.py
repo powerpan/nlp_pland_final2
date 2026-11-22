@@ -79,11 +79,28 @@ class NotesMemory:
         entries = self.entries(target)
         if any(content == e or content in e for e in entries):
             return "Already remembered (duplicate skipped)."
+        similar = self.similar(target, content)
+        if similar:
+            return ("A very similar entry already exists, so nothing was added. To refine it, use action=replace with "
+                    f"old_text from: {similar[:200]!r}")
         entries.append(content)
         self._write(target, entries)
         _log(self.profile, target, "add", {"content": content}, session_id)
         used, cap = self.usage(target)
         return f"Saved to {target} ({used}/{cap} chars)."
+
+    def similar(self, target: str, content: str, threshold: float = 0.6) -> str | None:
+        """Near-duplicate check so repeated reflections don't fill memory with paraphrases. Uses the overlap
+        coefficient |A∩B| / min(|A|,|B|) over terms, which also catches a short restatement of a longer,
+        more detailed entry (calibrated on a real run where 8 paraphrases of one convention piled up)."""
+        new = set(tokenize(content))
+        if not new:
+            return None
+        for e in self.entries(target):
+            old = set(tokenize(e))
+            if old and len(new & old) / min(len(new), len(old)) >= threshold:
+                return e
+        return None
 
     def replace(self, target: str, old_text: str, content: str, session_id: str | None = None) -> str:
         entries = self.entries(target)

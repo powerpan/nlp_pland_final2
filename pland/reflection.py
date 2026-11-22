@@ -57,16 +57,39 @@ def _parse(text: str) -> dict:
     return json.loads(m.group(0))
 
 
-def reflect(agent: "Agent", task_text: str, result: "RunResult") -> list[str]:
+def _reflect_in_context(agent: "Agent", task_text: str, status_note: str, messages: list | None = None):
+    """Hermes-style review: replay the session as-is (same system prompt, tools and history, so the
+    provider's prompt cache is reused) and append one reflection request. Returns None if the model
+    does not answer with usable JSON, in which case the caller falls back to a separate digest prompt."""
+    if agent.role == "subagent":
+        return None
+    msgs = list(messages) if messages is not None else agent._llm_messages()
+    msgs.append({"role": "user", "content": "[reflection request — do not call tools; reply with JSON only]\n"
+                 + PROMPT + f"\n\nReflect on the most recent task in this conversation: {task_text[:600]!r}\n{status_note}"})
+    schemas = [t.schema() for t in agent.tools.values()] or None
+    resp = agent.chat(msgs, schemas, purpose="reflection", max_tokens=1200)
+    if resp.tool_calls:
+        return None
+    try:
+        return resp, _parse(resp.content)
+    except (ValueError, json.JSONDecodeError):
+        return None
+
+
+def reflect(agent: "Agent", task_text: str, result: "RunResult", messages: list | None = None) -> list[str]:
     store = ExperienceStore(agent.profile)
     status_note = f"Run status: {result.status}" + (f" ({result.error.splitlines()[0]})" if result.error else "")
-    messages = [
-        {"role": "system", "content": PROMPT},
-        {"role": "user", "content": f"TASK:\n{task_text[:3000]}\n\n{status_note}\n\nTRANSCRIPT:\n{_digest(agent)}\n\nFINAL ANSWER:\n{result.text[:3000]}"},
-    ]
-    resp = agent.chat(messages, None, purpose="reflection", json_mode=True, max_tokens=1200)
+    got = _reflect_in_context(agent, task_text, status_note, messages)
+    if got is None:
+        messages = [
+            {"role": "system", "content": PROMPT},
+            {"role": "user", "content": f"TASK:\n{task_text[:3000]}\n\n{status_note}\n\nTRANSCRIPT:\n{_digest(agent)}\n\nFINAL ANSWER:\n{result.text[:3000]}"},
+        ]
+        resp = agent.chat(messages, None, purpose="reflection", json_mode=True, max_tokens=1200)
+        data = _parse(resp.content)
+    else:
+        resp, data = got
     result.usage.add(resp.usage)
-    data = _parse(resp.content)
     outcome = str(data.get("outcome", "partial")).lower()
     if result.status != "completed" and outcome == "success":
         outcome = "partial"
@@ -76,8 +99,11 @@ def reflect(agent: "Agent", task_text: str, result: "RunResult") -> list[str]:
         tags=[str(x).lower() for x in (data.get("tags") or [])][:6], session_id=agent.session_id,
     )
     # Feedback loop: experiences that were retrieved for this task get credit (or blame).
-    if agent.used_experience_ids:
-        store.feedback(sorted(agent.used_experience_ids), success=(outcome == "success"), session_id=agent.session_id)
+    used = sorted(agent.used_experience_ids)
+    if used:
+        store.feedback(used, success=(outcome == "success"), session_id=agent.session_id)
+    agent.sessions.patch_meta(agent.session_id, fn=lambda m: m.setdefault("feedback", []).append(
+        {"used": used, "self_outcome": outcome, "experience": exp.id}))
     notes = NotesMemory(agent.profile)
     for note in (data.get("memory_notes") or [])[:2]:
         try:

@@ -1,4 +1,4 @@
-"""SQLite persistence for profile transcripts, memory, events and the model-call ledger."""
+"""SQLite persistence for profile transcripts, memory, approvals, HITL and run history."""
 
 from __future__ import annotations
 
@@ -53,9 +53,29 @@ CREATE TABLE IF NOT EXISTS memory_events (
     detail TEXT NOT NULL,
     session_id TEXT
 );
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content, session_id UNINDEXED, msg_id UNINDEXED, role UNINDEXED, tokenize='trigram'
+);
+CREATE TABLE IF NOT EXISTS approval_rules (
+    pattern TEXT PRIMARY KEY,
+    category TEXT NOT NULL,
+    created REAL NOT NULL
+);
 """
 
 SHARED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS hitl_requests (
+    id TEXT PRIMARY KEY,
+    profile TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    room_id TEXT,
+    kind TEXT NOT NULL,                     -- clarify | approval
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending', -- pending | answered | expired | cancelled
+    answer TEXT,
+    created REAL NOT NULL,
+    answered REAL
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,

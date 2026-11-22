@@ -168,8 +168,9 @@ class AgentSettings:
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     max_iterations: int = 40
-    toolsets: list[str] = field(default_factory=lambda: ["files", "code", "web", "git", "memory", "plan"])
+    toolsets: list[str] = field(default_factory=lambda: ["files", "code", "web", "git", "memory", "plan", "hitl"])
     reflection: bool = True
+    background_reflection: bool = True
     experience_top_k: int = 3
     # Per run. Cache hits count 0.1 token.
     max_run_calls: int = 120

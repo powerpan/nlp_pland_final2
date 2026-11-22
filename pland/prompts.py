@@ -18,7 +18,7 @@ WORK_RULES = """\
 - Use available tools to do the task. Verify your work before claiming success.
 - Relative file paths resolve inside your private workspace.
 - Use todo to plan tasks with three or more steps.
-- If an essential detail is missing, explain what you need from the user.
+- If an essential detail is missing, ask the user with ask_user before proceeding.
 - In your final answer, summarize your result, give evidence, and state what remains open.
 """
 
@@ -28,7 +28,7 @@ MEMORY_RULES = """\
 You keep bounded personal notes (shown below as a snapshot taken at session start). Use the `memory` tool to save
 durable facts: user preferences, environment details, conventions, and lessons that will matter in future tasks.
 Do not save one-off task details or paths inside your workspace. Relevant past experiences may be attached to a
-task; apply their lessons.
+task; apply their lessons. `session_search` finds specifics from your past conversations that are not in your notes.
 Save a skill (skill_save) when you work out a reusable multi-step procedure.
 """
 
