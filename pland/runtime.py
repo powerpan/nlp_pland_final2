@@ -89,7 +89,7 @@ class Runtime:
         with self._locks_guard:
             backend = self._backends.get(key)
             if backend is None:
-                backend = make_backend(settings.sandbox, profile.name, profile.workspace)
+                backend = make_backend(settings.sandbox, profile.name, profile.workspace, deny_roots=[self.root])
                 self._backends[key] = backend
             return backend
 

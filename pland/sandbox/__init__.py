@@ -1,5 +1,5 @@
 from .backends import Backend, DockerBackend, ExecResult, LocalBackend, make_backend
-from .policy import PathPolicy, PolicyError, check_command, scan_python
+from .policy import PathPolicy, PolicyError, check_command, scan_python, scan_untrusted
 
 __all__ = [
     "Backend",
@@ -11,4 +11,5 @@ __all__ = [
     "PolicyError",
     "check_command",
     "scan_python",
+    "scan_untrusted",
 ]

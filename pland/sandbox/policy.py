@@ -40,7 +40,7 @@ DANGEROUS: list[tuple[str, str]] = [
     (r"\bchown\s+(-[^\s]*)?R\b", "recursive chown"),
     (r"\b(curl|wget)\b[^\n|]*\|\s*(ba|z|k)?sh\b", "pipe remote content to a shell"),
     (r"\b(bash|sh|zsh)\s+<\(\s*(curl|wget)\b", "execute a remote script"),
-    (r"\bxargs\s+[^\n]*\brm\b", "xargs rm"),
+    (r"\bxargs\s+[^\n]*\brm\b", "delete via xargs rm"),
     (r"\bfind\b[^\n]*(-delete\b|-exec\s+rm\b)", "find with delete"),
     (r"\bkill\s+-9\s+-1\b", "kill all processes"),
     (r"\b(pkill|killall)\b", "kill processes by name"),
@@ -59,6 +59,15 @@ DANGEROUS: list[tuple[str, str]] = [
     (r"\bnpm\s+(publish|unpublish)\b", "publish a package"),
 ]
 
+# Content-level shapes a verb list misses (after Hermes' content checks): secrets in upload bodies, and
+# invisible/bidirectional Unicode that makes the approved command differ from the one that runs.
+DANGEROUS += [
+    (r"\b(curl|wget)\b[^\n]*(-d|--data[\w-]*|--post-data|-F|--form)\s*[\"']?[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD)\w*",
+     "upload a secret-named variable"),
+    (r"\b(curl|wget)\b[^\n]*(-F\s*[\"']?\w*=@|-T\s+|--upload-file\s+|--post-file=?)[^\n]*(\.env\b|\.ssh/|credentials|\.netrc|/etc/passwd)",
+     "upload a credential file"),
+    ("[\u200b-\u200f\u202a-\u202e\u2066-\u2069\ufeff]", "invisible or bidirectional Unicode control characters"),
+]
 _HARDLINE = [(re.compile(p, _F), d) for p, d in HARDLINE]
 _DANGEROUS = [(re.compile(p, _F), d) for p, d in DANGEROUS]
 
@@ -145,3 +154,24 @@ class PathPolicy:
                     return f"{alias}/{rel}" if rel != "." else alias
                 return rel or "."
         return str(path)
+
+
+# --------------------------------------------------------------------------- untrusted content
+
+_INJECTION = [
+    (re.compile(r"\b(ignore|disregard|forget)\b[^.\n]{0,40}\b(previous|prior|above|earlier|all)\b[^.\n]{0,20}\b(instructions?|prompts?|rules)", re.I),
+     "asks to ignore prior instructions"),
+    (re.compile(r"\b(you are now|act as|new instructions?:|system prompt:)", re.I), "tries to redefine the assistant's role"),
+    (re.compile(r"<!--[^>]{0,400}\b(assistant|AI|agent|instruction|ignore|execute|run)\b[^>]{0,400}-->", re.I | re.S),
+     "hidden HTML comment with instructions"),
+    (re.compile(r"\b(cat|read|print|send|upload|post)\b[^\n]{0,60}(\.env\b|id_rsa|\.netrc|credentials|api[_ ]?key)", re.I),
+     "asks to read or send secrets"),
+    (re.compile(r"\b(curl|wget)\b[^\n]{0,120}\|\s*(ba)?sh\b", re.I), "pipes a download into a shell"),
+    (re.compile("[\u200b-\u200f\u202a-\u202e\u2066-\u2069]"), "invisible Unicode control characters"),
+]
+
+
+def scan_untrusted(text: str) -> list[str]:
+    """Heuristic prompt-injection scan for content that comes from outside (web pages, search results).
+    It flags; it does not block — the agent is told the content is data, not instructions."""
+    return sorted({desc for rx, desc in _INJECTION if rx.search(text or "")})

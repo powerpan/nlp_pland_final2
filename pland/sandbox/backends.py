@@ -88,13 +88,61 @@ class Backend:
         raise NotImplementedError
 
 
+SANDBOX_EXEC = "/usr/bin/sandbox-exec"
+
+
+def _sb_quote(path: Path | str) -> str:
+    return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def seatbelt_profile(writable: list[Path], readable: list[Path], denied: list[Path]) -> str:
+    """macOS Seatbelt policy for one command: everything outside `denied` behaves normally (system
+    libraries, toolchains, network, temp dirs); inside `denied` (all user homes and PLAND_HOME) file
+    contents can be neither read nor written, except the agent's own writable roots and the read-only
+    toolchain paths. Metadata (stat) stays allowed so git/venv can walk parent directories."""
+    lines = ["(version 1)", "(allow default)"]
+    lines.append("(deny file-read* file-write* " + " ".join(f"(subpath {_sb_quote(p)})" for p in denied) + ")")
+    lines.append("(allow file-read-metadata)")
+    if readable:
+        lines.append("(allow file-read* " + " ".join(f"(subpath {_sb_quote(p)})" for p in readable) + ")")
+    lines.append("(allow file-read* file-write* " + " ".join(f"(subpath {_sb_quote(p)})" for p in writable) + ")")
+    return "\n".join(lines) + "\n"
+
+
 class LocalBackend(Backend):
     name = "local"
     isolated = False
 
-    def __init__(self, cfg: SandboxConfig | None = None, python: str | None = None):
+    def __init__(self, cfg: SandboxConfig | None = None, python: str | None = None, workspace: Path | None = None,
+                 deny_roots: list[Path] | None = None):
         self.cfg = cfg or SandboxConfig()
         self.python = python or sys.executable
+        self.workspace = workspace.resolve() if workspace else None
+        self.seatbelt = (self.cfg.os_sandbox == "auto" and sys.platform == "darwin" and os.path.exists(SANDBOX_EXEC)
+                         and self.workspace is not None)
+        if self.seatbelt:
+            self.name = "local+seatbelt"
+            home = Path(os.path.expanduser("~")).resolve()
+            denied = {Path("/Users"), home, *(p.resolve() for p in (deny_roots or []))}
+            self._denied = sorted(denied)
+            # read-only: the platform's Python (venv + base install) so `python3`, pytest, pip work
+            self._readable = sorted({Path(sys.prefix).resolve(), Path(sys.base_prefix).resolve(),
+                                     Path(sys.executable).resolve().parent})
+
+    def _wrap(self, argv: list[str], cwd: Path, mounts: dict[str, Path] | None, env: dict[str, str]) -> list[str]:
+        if not self.seatbelt:
+            return argv
+        writable = [self.workspace] + [m.resolve() for m in (mounts or {}).values()]
+        if not any(cwd.resolve() == w or w in cwd.resolve().parents for w in writable):
+            writable.append(cwd.resolve())
+        home = self.workspace / ".home"
+        home.mkdir(parents=True, exist_ok=True)
+        env["HOME"] = str(home)  # the real home is off limits; tools get a private one
+        env.setdefault("GIT_AUTHOR_NAME", "pland-agent")
+        env.setdefault("GIT_AUTHOR_EMAIL", "agent@pland.local")
+        env.setdefault("GIT_COMMITTER_NAME", env["GIT_AUTHOR_NAME"])
+        env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
+        return [SANDBOX_EXEC, "-p", seatbelt_profile(writable, self._readable, self._denied)] + argv
 
     def _limits(self):  # pragma: no cover - runs in the child
         try:
@@ -135,11 +183,15 @@ class LocalBackend(Backend):
 
     def run(self, command, cwd, *, timeout=None, env=None, mounts=None) -> ExecResult:
         cwd.mkdir(parents=True, exist_ok=True)
-        return self._exec(["/bin/bash", "-c", command], cwd, timeout or self.cfg.command_timeout, scrub_env(env))
+        e = scrub_env(env)
+        argv = self._wrap(["/bin/bash", "-c", command], cwd, mounts, e)
+        return self._exec(argv, cwd, timeout or self.cfg.command_timeout, e)
 
     def run_python(self, code, cwd, *, timeout=None, mounts=None) -> ExecResult:
         cwd.mkdir(parents=True, exist_ok=True)
-        return self._exec([self.python, "-I", "-"], cwd, timeout or self.cfg.command_timeout, scrub_env(), stdin=code)
+        e = scrub_env()
+        argv = self._wrap([self.python, "-I", "-"], cwd, mounts, e)
+        return self._exec(argv, cwd, timeout or self.cfg.command_timeout, e, stdin=code)
 
 
 class DockerBackend(Backend):
@@ -160,6 +212,26 @@ class DockerBackend(Backend):
             return r.returncode == 0
         except (OSError, subprocess.TimeoutExpired):
             return False
+
+    _image_lock = threading.Lock()
+    _image_ready: dict[str, str] = {}
+
+    def _image(self) -> str:
+        """Ensure the sandbox image exists: build pland-sandbox from docker/sandbox.Dockerfile once (git,
+        pytest, curl...), falling back to python:3.11-slim if building is impossible."""
+        want = self.cfg.docker_image
+        with DockerBackend._image_lock:
+            if want in DockerBackend._image_ready:
+                return DockerBackend._image_ready[want]
+            have = subprocess.run(["docker", "image", "inspect", want], capture_output=True, text=True).returncode == 0
+            if not have and want.startswith("pland-sandbox"):
+                dockerfile = Path(__file__).resolve().parents[2] / "docker" / "sandbox.Dockerfile"
+                if dockerfile.is_file():
+                    r = subprocess.run(["docker", "build", "-t", want, "-f", str(dockerfile), str(dockerfile.parent)],
+                                       capture_output=True, text=True, timeout=900)
+                    have = r.returncode == 0
+            DockerBackend._image_ready[want] = want if have else "python:3.11-slim"
+            return DockerBackend._image_ready[want]
 
     def _container_for(self, mounts: dict[str, Path] | None) -> str:
         key = "|".join(f"{k}={v}" for k, v in sorted((mounts or {}).items()))
@@ -187,9 +259,10 @@ class DockerBackend(Backend):
                 "-w", "/workspace",
             ]
             for alias, path in (mounts or {}).items():
-                # nested mount: the room's shared folder appears as ./shared inside the workspace
-                argv += ["-v", f"{path.resolve()}:/workspace/{alias}"]
-            argv += [self.cfg.docker_image, "sleep", "infinity"]
+                # mounted beside the workspace; ./shared inside the workspace is a symlink to it (see
+                # tools.code._link_room_shared) — a nested mount point would leave a root-owned dir on the host
+                argv += ["-v", f"{path.resolve()}:/{alias}"]
+            argv += [self._image(), "sleep", "infinity"]
             r = subprocess.run(argv, capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
                 raise RuntimeError(f"failed to start sandbox container: {r.stderr.strip()[:500]}")
@@ -208,7 +281,7 @@ class DockerBackend(Backend):
         for alias, path in (mounts or {}).items():
             path = path.resolve()
             if cwd == path or path in cwd.parents:
-                return f"/workspace/{alias}/" + cwd.relative_to(path).as_posix()
+                return f"/{alias}/" + cwd.relative_to(path).as_posix()
         return "/workspace"
 
     def _exec(self, argv: list[str], timeout: float, stdin: str | None = None) -> ExecResult:
@@ -240,12 +313,12 @@ class DockerBackend(Backend):
             self._containers.clear()
 
 
-def make_backend(cfg: SandboxConfig, profile_name: str, workspace: Path) -> Backend:
+def make_backend(cfg: SandboxConfig, profile_name: str, workspace: Path, deny_roots: list[Path] | None = None) -> Backend:
     if cfg.backend == "docker":
         return DockerBackend(cfg, profile_name, workspace)
     if cfg.backend != "local":
         raise ValueError(f"unknown sandbox backend {cfg.backend!r} (use local or docker)")
-    return LocalBackend(cfg)
+    return LocalBackend(cfg, workspace=workspace, deny_roots=deny_roots)
 
 
 def quote(s: str) -> str:
