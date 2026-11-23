@@ -64,9 +64,6 @@ def todo(ctx: ToolContext, a):
     for t in items:
         if t["status"] not in STATUSES:
             raise ToolError(f"status must be one of {STATUSES}")
-    sess = store.get(ctx.session_id)
-    meta = dict(sess.meta)
-    meta["todos"] = items
-    store.update(ctx.session_id, meta=meta)
+    store.patch_meta(ctx.session_id, {"todos": items})
     ctx.emit("todo.updated", todos=items)
     return render(items)

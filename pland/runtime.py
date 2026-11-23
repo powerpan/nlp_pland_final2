@@ -33,6 +33,11 @@ class Runtime:
         self._backends: dict[tuple[str, str], Backend] = {}
         self._threads: list[threading.Thread] = []
         self._reflections: list[threading.Thread] = []
+        from .team.board import TaskBoard
+        from .team.rooms import RoomManager
+
+        self.board = TaskBoard(self)
+        self.rooms = RoomManager(self)
 
     # ------------------------------------------------------------------ sessions & locks
     def session_lock(self, profile: str, session_id: str) -> threading.Lock:

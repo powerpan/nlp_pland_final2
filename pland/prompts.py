@@ -12,16 +12,25 @@ from .memory import NotesMemory, SkillStore
 
 if TYPE_CHECKING:
     from .profiles import Profile
+    from .runtime import Runtime
 
 WORK_RULES = """\
 # How you work
-- Use available tools to do the task. Verify your work before claiming success.
-- Relative file paths resolve inside your private workspace.
+- Accomplish tasks by acting: use your tools to create/edit files, run code and tests, search and read the web,
+  and commit/push with git. Never just describe steps you could perform yourself.
+- Verify before you claim success (run the code, run tests, re-read the file, check command output). If something
+  failed, say so plainly; do not invent results.
+- Relative paths resolve inside your private workspace. You cannot access other agents' workspaces or memory.
 - Use todo to plan tasks with three or more steps.
-- If an essential detail is missing, ask the user with ask_user before proceeding.
-- In your final answer, summarize your result, give evidence, and state what remains open.
+- Documents you produce must be Markdown (.md) or plain text (.txt). Source code files are fine in any language.
+- Human-in-the-loop: if the request is ambiguous or leaves out a fact that changes the result (a unit, format,
+  target, version, scope, ...), ask with ask_user instead of guessing — even for small tasks. Do not infer such
+  unstated parameters from the data's appearance. When you could not ask (no answer), state the assumption you made.
+  Operations that need permission (deleting files, risky shell commands, git push, ...) automatically ask the
+  human — never try to work around a denial or a refusal (e.g. pushing with a script instead of git_push).
+- Keep your final answer concise: what you did, the result (with evidence such as file paths, test output, URLs),
+  and anything left open.
 """
-
 
 MEMORY_RULES = """\
 # Memory
@@ -33,7 +42,34 @@ Save a skill (skill_save) when you work out a reusable multi-step procedure.
 """
 
 
-def build_system_prompt(profile: "Profile", *,
+def team_section(runtime: "Runtime", profile: "Profile", room: dict | None = None) -> str:
+    mates = [p for p in runtime.profiles.list(bots_only=True) if p.name != profile.name and not p.meta.get("hidden")]
+    if not mates:
+        return ""
+
+    def row(p) -> str:
+        return f"- @{p.name}: {p.title}" + (f" — {p.description}" if p.description else "")
+
+    if room:
+        members = set(room.get("members") or [])
+        inside = [p for p in mates if p.name in members]
+        outside = [p for p in mates if p.name not in members]
+        lines = ["# Teammates", "Members of this room (prefer them for the room's work):"] + [row(p) for p in inside]
+        if outside:
+            lines += ["Other bots outside this room (only if no member fits):"] + [row(p) for p in outside]
+    else:
+        lines = ["# Teammates (other agents you can collaborate with)"] + [row(p) for p in mates]
+    lines.append(
+        "Use delegate_task(to=\"<name>\") to hand a self-contained subtask to the best-suited teammate; it executes "
+        "in its own workspace with its own tools and memory and returns a report. Independent subtasks passed together "
+        "in one delegate_task call run in parallel. Give each delegate full context — they cannot see your conversation. "
+        "Use message_agent for a quick question. Use share_file to hand over files. Do the work yourself when no teammate "
+        "is a better fit."
+    )
+    return "\n".join(lines)
+
+
+def build_system_prompt(runtime: "Runtime", profile: "Profile", *, role: str = "main", room: dict | None = None,
                         backend_name: str = "local", extra: str | None = None, tool_names: set[str] | None = None) -> str:
     parts = []
     ident = f"You are {profile.title} (@{profile.name})."
@@ -46,22 +82,41 @@ def build_system_prompt(profile: "Profile", *,
         "# Environment",
         f"- Date: {time.strftime('%Y-%m-%d %H:%M %Z')}",
         f"- Host OS: {platform.system()} {platform.release()} | execution backend: {backend_name}"
-        + (" (commands run inside an isolated container; /workspace is your workspace)" if backend_name == "docker" else ""),
+        + (" (commands run inside an isolated container where /workspace is your workspace; the host sees a different "
+           "absolute path, so use relative paths in config files such as git remotes)" if backend_name == "docker" else ""),
         f"- Your private workspace: {ws}",
     ]
     if platform.system() == "Darwin" and backend_name != "docker":
         env.append("- Shell is macOS (BSD userland): `sed -i ''`, no GNU `timeout`/`cat -A`; use `python3` for portable "
                    "scripting. Python 3 with pytest is on PATH.")
+    if backend_name != "local":
+        env.append("- Shell commands run sandboxed with a private HOME and no access to the user's credentials or files "
+                   "outside your workspace. To push to a remote (e.g. GitHub) use the git_push tool, which runs on the "
+                   "host with the user's git credentials after approval.")
+    if room:
+        env.append(f"- Shared folder of group room '{room['name']}': `shared/` (relative to your workspace) in file tools "
+                   "and shell commands alike. Teammates see it; your other files stay private.")
     parts.append("\n".join(env))
     parts.append(WORK_RULES)
     tool_names = tool_names or set()
-    if "memory" in tool_names:
+    if "memory" in tool_names and role != "subagent":
         notes = NotesMemory(profile)
         parts.append(MEMORY_RULES + "\n" + notes.render())
         skills = SkillStore(profile).list()
         if skills:
             parts.append("# Your skills (read the relevant one with skill_view before starting a matching task)\n"
                          + "\n".join(f"- {s['name']}: {s['description']}" for s in skills))
+    if "delegate_task" in tool_names and role != "subagent":
+        team = team_section(runtime, profile, room)
+        if team:
+            parts.append(team)
+    if role == "subagent":
+        parts.append("# Subagent\nYou are a temporary subagent working on one delegated subtask with a fresh context. "
+                     "You cannot ask the user questions. Finish with a structured report: what you did, results, files changed, issues.")
+    elif role == "delegate":
+        parts.append("# Delegated work\nIn this session you execute tasks delegated to you by teammates. Work autonomously, "
+                     "then finish with a concise report the delegator can act on: what you did, results with evidence, "
+                     "files produced (paths), open issues.")
     if extra:
         parts.append(extra)
     return "\n\n".join(p for p in parts if p)

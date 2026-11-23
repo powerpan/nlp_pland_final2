@@ -1,4 +1,11 @@
-"""SQLite persistence for profile transcripts, memory, approvals, HITL and run history."""
+"""SQLite persistence.
+
+Two kinds of database exist:
+* `<profile>/state.db` — private to one profile: sessions, messages, experiences, memory events,
+  permanent approval rules. Other agents never open it directly.
+* `<PLAND_HOME>/shared.db` — collaboration state that is shared on purpose: group rooms and their
+  transcripts, the team task board, inter-agent deliveries, HITL requests and the event log.
+"""
 
 from __future__ import annotations
 
@@ -64,6 +71,50 @@ CREATE TABLE IF NOT EXISTS approval_rules (
 """
 
 SHARED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS rooms (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE,
+    members TEXT NOT NULL,                  -- JSON list of profile names
+    settings TEXT NOT NULL DEFAULT '{}',
+    created REAL NOT NULL,
+    updated REAL NOT NULL,
+    needs_you INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS room_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT NOT NULL,
+    speaker TEXT NOT NULL,                  -- 'user' or a profile name or 'system'
+    kind TEXT NOT NULL DEFAULT 'message',   -- message | activity | system
+    content TEXT NOT NULL,
+    meta TEXT NOT NULL DEFAULT '{}',
+    created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_room_messages ON room_messages(room_id, id);
+CREATE TABLE IF NOT EXISTS team_tasks (
+    id TEXT PRIMARY KEY,
+    room_id TEXT,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    assignee TEXT,
+    status TEXT NOT NULL DEFAULT 'todo',    -- todo | in_progress | done | failed | blocked
+    created_by TEXT NOT NULL,
+    parent_id TEXT,
+    depends_on TEXT NOT NULL DEFAULT '[]',
+    result TEXT,
+    created REAL NOT NULL,
+    updated REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS deliveries (
+    id TEXT PRIMARY KEY,
+    sender TEXT NOT NULL,
+    target TEXT NOT NULL,
+    kind TEXT NOT NULL,                     -- message | delegation
+    payload TEXT NOT NULL,
+    status TEXT NOT NULL,                   -- queued | running | done | failed
+    reply TEXT,
+    created REAL NOT NULL,
+    updated REAL NOT NULL
+);
 CREATE TABLE IF NOT EXISTS hitl_requests (
     id TEXT PRIMARY KEY,
     profile TEXT NOT NULL,

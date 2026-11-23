@@ -1,4 +1,14 @@
-"""Single-agent tool loop with resumable sessions and background reflection."""
+"""The agent execution loop.
+
+One `Agent` drives one session of one profile:
+
+    user task ──► [retrieve relevant experiences] ──► LLM ──► tool calls ──► results ──► LLM ──► … ──► answer
+                                                                                         └─► reflection → experience store
+
+Tool calls that need a human (ask_user, approvals) block inside the tool; the run therefore resumes
+in place once answered. Because every message is persisted as it happens, a run interrupted by a
+crash or restart can be continued with `Agent.resume()`, which completes dangling tool calls first.
+"""
 
 from __future__ import annotations
 
@@ -26,8 +36,29 @@ if TYPE_CHECKING:
     from .profiles import Profile
     from .runtime import Runtime
 
-CONTEXT_CHAR_BUDGET = 400_000  # ~100k tokens; older context is compacted beyond this
+# Tools a temporary subagent never gets (it has no human channel and no long-term identity).
+SUBAGENT_EXCLUDE = {"ask_user", "memory", "skill_save", "message_agent", "team_tasks"}
+# Tools that change state; refused during discussion-only room turns. (Refused at call time rather than removed
+# from the schema, so the session's prompt prefix — and DeepSeek's cache — stays stable across turns.)
+MUTATING_TOOLS = {"write_file", "edit_file", "delete_file", "run_shell", "run_python", "git_status", "git_commit",
+                  "git_push", "delegate_task", "message_agent", "share_file", "memory", "skill_save"}
 MAX_TOOL_RESULT = 24_000
+PRUNED_TOOL_OUTPUT = "[Old tool output cleared to save context space — re-run the tool if you need it again]"
+SUMMARY_PROMPT = """You compress the earlier part of an AI agent's working conversation so it can continue the task.
+Write a dense Markdown summary with exactly these sections (omit nothing important, invent nothing):
+## Goal
+## Constraints & Preferences
+## Progress
+### Done
+### In Progress
+### Blocked
+## Key Decisions
+## Relevant Files
+## Next Steps
+## Critical Context
+(specific values, commands, error messages, IDs and results the agent will need verbatim)
+If a previous summary is given, update it: move finished items to Done, add new progress, drop what became irrelevant.
+Max ~900 words."""
 REPEAT_WARN, REPEAT_STOP = 3, 5  # identical tool call (same name + args) within one run
 # No-progress guard: consecutive tool results identical to earlier results of the same tool.
 STALE_NUDGE, STALE_STOP = 3, 6
@@ -74,32 +105,54 @@ class Agent:
         session_id: str,
         *,
         hitl: HITLChannel | None = None,
+        room_id: str | None = None,
+        role: str = "main",  # main | delegate | subagent
+        depth: int = 0,
+        chain: list[str] | None = None,
         exclude_tools: set[str] | None = None,
         llm: LLMClient | None = None,
         settings: AgentSettings | None = None,
         system_extra: str | None = None,
         reflect: bool | None = None,
+        budget: Budget | None = None,
+        discussion_only: bool = False,
     ):
         self.runtime = runtime
         self.profile = profile
         self.session_id = session_id
         self.hitl = hitl or runtime.default_hitl
-        self.role = "main"
+        self.room_id = room_id
+        self.role = role
+        self.depth = depth
+        self.chain = list(chain or [])
         self.settings = settings or profile.settings()
         self.sessions = SessionStore(profile)
         self.system_extra = system_extra
         self.reflect_enabled = self.settings.reflection if reflect is None else reflect
         self._llm = llm
-        self.tools = {t.name: t for t in select_tools(self.settings.toolsets, exclude_tools)}
+        exclude = set(exclude_tools or set())
+        if role == "subagent":
+            exclude |= SUBAGENT_EXCLUDE
+        if depth >= self.settings.max_delegation_depth:
+            exclude |= {"delegate_task", "message_agent"}
+        if not runtime.profiles.list(bots_only=True):
+            exclude |= {"message_agent"}
+        self.tools = {t.name: t for t in select_tools(self.settings.toolsets, exclude)}
         self.backend = runtime.backend_for(profile, self.settings)
-        self.paths = PathPolicy({"": profile.workspace})
+        roots = {"": profile.workspace}
+        self.room = runtime.rooms.get(room_id) if room_id else None
+        if self.room:
+            roots["shared"] = runtime.rooms.shared_dir(room_id)
+        self.paths = PathPolicy(roots)
         self.used_experience_ids: set[str] = set()
         self.run_id = ""
-        self.is_root = True
-        self.budget = Budget(self.settings.max_run_calls, self.settings.max_run_tokens)
+        # Delegates/subagents share the budget of the run that spawned them; a top-level run owns one.
+        self.is_root = budget is None
+        self.budget = budget or Budget(self.settings.max_run_calls, self.settings.max_run_tokens)
         self._call_sigs: dict[str, int] = {}
         self._result_sigs: dict[int, int] = {}
         self._stale_streak = 0
+        self.discussion_only = discussion_only
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -127,21 +180,22 @@ class Agent:
         return resp
 
     def emit(self, type: str, **data: Any) -> None:
-        self.runtime.bus.publish(type, profile=self.profile.name, session_id=self.session_id,
+        self.runtime.bus.publish(type, profile=self.profile.name, session_id=self.session_id, room_id=self.room_id,
                                  run_id=self.run_id, **data)
 
     def _context(self, tool_call_id: str | None = None) -> ToolContext:
-        gate = ApprovalGate(self.profile, self.settings.approvals, self.hitl, self.session_id,
-                            run_id=self.run_id, publish=self.runtime.bus.publish)
+        gate = ApprovalGate(self.profile, self.settings.approvals, self.hitl, self.session_id, room_id=self.room_id,
+                            run_id=self.run_id, publish=self.runtime.bus.publish,
+                            guard=lambda msgs: self.chat(msgs, None, purpose="approval", max_tokens=8, temperature=0).content)
         return ToolContext(
             runtime=self.runtime, agent=self, profile=self.profile, settings=self.settings, session_id=self.session_id,
             run_id=self.run_id, backend=self.backend, paths=self.paths, hitl=self.hitl, approvals=gate,
-            tool_call_id=tool_call_id,
+            room_id=self.room_id, depth=self.depth, chain=self.chain + [self.profile.name], tool_call_id=tool_call_id,
         )
 
     def _system_prompt(self) -> str:
         return build_system_prompt(
-            self.profile, backend_name=self.backend.name,
+            self.runtime, self.profile, role=self.role, room=self.room, backend_name=self.backend.name,
             extra=self.system_extra, tool_names=set(self.tools),
         )
 
@@ -155,10 +209,18 @@ class Agent:
 
     # ------------------------------------------------------------------ context
     def _llm_messages(self) -> list[dict[str, Any]]:
+        """The model's view of the session: summary of folded turns + live turns, with old tool outputs
+        pruned. The stored transcript itself is never rewritten."""
         sess = self.sessions.get(self.session_id)
         upto = int(sess.meta.get("compacted_upto") or 0)
-        records = self.sessions.records(self.session_id)
-        msgs = [r["message"] for r in records if r["id"] > upto or r["message"].get("role") == "system"]
+        pruned = int(sess.meta.get("pruned_upto") or 0)
+        msgs = []
+        for r in self.sessions.records(self.session_id):
+            m = r["message"]
+            if m.get("role") == "system" or r["id"] > upto:
+                if m.get("role") == "tool" and r["id"] <= pruned and len(str(m.get("content") or "")) > 200:
+                    m = {**m, "content": PRUNED_TOOL_OUTPUT}
+                msgs.append(m)
         if upto and sess.meta.get("summary"):
             sys_msgs = [m for m in msgs if m.get("role") == "system"][:1]
             rest = [m for m in msgs if m.get("role") != "system"]
@@ -171,41 +233,59 @@ class Agent:
                                {"role": "assistant", "content": "Understood. Continuing from that summary."}] + rest
         return close_tool_calls(msgs)
 
+    def _view_size(self) -> int:
+        return sum(len(json.dumps(m, ensure_ascii=False)) for m in self._llm_messages())
+
+    def _tail_start(self, live: list[dict[str, Any]], tail_budget: int) -> int:
+        """Index in `live` where the protected tail begins: walk back until ~tail_budget chars, then move
+        forward to a user message so tool-call groups are never split."""
+        size, i = 0, len(live)
+        while i > 0 and size < tail_budget:
+            i -= 1
+            size += len(json.dumps(live[i]["message"], ensure_ascii=False))
+        while i < len(live) and live[i]["message"].get("role") != "user":
+            i += 1
+        return i
+
     def _maybe_compact(self) -> None:
-        msgs = self._llm_messages()
-        size = sum(len(json.dumps(m, ensure_ascii=False)) for m in msgs)
-        if size <= CONTEXT_CHAR_BUDGET:
+        """Two-phase compaction after Hermes' ContextCompressor. Phase 1 (no model call): clear old tool
+        outputs outside the protected tail. Phase 2, only if still over budget: fold the middle turns into
+        a structured summary that updates the previous one, keeping the tail verbatim. Done rarely and in
+        large steps, so DeepSeek's prefix cache stays warm between compactions."""
+        budget = self.settings.context_char_budget
+        if self._view_size() <= budget:
             return
-        records = self.sessions.records(self.session_id)
         sess = self.sessions.get(self.session_id)
         upto = int(sess.meta.get("compacted_upto") or 0)
-        live = [r for r in records if r["id"] > upto and r["message"].get("role") != "system"]
-        # cut at a user-message boundary roughly in the middle so tool-call pairs stay intact
-        half = len(live) // 2
-        cut_idx = next((i for i in range(half, len(live)) if live[i]["message"].get("role") == "user"), None)
-        if not cut_idx:
+        live = [r for r in self.sessions.records(self.session_id) if r["id"] > upto and r["message"].get("role") != "system"]
+        cut = self._tail_start(live, budget // 5)
+        if cut <= 0:
             return
-        old = live[:cut_idx]
-        digest = "\n".join(_digest_line(r["message"]) for r in old)[-120_000:]
+        # Phase 1: prune old tool outputs
+        self.sessions.patch_meta(self.session_id, {"pruned_upto": live[cut - 1]["id"]})
+        after = self._view_size()
+        self.emit("context.pruned", upto=live[cut - 1]["id"], size=after)
+        if after <= int(budget * 0.7):
+            return
+        # Phase 2: structured summary of the middle, iteratively updating the previous summary
+        old = live[:cut]
+        digest = "\n".join(_digest_line(r["message"]) for r in old)[-160_000:]
         prev = sess.meta.get("summary") or ""
         prompt = [
-            {"role": "system", "content": "You compress agent transcripts. Keep goals, decisions, facts learned, files touched, "
-                                          "open problems and the user's preferences. Be dense; max 600 words."},
-            {"role": "user", "content": (f"Earlier summary:\n{prev}\n\n" if prev else "") + f"Transcript to fold in:\n{digest}"},
+            {"role": "system", "content": SUMMARY_PROMPT},
+            {"role": "user", "content": (f"PREVIOUS SUMMARY (update it, don't start over):\n{prev}\n\n" if prev else "")
+                                        + f"TURNS TO FOLD IN:\n{digest}"},
         ]
         try:
-            summary = self.chat(prompt, purpose="compaction", max_tokens=1500).content.strip()
+            summary = self.chat(prompt, purpose="compaction", max_tokens=3000).content.strip()
         except (LLMError, BudgetExceeded):
             summary = (prev + "\n" + digest[-4000:]).strip()
-        meta = dict(sess.meta)
-        meta["compacted_upto"] = old[-1]["id"]
-        meta["summary"] = summary
-        self.sessions.update(self.session_id, meta=meta)
-        self.emit("context.compacted", folded=len(old))
+        self.sessions.patch_meta(self.session_id, {"compacted_upto": old[-1]["id"], "summary": summary})
+        self.emit("context.compacted", folded=len(old), size=self._view_size())
 
     # ------------------------------------------------------------------ experience
     def _with_experience(self, text: str, query: str | None = None) -> tuple[str, list[str]]:
-        if "memory" not in self.settings.toolsets or self.settings.experience_top_k <= 0:
+        if self.role == "subagent" or "memory" not in self.settings.toolsets or self.settings.experience_top_k <= 0:
             return text, []
         store = ExperienceStore(self.profile)
         hits = store.search(query or text, self.settings.experience_top_k)
@@ -220,8 +300,10 @@ class Agent:
                 f"{block}\n</relevant_past_experience>"), ids
 
     # ------------------------------------------------------------------ main loop
-    def run(self, text: str | None, *, meta: dict[str, Any] | None = None,
-            max_iterations: int | None = None) -> RunResult:
+    def run(self, text: str | None, *, meta: dict[str, Any] | None = None, max_iterations: int | None = None,
+            task_text: str | None = None) -> RunResult:
+        """Run one turn. `task_text` is the underlying request when `text` wraps it in protocol
+        boilerplate (room turns, delegations); it is what experience retrieval and reflection see."""
         self.run_id = new_id("r_")
         start = time.time()
         usage = Usage()
@@ -230,22 +312,18 @@ class Agent:
         if not lock.acquire(timeout=1800):
             return RunResult(self.run_id, self.session_id, self.profile.name, "error", "", error="session is busy")
         self.runtime.clear_cancel(self.profile.name, self.session_id)
-        self.budget = Budget(self.settings.max_run_calls, self.settings.max_run_tokens)
-        self._call_sigs.clear()
-        self._result_sigs.clear()
-        self._stale_streak = 0
-        self.used_experience_ids.clear()
         final_text = ""
         status = "completed"
         error = None
-        task_text = text or ""
+        task_text = task_text or text or ""
         try:
+            # pid lets a restarted server tell a live run from an interrupted one
             self.sessions.patch_meta(self.session_id, {"pid": os.getpid()})
             self.sessions.update(self.session_id, status="running")
             self._ensure_system()
-            self.emit("run.started", text=(text or "")[:2000])
+            self.emit("run.started", text=(text or "")[:2000], role=self.role, depth=self.depth)
             if text is not None:
-                content, _ = self._with_experience(text)
+                content, _ = self._with_experience(text, task_text)
                 self.sessions.append(self.session_id, {"role": "user", "content": content},
                                      meta={"display": text, **(meta or {})})
             else:
@@ -279,10 +357,10 @@ class Agent:
             lock.release()
         result = RunResult(self.run_id, self.session_id, self.profile.name, status, final_text, iterations, tool_calls,
                            time.time() - start, usage, error, budget=self.budget.snapshot())
-        trivial = final_text.strip().lower().strip(" .") in {"[pass]", "pass", "[silent]"}
+        trivial = self.discussion_only or final_text.strip().lower().strip(" .") in {"[pass]", "pass", "[silent]"}
         self.emit("run.finished", status=status, text=final_text[:4000], iterations=iterations, tool_calls=tool_calls,
                   duration=round(result.duration, 2), error=error)
-        if self.reflect_enabled and status != "cancelled" and task_text.strip() and not trivial:
+        if self.reflect_enabled and self.role != "subagent" and status != "cancelled" and task_text.strip() and not trivial:
             snapshot = self._llm_messages()  # reflect on this run only, even if the session moves on
 
             def _reflect() -> None:
@@ -348,6 +426,9 @@ class Agent:
                        f"got the same result. Do not repeat it; change your approach or finish with what you have.")
             elif t is None:
                 out = f"ERROR: unknown tool '{name}'. Available: {', '.join(sorted(self.tools))}"
+            elif self.discussion_only and name in MUTATING_TOOLS:
+                out = (f"ERROR: this is a discussion turn — {name} is not available now. Share your input in your reply "
+                       "(or [PASS]); the lead will delegate work to you if needed.")
             else:
                 try:
                     args = json.loads(raw) if raw.strip() else {}
@@ -403,7 +484,11 @@ class Agent:
             self.emit("llm.request", iteration=iterations)
             # Greedy decoding (temperature 0) can lock into repetition; loosen it while the guard sees no progress.
             temp = 0.7 if self._stale_streak >= 2 else None
-            resp = self.chat(self._llm_messages(), schemas or None, temperature=temp)
+            streamer = _DeltaStreamer(self, iterations) if self.settings.stream else None
+            resp = self.chat(self._llm_messages(), schemas or None, temperature=temp,
+                             on_delta=streamer.feed if streamer else None)
+            if streamer:
+                streamer.flush()
             usage.add(resp.usage)
             msg = resp.to_message()
             self.sessions.append(self.session_id, msg, meta={"usage": resp.usage.__dict__, "finish": resp.finish_reason})
@@ -424,6 +509,32 @@ class Agent:
         usage.add(resp.usage)
         self.sessions.append(self.session_id, resp.to_message())
         return resp.content
+
+
+class _DeltaStreamer:
+    """Publishes streamed text as `assistant.delta` events, batched (~every 120 ms or 400 chars) so a
+    fast stream does not flood the event bus / WebSocket."""
+
+    def __init__(self, agent: "Agent", iteration: int):
+        self.agent = agent
+        self.iteration = iteration
+        self.buf: dict[str, list[str]] = {"content": [], "reasoning": []}
+        self.size = 0
+        self.last = time.time()
+
+    def feed(self, kind: str, text: str) -> None:
+        self.buf.setdefault(kind, []).append(text)
+        self.size += len(text)
+        if self.size >= 400 or time.time() - self.last >= 0.12:
+            self.flush()
+
+    def flush(self) -> None:
+        for kind, parts in self.buf.items():
+            if parts:
+                self.agent.emit("assistant.delta", kind=kind, text="".join(parts), iteration=self.iteration)
+        self.buf = {"content": [], "reasoning": []}
+        self.size = 0
+        self.last = time.time()
 
 
 def close_tool_calls(msgs: list[dict[str, Any]]) -> list[dict[str, Any]]:

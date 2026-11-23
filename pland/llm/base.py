@@ -94,4 +94,5 @@ class LLMClient(Protocol):
         json_mode: bool = False,
         max_tokens: int | None = None,
         temperature: float | None = None,
+        on_delta: Any = None,
     ) -> LLMResponse: ...

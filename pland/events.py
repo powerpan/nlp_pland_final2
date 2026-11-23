@@ -16,6 +16,9 @@ from .store import DB, dumps
 
 Subscriber = Callable[[dict[str, Any]], None]
 
+# High-frequency, transient events are delivered live but not written to the event log.
+EPHEMERAL = {"assistant.delta"}
+
 
 class EventBus:
     def __init__(self, db: DB | None = None):
@@ -36,7 +39,7 @@ class EventBus:
 
     def publish(self, type: str, **fields: Any) -> dict[str, Any]:
         event = {"type": type, "ts": time.time(), **fields}
-        if self._db is not None:
+        if self._db is not None and type not in EPHEMERAL:
             try:
                 self._db.execute(
                     "INSERT INTO events(ts, type, profile, session_id, room_id, run_id, data) VALUES (?,?,?,?,?,?,?)",

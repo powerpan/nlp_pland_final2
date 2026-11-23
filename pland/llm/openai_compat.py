@@ -23,8 +23,12 @@ from .guard import check_endpoint
 _RETRY_STATUS = {408, 429, 500, 502, 503, 504}
 
 
+class _StreamCut(Exception):
+    """The stream broke after output had already been delivered; retrying would duplicate it."""
+
+
 class OpenAICompatClient:
-    def __init__(self, cfg: ModelConfig):
+    def __init__(self, cfg: ModelConfig, transport: httpx.BaseTransport | None = None):
         cfg = cfg.resolved()
         check_endpoint(cfg.provider, cfg.base_url)
         if not cfg.api_key:
@@ -37,7 +41,7 @@ class OpenAICompatClient:
         self.provider = cfg.provider
         self.model = cfg.model
         self._url = cfg.base_url.rstrip("/") + "/chat/completions"
-        self._http = httpx.Client(timeout=httpx.Timeout(cfg.timeout, connect=20.0))
+        self._http = httpx.Client(timeout=httpx.Timeout(cfg.timeout, connect=20.0), transport=transport)
         self._lock = threading.Lock()
         self.total_usage = Usage()
         self.calls = 0
@@ -64,29 +68,93 @@ class OpenAICompatClient:
             payload["temperature"] = temp
         return payload
 
-    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None, temperature=None) -> LLMResponse:
+    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None, temperature=None,
+             on_delta=None) -> LLMResponse:
+        """One chat completion. With `on_delta(kind, text)` the response is streamed and each content /
+        reasoning fragment is passed on as it arrives (kind = "content" | "reasoning"); the return value
+        is the same assembled LLMResponse either way."""
         payload = self._payload(messages, tools, json_mode, max_tokens, temperature)
+        if on_delta is not None:
+            payload["stream"] = True
+            payload["stream_options"] = {"include_usage": True}
         headers = {"Authorization": f"Bearer {self.cfg.api_key}", "Content-Type": "application/json"}
         last_err: Exception | None = None
         for attempt in range(self.cfg.max_retries + 1):
             try:
-                resp = self._http.post(self._url, headers=headers, content=json.dumps(payload))
+                if on_delta is None:
+                    resp = self._http.post(self._url, headers=headers, content=json.dumps(payload))
+                    if resp.status_code == 200:
+                        return self._parse(resp.json())
+                    status, body = resp.status_code, resp.text[:800]
+                else:
+                    with self._http.stream("POST", self._url, headers=headers, content=json.dumps(payload)) as resp:
+                        if resp.status_code == 200:
+                            return self._consume_stream(resp, on_delta)
+                        status, body = resp.status_code, resp.read().decode("utf-8", "replace")[:800]
+            except _StreamCut as exc:
+                raise LLMError(f"stream from {self.provider} broke mid-response: {exc}", retryable=False)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
                 last_err = LLMError(f"network error talking to {self.provider}: {exc}", retryable=True)
             else:
-                if resp.status_code == 200:
-                    return self._parse(resp.json())
-                body = resp.text[:800]
-                retryable = resp.status_code in _RETRY_STATUS
-                last_err = LLMError(
-                    f"{self.provider} HTTP {resp.status_code}: {body}", status=resp.status_code, retryable=retryable
-                )
+                retryable = status in _RETRY_STATUS
+                last_err = LLMError(f"{self.provider} HTTP {status}: {body}", status=status, retryable=retryable)
                 if not retryable:
                     raise last_err
             if attempt < self.cfg.max_retries:
                 time.sleep((2 ** attempt) + random.random() * 0.25)
         assert last_err is not None
         raise last_err
+
+    def _consume_stream(self, resp: httpx.Response, on_delta) -> LLMResponse:
+        """Assemble a streamed (SSE) completion: content, reasoning_content and tool-call fragments
+        (keyed by index) arrive as deltas; usage comes in the final chunk."""
+        content: list[str] = []
+        reasoning: list[str] = []
+        calls: dict[int, dict[str, str]] = {}
+        finish = model = None
+        usage: dict[str, Any] = {}
+        emitted = False
+        try:
+            for line in resp.iter_lines():
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                chunk = json.loads(data)
+                model = chunk.get("model") or model
+                if chunk.get("usage"):
+                    usage = chunk["usage"]
+                for choice in chunk.get("choices") or []:
+                    delta = choice.get("delta") or {}
+                    if delta.get("reasoning_content"):
+                        reasoning.append(delta["reasoning_content"])
+                        on_delta("reasoning", delta["reasoning_content"])
+                        emitted = True
+                    if delta.get("content"):
+                        content.append(delta["content"])
+                        on_delta("content", delta["content"])
+                        emitted = True
+                    for tc in delta.get("tool_calls") or []:
+                        slot = calls.setdefault(int(tc.get("index", len(calls))), {"id": "", "name": "", "arguments": ""})
+                        slot["id"] = tc.get("id") or slot["id"]
+                        fn = tc.get("function") or {}
+                        slot["name"] += fn.get("name") or ""
+                        slot["arguments"] += fn.get("arguments") or ""
+                    if choice.get("finish_reason"):
+                        finish = choice["finish_reason"]
+        except (httpx.TransportError, json.JSONDecodeError) as exc:
+            if emitted:
+                raise _StreamCut(str(exc)) from exc
+            raise httpx.TransportError(str(exc)) from exc
+        message: dict[str, Any] = {"content": "".join(content)}
+        if reasoning:
+            message["reasoning_content"] = "".join(reasoning)
+        if calls:
+            message["tool_calls"] = [{"id": c["id"] or f"call_{i}", "type": "function",
+                                      "function": {"name": c["name"], "arguments": c["arguments"] or "{}"}}
+                                     for i, c in sorted(calls.items())]
+        return self._parse({"choices": [{"message": message, "finish_reason": finish}], "usage": usage, "model": model})
 
     def _parse(self, data: dict[str, Any]) -> LLMResponse:
         try:

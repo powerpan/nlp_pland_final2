@@ -140,6 +140,8 @@ def default_provider() -> str:
 @dataclass
 class ApprovalConfig:
     # manual: ask the human for every operation that needs permission
+    # smart:  a guard model call triages flagged shell/python commands (approve / deny / escalate to the
+    #         human); deleting files, git push, credentials and publishing always go to the human
     # off:    never ask (still subject to the hardline blocklist)
     mode: str = "manual"
     timeout: float = 600.0
@@ -156,7 +158,7 @@ class SandboxConfig:
     os_sandbox: str = "auto"
     command_timeout: float = 120.0
     max_output_chars: int = 20000
-    docker_image: str = "python:3.11-slim"
+    docker_image: str = "pland-sandbox:py3.11"  # built from docker/sandbox.Dockerfile on first use
     docker_network: str = "bridge"  # bridge | none
     docker_memory: str = "1g"
     docker_cpus: str = "1.0"
@@ -168,11 +170,17 @@ class AgentSettings:
     approvals: ApprovalConfig = field(default_factory=ApprovalConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
     max_iterations: int = 40
-    toolsets: list[str] = field(default_factory=lambda: ["files", "code", "web", "git", "memory", "plan", "hitl"])
+    toolsets: list[str] = field(default_factory=lambda: ["files", "code", "web", "git", "memory", "plan", "hitl", "delegation", "team"])
     reflection: bool = True
-    background_reflection: bool = True
+    background_reflection: bool = True  # return the answer first, reflect afterwards (Hermes background review)
+    stream: bool = True  # stream turn responses and publish assistant.delta events (UI/CLI live text)
+    # Compaction threshold for the model's view of a session (~100k tokens). DeepSeek's window is 1M,
+    # but every call re-sends the whole conversation, so long Bot Chats are compacted well before it.
+    context_char_budget: int = 400_000
     experience_top_k: int = 3
-    # Per run. Cache hits count 0.1 token.
+    max_delegation_depth: int = 2
+    max_parallel_delegations: int = 4
+    # Per top-level run (shared by every delegate/subagent it spawns). Cache hits count 0.1 token.
     max_run_calls: int = 120
     max_run_tokens: int = 3_000_000
 
