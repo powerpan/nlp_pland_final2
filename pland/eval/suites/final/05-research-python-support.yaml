@@ -1,0 +1,150 @@
+# final 05 — research + report with verifiable facts: the check fetches endoflife.date and PyPI at check time
+id: final-research-python-support
+title: Report on supported Python versions from live data
+category: web
+prompt: |
+  Using live data from the endoflife.date API (`https://endoflife.date/api/python.json`), write
+  `python_support.md` containing:
+
+  1. A Markdown table of every Python release cycle that is still supported today (its `eol` date is after
+     today's date), newest cycle first, with the columns `Cycle | Latest | Latest release date | EOL | PEP` —
+     dates as `YYYY-MM-DD`, and PEP as the number of the cycle's release-schedule PEP (e.g. `PEP 619`).
+  2. A line `Oldest supported: <cycle> (EOL <date>, <N> days from today)`.
+  3. A line `Newest: <cycle>`.
+  4. The latest version of `pip` on PyPI and the Python versions it requires, as the line
+     `pip: <version> (requires Python <requires_python>)` — e.g. from `https://pypi.org/pypi/pip/json`.
+
+  Do not rely on what you remember: these facts change over time.
+checks:
+- {id: report-exists, type: file_exists, path: python_support.md}
+- id: supported-rows
+  type: python
+  code: |
+    import json, re, urllib.request
+    from datetime import date, timedelta
+    def eol_data():
+        req = urllib.request.Request("https://endoflife.date/api/python.json", headers={"User-Agent": "pland-eval"})
+        data = json.load(urllib.request.urlopen(req, timeout=30))
+        today = date.today()
+        sup = [c for c in data if isinstance(c.get("eol"), str) and date.fromisoformat(c["eol"]) > today]
+        return sorted(sup, key=lambda c: tuple(int(x) for x in c["cycle"].split(".")), reverse=True), today
+    def table_rows(doc):
+        out = []
+        for line in doc.splitlines():
+            if line.strip().startswith("|"):
+                cells = [c.strip().strip("`*_ ") for c in line.strip().strip("|").split("|")]
+                if cells and re.fullmatch(r"(?i)(python\s*)?\d+\.\d+", cells[0]):
+                    out.append((re.sub(r"(?i)python\s*", "", cells[0]), cells, line))
+        return out
+    def ok_latest(c, today):
+        ok = {c["latest"]}
+        if c.get("latestReleaseDate") and date.fromisoformat(c["latestReleaseDate"]) >= today - timedelta(days=2):
+            major, minor, patch = c["latest"].split(".")[:3]
+            if patch.isdigit() and int(patch) > 0:
+                ok.add(f"{major}.{minor}.{int(patch) - 1}")
+        return ok
+    sup, today = eol_data()
+    rows = table_rows(path("python_support.md").read_text(encoding="utf-8"))
+    listed = [r[0] for r in rows]
+    want = [c["cycle"] for c in sup]
+    assert sorted(listed) == sorted(want), f"table lists cycles {listed}, supported today are {want}"
+    for c in sup:
+        cells, line = next((r[1], r[2]) for r in rows if r[0] == c["cycle"])
+        okv = ok_latest(c, today)
+        assert any(re.search(r"(?<![\d.])" + re.escape(v) + r"(?![\d.])", line) for v in okv), f"{c['cycle']}: latest should be {c['latest']}: {line.strip()}"
+        assert c["eol"] in line, f"{c['cycle']}: EOL {c['eol']} missing: {line.strip()}"
+        if c["latest"] in line:
+            assert c["latestReleaseDate"] in line, f"{c['cycle']}: latest release date {c['latestReleaseDate']} missing"
+        pep = c.get("pep") or ""
+        num = re.sub(r"\D", "", pep).lstrip("0")
+        if num:
+            assert re.search(r"(?i)pep[\s\-_]*0*" + num + r"\b", line), f"{c['cycle']}: PEP {num} missing: {line.strip()}"
+- id: newest-first
+  type: python
+  code: |
+    import json, re, urllib.request
+    from datetime import date, timedelta
+    def eol_data():
+        req = urllib.request.Request("https://endoflife.date/api/python.json", headers={"User-Agent": "pland-eval"})
+        data = json.load(urllib.request.urlopen(req, timeout=30))
+        today = date.today()
+        sup = [c for c in data if isinstance(c.get("eol"), str) and date.fromisoformat(c["eol"]) > today]
+        return sorted(sup, key=lambda c: tuple(int(x) for x in c["cycle"].split(".")), reverse=True), today
+    def table_rows(doc):
+        out = []
+        for line in doc.splitlines():
+            if line.strip().startswith("|"):
+                cells = [c.strip().strip("`*_ ") for c in line.strip().strip("|").split("|")]
+                if cells and re.fullmatch(r"(?i)(python\s*)?\d+\.\d+", cells[0]):
+                    out.append((re.sub(r"(?i)python\s*", "", cells[0]), cells, line))
+        return out
+    def ok_latest(c, today):
+        ok = {c["latest"]}
+        if c.get("latestReleaseDate") and date.fromisoformat(c["latestReleaseDate"]) >= today - timedelta(days=2):
+            major, minor, patch = c["latest"].split(".")[:3]
+            if patch.isdigit() and int(patch) > 0:
+                ok.add(f"{major}.{minor}.{int(patch) - 1}")
+        return ok
+    sup, today = eol_data()
+    listed = [r[0] for r in table_rows(path("python_support.md").read_text(encoding="utf-8"))]
+    key = lambda v: tuple(int(x) for x in v.split("."))
+    assert listed and listed == sorted(listed, key=key, reverse=True), f"rows are not newest-first: {listed}"
+- id: oldest-newest
+  type: python
+  code: |
+    import json, re, urllib.request
+    from datetime import date, timedelta
+    def eol_data():
+        req = urllib.request.Request("https://endoflife.date/api/python.json", headers={"User-Agent": "pland-eval"})
+        data = json.load(urllib.request.urlopen(req, timeout=30))
+        today = date.today()
+        sup = [c for c in data if isinstance(c.get("eol"), str) and date.fromisoformat(c["eol"]) > today]
+        return sorted(sup, key=lambda c: tuple(int(x) for x in c["cycle"].split(".")), reverse=True), today
+    def table_rows(doc):
+        out = []
+        for line in doc.splitlines():
+            if line.strip().startswith("|"):
+                cells = [c.strip().strip("`*_ ") for c in line.strip().strip("|").split("|")]
+                if cells and re.fullmatch(r"(?i)(python\s*)?\d+\.\d+", cells[0]):
+                    out.append((re.sub(r"(?i)python\s*", "", cells[0]), cells, line))
+        return out
+    def ok_latest(c, today):
+        ok = {c["latest"]}
+        if c.get("latestReleaseDate") and date.fromisoformat(c["latestReleaseDate"]) >= today - timedelta(days=2):
+            major, minor, patch = c["latest"].split(".")[:3]
+            if patch.isdigit() and int(patch) > 0:
+                ok.add(f"{major}.{minor}.{int(patch) - 1}")
+        return ok
+    sup, today = eol_data()
+    doc = path("python_support.md").read_text(encoding="utf-8")
+    oldest, newest = sup[-1], sup[0]
+    m = re.search(r"(?im)^\W*oldest supported\W*:?\W*(\d+\.\d+)\b(.*)$", doc)
+    assert m, "no 'Oldest supported: ...' line"
+    assert m.group(1) == oldest["cycle"], f"oldest supported is {oldest['cycle']}, not {m.group(1)}"
+    assert oldest["eol"] in m.group(2), f"oldest-supported line lacks the EOL date {oldest['eol']}"
+    days = (date.fromisoformat(oldest["eol"]) - today).days
+    n = re.search(r"(-?\d+)\s*days", m.group(2))
+    assert n and abs(int(n.group(1)) - days) <= 1, f"days until EOL should be {days}: {m.group(0).strip()}"
+    m = re.search(r"(?im)^\W*newest\W*:?\W*(\d+\.\d+)\b", doc)
+    assert m and m.group(1) == newest["cycle"], f"newest cycle is {newest['cycle']}"
+- id: pip-line
+  type: python
+  code: |
+    import json, urllib.request
+    from datetime import datetime, timezone, timedelta
+    def pypi(pkg):
+        req = urllib.request.Request(f"https://pypi.org/pypi/{pkg}/json", headers={"User-Agent": "pland-eval"})
+        d = json.load(urllib.request.urlopen(req, timeout=30))
+        ok = {d["info"]["version"]}
+        ups = sorted(((max(f["upload_time_iso_8601"] for f in fs), v) for v, fs in d["releases"].items() if fs), reverse=True)
+        if ups and datetime.now(timezone.utc) - datetime.fromisoformat(ups[0][0].replace("Z", "+00:00")) < timedelta(days=1):
+            ok.update(v for _, v in ups[:2])
+        return d["info"], ok
+    import re
+    doc = path("python_support.md").read_text(encoding="utf-8")
+    m = re.search(r"(?im)^\W*pip\W*:?\s*v?([0-9][\w.]*)\W*\(\s*requires\s+python\s*([^)]*)\)", doc)
+    assert m, "no line 'pip: <version> (requires Python <requires_python>)'"
+    info, ok = pypi("pip")
+    assert m.group(1) in ok, f"pip latest is {info['version']}, not {m.group(1)}"
+    norm = lambda s: re.sub(r"[\s`\\]", "", s)
+    assert norm(m.group(2)) == norm(info.get("requires_python") or ""), f"pip requires_python is {info.get('requires_python')!r}"

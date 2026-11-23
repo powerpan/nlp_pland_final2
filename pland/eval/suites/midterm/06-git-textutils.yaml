@@ -1,0 +1,68 @@
+# midterm 06 — git: init a repo in a sub-folder, ≥2 meaningful commits with message conventions, clean tree
+id: mid-git-textutils
+title: New git repo with two meaningful conventional commits
+category: git
+prompt: |
+  Create a new git repository in the folder `textutils/` (branch `main`) and build a tiny library in it, committing
+  as you go — at least two commits:
+
+  1. First commit: `textutils.py` with `word_count(text)` (number of whitespace-separated words) and a `README.md`
+     that describes the library.
+  2. A later commit: add `reverse_words(text)` to `textutils.py` (the whitespace-separated words in reverse order,
+     joined by single spaces) together with `test_textutils.py`, pytest tests for both functions.
+
+  Every commit message must follow the Conventional Commits style (e.g. `feat: ...`, `test: ...`, `docs: ...`).
+  When you are done, the working tree must be clean (`git status` shows nothing to commit).
+checks:
+- {id: commits, type: git_commits, repo: textutils, min: 2}
+- id: conventional-messages
+  type: git_commits
+  repo: textutils
+  min: 2
+  message_pattern: '^(feat|fix|docs|test|tests|chore|refactor|style|build|ci|perf)(\([^)]*\))?!?: \S'
+- {id: clean-tree, type: git_clean, repo: textutils}
+- id: incremental-history
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    repo = path("textutils")
+    shas = git("rev-list", "HEAD", cwd=repo).stdout.split()
+    assert shas, "no commits in textutils/"
+    tracked = git("ls-files", cwd=repo).stdout.split()
+    for f in ["textutils.py", "README.md", "test_textutils.py"]:
+        assert f in tracked, f"{f} is not committed"
+    early = [s for s in shas[1:] if "def word_count" in git("show", f"{s}:textutils.py", cwd=repo).stdout
+             and "reverse_words" not in git("show", f"{s}:textutils.py", cwd=repo).stdout]
+    assert early, "no earlier commit with word_count but without reverse_words (work was not committed incrementally)"
+- id: functions-work
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    t = load("textutils_under_test", path("textutils/textutils.py"))
+    assert t.word_count("") == 0
+    assert t.word_count("one") == 1
+    assert t.word_count("  a  b\tc\n") == 3
+    assert t.reverse_words("one two  three") == "three two one"
+    assert t.reverse_words("") == ""
+    assert t.reverse_words("  hi  ") == "hi"
+- id: repo-tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    pytest_in(path("textutils"), 2)

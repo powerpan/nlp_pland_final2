@@ -1,0 +1,14 @@
+# PlanD eval suite `midterm` (format: pland/eval/SCHEMA.md)
+description: |-
+  Midterm suite: 15 tasks that cover every required capability at least once — file processing with computed
+  values, coding with hidden tests, debugging, web fetch/search (verified live at check time), git commits and a
+  push to a local bare remote, HITL clarification and approval (approved and denied), cross-session memory
+  reuse (task 11 states a standing preference, task 15 relies on it without restating it) and three team tasks
+  in group rooms with real delegation. Run in file order; tasks 11 and 15 must stay in the same suite run.
+defaults:
+  timeout: 600
+  max_iterations: 30
+  memory: carry
+  hitl:
+    approvals: approve
+    default_reply: Use your best judgement and state any assumption you make.

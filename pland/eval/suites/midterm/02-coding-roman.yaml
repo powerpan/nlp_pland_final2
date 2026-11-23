@@ -1,0 +1,78 @@
+# midterm 02 — coding: implement a module from a spec; hidden checks import it and test edge cases
+id: mid-coding-roman
+title: Roman numeral converter with tests (hidden edge cases)
+category: coding
+prompt: |
+  Implement a module `roman.py` in the workspace root with two functions:
+
+  - `to_roman(n)` — convert an integer 1..3999 to an uppercase Roman numeral using standard subtractive notation
+    (4 = IV, 9 = IX, 40 = XL, 90 = XC, 400 = CD, 900 = CM). Raise `TypeError` if `n` is not an `int`
+    (e.g. a float or a string), and `ValueError` if it is outside 1..3999.
+  - `from_roman(s)` — the inverse. It ignores surrounding whitespace and letter case (`" xiv "` → 14). It must accept
+    only canonical numerals, i.e. exactly the strings `to_roman` produces: anything else — `""`, `"IIII"`, `"VV"`,
+    `"IC"`, `"XM"`, `"MMMM"`, `"ABC"` — raises `ValueError`.
+
+  Write pytest tests in `tests/test_roman.py` (at least 5 test functions, covering normal values and the error cases)
+  and make sure they pass.
+checks:
+- {id: module-exists, type: file_exists, path: roman.py}
+- id: hidden-valid
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    roman = load("roman_under_test", path("roman.py"))
+    known = {1: "I", 4: "IV", 9: "IX", 14: "XIV", 40: "XL", 90: "XC", 400: "CD", 944: "CMXLIV",
+             1994: "MCMXCIV", 2026: "MMXXVI", 3999: "MMMCMXCIX"}
+    for n, s in known.items():
+        assert roman.to_roman(n) == s, f"to_roman({n}) = {roman.to_roman(n)!r}, expected {s!r}"
+        assert roman.from_roman(s) == n, f"from_roman({s!r}) = {roman.from_roman(s)!r}, expected {n}"
+    for n in range(1, 4000):
+        assert roman.from_roman(roman.to_roman(n)) == n, f"round trip fails for {n}"
+    assert roman.from_roman(" xiv ") == 14, "from_roman must ignore case and surrounding whitespace"
+    assert roman.from_roman("mmxxvi") == 2026
+- id: hidden-errors
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    roman = load("roman_under_test", path("roman.py"))
+    def raises(exc, fn, arg):
+        try:
+            fn(arg)
+        except exc:
+            return True
+        except Exception as other:
+            raise AssertionError(f"{fn.__name__}({arg!r}) raised {type(other).__name__}, expected {exc.__name__}")
+        raise AssertionError(f"{fn.__name__}({arg!r}) did not raise {exc.__name__}")
+    for bad in [0, -1, 4000, 10000]:
+        raises(ValueError, roman.to_roman, bad)
+    for bad in [3.0, 2.5, "5", None]:
+        raises(TypeError, roman.to_roman, bad)
+    for bad in ["", "   ", "IIII", "VV", "IC", "XM", "MMMM", "ABC", "IVI", "XIIV", "VX", "LL", "DM", "CMC"]:
+        raises(ValueError, roman.from_roman, bad)
+- id: agent-tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    assert path("tests/test_roman.py").is_file(), "tests/test_roman.py is missing"
+    pytest_in(ws, 5, "tests")

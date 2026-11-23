@@ -1,0 +1,130 @@
+# final 08 — team (lead/researcher/coder): research + code; unit tests hidden, report verified against PyPI at check time
+id: final-team-deps-audit
+title: Researcher + coder build a dependency audit tool and report from live PyPI data
+category: team
+mode: team
+team:
+  room: true
+  lead: lead
+  bots:
+  - name: lead
+    title: Lead
+    description: 'Coordinates the team: plans, delegates and integrates results'
+  - name: researcher
+    title: Researcher
+    description: Finds and verifies facts on the web (search + fetch) and always reports the source URLs
+  - name: coder
+    title: Coder
+    description: Implements Python code carefully from a specification
+prompt: |
+  Team task — dependency audit. `shared/requirements.txt` pins our production dependencies. Build a small audit
+  tool and use it to produce a report:
+
+  1. `shared/audit/audit.py` (standard library only) with
+     - `parse_requirements(text) -> list[tuple[str, str]]`: the `(name, version)` pairs of all exact pins
+       `name==version`, in file order, names lowercased; whitespace around `==` is allowed; comments (`# ...`, also
+       at the end of a line), blank lines and every other kind of line (`-r ...`, `pkg>=1.0`, ...) are ignored;
+     - `is_outdated(pinned, latest) -> bool`: compare dotted numeric versions component by component as integers
+       (so `2.10` is newer than `2.9`); missing trailing components count as 0 (`1.0` equals `1.0.0`);
+     - a CLI `python audit.py <requirements.txt> <report.md>` that looks up each pinned package's latest version on
+       PyPI (JSON API `https://pypi.org/pypi/<name>/json`) and writes the report.
+  2. `shared/audit/report.md`, produced by running the tool on `shared/requirements.txt`: a Markdown table with the
+     columns `Package | Pinned | Latest | Requires-Python | Status` — one row per pin in file order, Requires-Python
+     of the latest release, Status `outdated` or `up-to-date` — followed by the line `Outdated: <n> of <m>`.
+
+  The researcher first confirms how to read the latest version and its Requires-Python from the PyPI JSON API, and
+  at the end independently verifies the report's facts; the coder writes and runs the tool.
+setup:
+  files:
+    shared/requirements.txt: |
+      # production pins
+      requests==2.25.1
+      six==1.17.0
+      attrs == 21.2.0   # old pin kept for Python 3.6 compatibility
+
+      idna==2.10
+      -r dev-requirements.txt
+      urllib3>=1.26
+timeout: 1200
+checks:
+- id: hidden-unit
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    a = load("audit_under_test", path("shared/audit/audit.py"))
+    assert a.parse_requirements(path("shared/requirements.txt").read_text(encoding="utf-8")) == [('requests', '2.25.1'), ('six', '1.17.0'), ('attrs', '21.2.0'), ('idna', '2.10')]
+    text = "Django==4.2.1\n  numpy == 1.26.0  # pinned\n# x==1\nflask>=2\n-e .\n\nRequests==2.31.0\n"
+    got = a.parse_requirements(text)
+    assert got == [("django", "4.2.1"), ("numpy", "1.26.0"), ("requests", "2.31.0")], got
+    for p, l, want in [("2.9", "2.10", True), ("2.10", "2.9", False), ("1.0", "1.0.0", False), ("1.0.0", "1.0", False),
+                       ("21.2.0", "26.1.0", True), ("1.17.0", "1.17.0", False), ("0.9.9", "0.10", True), ("3.20", "3.3", False)]:
+        assert a.is_outdated(p, l) is want, f"is_outdated({p!r}, {l!r}) should be {want}"
+- id: report-rows
+  type: python
+  code: |
+    import json, urllib.request
+    from datetime import datetime, timezone, timedelta
+    def pypi(pkg):
+        req = urllib.request.Request(f"https://pypi.org/pypi/{pkg}/json", headers={"User-Agent": "pland-eval"})
+        d = json.load(urllib.request.urlopen(req, timeout=30))
+        ok = {d["info"]["version"]}
+        ups = sorted(((max(f["upload_time_iso_8601"] for f in fs), v) for v, fs in d["releases"].items() if fs), reverse=True)
+        if ups and datetime.now(timezone.utc) - datetime.fromisoformat(ups[0][0].replace("Z", "+00:00")) < timedelta(days=1):
+            ok.update(v for _, v in ups[:2])
+        return d["info"], ok
+    import re
+    def report_rows(doc):
+        rows = []
+        for line in doc.splitlines():
+            if line.strip().startswith("|"):
+                cells = [re.sub(r"[`*\\]", "", c).strip() for c in line.strip().strip("|").split("|")]
+                if len(cells) >= 5 and re.fullmatch(r"[A-Za-z0-9][\w.-]*", cells[0]) and cells[0].lower() != "package":
+                    rows.append(cells)
+        return rows
+    def vkey(v):
+        parts = [int(x) for x in v.split(".")]
+        while parts and parts[-1] == 0:
+            parts.pop()
+        return parts
+    rows = report_rows(path("shared/audit/report.md").read_text(encoding="utf-8"))
+    assert [r[0].lower() for r in rows] == [p for p, _ in [('requests', '2.25.1'), ('six', '1.17.0'), ('attrs', '21.2.0'), ('idna', '2.10')]], f"rows {[r[0] for r in rows]} != pins in file order"
+    for (name, pinned), r in zip([('requests', '2.25.1'), ('six', '1.17.0'), ('attrs', '21.2.0'), ('idna', '2.10')], rows):
+        info, ok = pypi(name)
+        assert r[1] == pinned, f"{name}: pinned {r[1]!r} != {pinned}"
+        assert r[2] in ok, f"{name}: latest {r[2]!r}, PyPI says {info['version']}"
+        rp = re.sub(r"\s", "", info.get("requires_python") or "").replace("*", "")
+        assert re.sub(r"\s", "", r[3]).replace("*", "") == rp, f"{name}: Requires-Python {r[3]!r} != {info.get('requires_python')!r}"
+        want = "outdated" if vkey(pinned) < vkey(r[2]) else "up-to-date"
+        assert r[4].lower() == want, f"{name}: status {r[4]!r}, expected {want}"
+- id: outdated-line
+  type: python
+  code: |
+    import re
+    def report_rows(doc):
+        rows = []
+        for line in doc.splitlines():
+            if line.strip().startswith("|"):
+                cells = [re.sub(r"[`*\\]", "", c).strip() for c in line.strip().strip("|").split("|")]
+                if len(cells) >= 5 and re.fullmatch(r"[A-Za-z0-9][\w.-]*", cells[0]) and cells[0].lower() != "package":
+                    rows.append(cells)
+        return rows
+    def vkey(v):
+        parts = [int(x) for x in v.split(".")]
+        while parts and parts[-1] == 0:
+            parts.pop()
+        return parts
+    doc = path("shared/audit/report.md").read_text(encoding="utf-8")
+    rows = report_rows(doc)
+    n = sum(1 for r in rows if r[4].lower() == "outdated")
+    m = re.search(r"(?im)^\W*outdated\W*:?\s*(\d+)\s+of\s+(\d+)", doc)
+    assert m, "no 'Outdated: <n> of <m>' line"
+    assert (int(m.group(1)), int(m.group(2))) == (n, 4), f"'Outdated: {m.group(1)} of {m.group(2)}' should be {n} of 4"
+- {id: delegated-coder, type: delegated, min: 1, to: [coder]}
+- {id: delegated-researcher, type: delegated, min: 1, to: [researcher]}

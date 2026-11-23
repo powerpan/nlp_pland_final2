@@ -1,0 +1,158 @@
+# memory_evolution 05 — log format: microseconds. The simulated user refuses to repeat the conventions; only memory from earlier tasks helps.
+# expected: {'requests': 51, 'errors': 4, 'error_rate': '7.84', 'p95_ms': 900, 'slowest_endpoint': '/api/analytics/daily'}
+# traps (field changed if the convention is ignored): {'health': ['requests', 'error_rate', 'p95_ms', 'slowest_endpoint'], '4xx': ['errors', 'error_rate'], 'query': ['slowest_endpoint'], 'p95': ['p95_ms'], 'unit': 'microseconds'}
+id: memevo-05
+title: 'Log statistics #5 (microseconds)'
+category: memory
+prompt: |
+  Compute our standard request statistics for `logs/apache-05.log` and write them to `stats/report-05.txt`.
+
+  `logs/apache-05.log` uses the Apache common log format followed by `%D`:
+  `<client ip> - <user> [<timestamp>] "<METHOD> <path> <protocol>" <status> <bytes> <response time in MICROseconds>`.
+
+  Apply our team's conventions for request-log statistics (if you don't know them, ask me).
+
+  The file must contain exactly these five lines, in this order, and nothing else:
+  requests: <number of requests counted>
+  errors: <number of requests counted as errors>
+  error_rate: <errors / requests × 100, with exactly two decimals>%
+  p95_ms: <95th-percentile latency in whole milliseconds>
+  slowest_endpoint: <endpoint with the highest mean latency>
+setup:
+  files:
+    logs/apache-05.log: |
+      192.168.4.218 - - [05/Oct/2026:08:00:06 +0000] "GET /api/search?q=scarf&page=3 HTTP/1.1" 200 5005 225152
+      192.168.5.181 - bob [05/Oct/2026:08:00:38 +0000] "GET /api/users HTTP/1.1" 404 7805 80441
+      192.168.8.205 - bob [05/Oct/2026:08:00:59 +0000] "GET /api/users HTTP/1.1" 404 8841 133273
+      192.168.0.106 - bob [05/Oct/2026:08:01:23 +0000] "GET /api/analytics/daily HTTP/1.1" 200 6725 676183
+      192.168.5.249 - - [05/Oct/2026:08:01:25 +0000] "GET /api/analytics/daily HTTP/1.1" 304 7581 899654
+      192.168.1.7 - - [05/Oct/2026:08:01:31 +0000] "GET /api/users HTTP/1.1" 204 4950 133201
+      192.168.2.56 - bob [05/Oct/2026:08:01:39 +0000] "GET /api/cart?id=94 HTTP/1.1" 404 2099 162698
+      192.168.8.200 - carol [05/Oct/2026:08:01:53 +0000] "GET /api/items?id=21 HTTP/1.1" 200 4538 90982
+      192.168.6.78 - - [05/Oct/2026:08:02:30 +0000] "GET /api/users HTTP/1.1" 304 4871 73771
+      192.168.3.95 - bob [05/Oct/2026:08:02:40 +0000] "GET /health HTTP/1.1" 200 3134 1487958
+      192.168.6.189 - - [05/Oct/2026:08:02:45 +0000] "GET /api/users HTTP/1.1" 404 7114 90568
+      192.168.5.73 - carol [05/Oct/2026:08:03:15 +0000] "GET /api/search?q=coat&page=4 HTTP/1.1" 200 228 256707
+      192.168.2.158 - - [05/Oct/2026:08:03:47 +0000] "GET /api/cart HTTP/1.1" 200 5269 116096
+      192.168.0.135 - carol [05/Oct/2026:08:03:51 +0000] "GET /api/items HTTP/1.1" 200 5633 110221
+      192.168.1.86 - bob [05/Oct/2026:08:04:19 +0000] "GET /api/users?id=93 HTTP/1.1" 200 6537 85679
+      192.168.8.116 - - [05/Oct/2026:08:04:39 +0000] "GET /health/ready HTTP/1.1" 200 1446 1985919
+      192.168.5.66 - carol [05/Oct/2026:08:04:55 +0000] "GET /api/analytics/daily HTTP/1.1" 502 8030 628560
+      192.168.8.138 - - [05/Oct/2026:08:05:03 +0000] "GET /api/search?q=new+arrivals HTTP/1.1" 200 2401 1600000
+      192.168.8.201 - carol [05/Oct/2026:08:05:34 +0000] "GET /api/search?q=scarf&page=2 HTTP/1.1" 200 2046 248595
+      192.168.8.99 - bob [05/Oct/2026:08:05:37 +0000] "GET /api/cart?id=57 HTTP/1.1" 400 184 170116
+      192.168.5.73 - - [05/Oct/2026:08:06:02 +0000] "GET /api/cart HTTP/1.1" 204 447 74674
+      192.168.1.187 - bob [05/Oct/2026:08:06:25 +0000] "GET /api/search?q=coat&page=4 HTTP/1.1" 200 8247 146172
+      192.168.7.126 - - [05/Oct/2026:08:06:41 +0000] "GET /api/orders HTTP/1.1" 200 3504 123599
+      192.168.8.102 - - [05/Oct/2026:08:07:07 +0000] "GET /api/analytics/daily HTTP/1.1" 200 2960 758748
+      192.168.0.236 - - [05/Oct/2026:08:07:18 +0000] "GET /healthz HTTP/1.1" 200 8572 2454345
+      192.168.0.200 - bob [05/Oct/2026:08:07:42 +0000] "GET /api/search?q=scarf&page=3 HTTP/1.1" 200 7995 180695
+      192.168.0.240 - bob [05/Oct/2026:08:07:55 +0000] "GET /api/search?q=coat&page=4 HTTP/1.1" 500 8275 215477
+      192.168.1.115 - - [05/Oct/2026:08:08:25 +0000] "GET /api/items?id=53 HTTP/1.1" 200 278 66055
+      192.168.8.50 - carol [05/Oct/2026:08:08:32 +0000] "GET /api/orders?id=31 HTTP/1.1" 404 8974 209287
+      192.168.1.189 - carol [05/Oct/2026:08:09:00 +0000] "GET /login HTTP/1.1" 200 7313 137839
+      192.168.1.162 - - [05/Oct/2026:08:09:10 +0000] "GET /api/items?id=74 HTTP/1.1" 200 3150 58350
+      192.168.6.141 - - [05/Oct/2026:08:09:34 +0000] "GET /api/cart HTTP/1.1" 400 5513 161756
+      192.168.9.154 - - [05/Oct/2026:08:09:38 +0000] "GET /api/analytics/daily HTTP/1.1" 200 4126 744944
+      192.168.2.140 - - [05/Oct/2026:08:10:16 +0000] "GET /api/cart HTTP/1.1" 200 6612 143462
+      192.168.2.8 - carol [05/Oct/2026:08:10:49 +0000] "GET /api/items HTTP/1.1" 200 803 117965
+      192.168.0.244 - carol [05/Oct/2026:08:10:50 +0000] "GET /api/orders HTTP/1.1" 500 2755 196196
+      192.168.4.227 - carol [05/Oct/2026:08:11:11 +0000] "GET /health/ready HTTP/1.1" 200 4748 2133177
+      192.168.6.138 - bob [05/Oct/2026:08:11:13 +0000] "GET /login?id=33 HTTP/1.1" 200 1293 251200
+      192.168.2.181 - - [05/Oct/2026:08:11:48 +0000] "GET /api/users HTTP/1.1" 200 5702 122539
+      192.168.7.198 - - [05/Oct/2026:08:12:24 +0000] "GET /api/items HTTP/1.1" 200 5522 37667
+      192.168.4.106 - - [05/Oct/2026:08:12:40 +0000] "GET /healthz HTTP/1.1" 200 1770 2292184
+      192.168.6.8 - bob [05/Oct/2026:08:13:01 +0000] "GET /api/cart?id=93 HTTP/1.1" 200 2169 120039
+      192.168.3.213 - - [05/Oct/2026:08:13:18 +0000] "GET /api/items?id=94 HTTP/1.1" 200 1580 97732
+      192.168.3.117 - - [05/Oct/2026:08:13:20 +0000] "GET /login HTTP/1.1" 200 3536 148159
+      192.168.3.84 - - [05/Oct/2026:08:13:42 +0000] "GET /login?id=79 HTTP/1.1" 502 8807 163037
+      192.168.1.234 - bob [05/Oct/2026:08:13:53 +0000] "GET /api/cart?id=45 HTTP/1.1" 200 1739 102233
+      192.168.8.68 - bob [05/Oct/2026:08:14:30 +0000] "GET /login HTTP/1.1" 200 4296 80631
+      192.168.1.222 - - [05/Oct/2026:08:15:07 +0000] "GET /api/orders?id=85 HTTP/1.1" 200 280 210090
+      192.168.6.142 - - [05/Oct/2026:08:15:29 +0000] "GET /api/analytics/daily HTTP/1.1" 200 7197 990003
+      192.168.2.145 - carol [05/Oct/2026:08:16:00 +0000] "GET /api/search?q=scarf&page=4 HTTP/1.1" 200 8298 139568
+      192.168.4.89 - bob [05/Oct/2026:08:16:15 +0000] "GET /api/cart HTTP/1.1" 200 1790 159270
+      192.168.7.68 - - [05/Oct/2026:08:16:40 +0000] "GET /api/users?id=45 HTTP/1.1" 200 4131 112553
+      192.168.4.24 - bob [05/Oct/2026:08:17:17 +0000] "GET /api/orders?id=16 HTTP/1.1" 200 3895 131086
+      192.168.7.193 - carol [05/Oct/2026:08:17:23 +0000] "GET /login HTTP/1.1" 200 7235 152559
+      192.168.4.92 - - [05/Oct/2026:08:17:55 +0000] "GET /api/cart HTTP/1.1" 200 5125 144555
+      192.168.1.236 - bob [05/Oct/2026:08:17:56 +0000] "GET /api/items?id=48 HTTP/1.1" 200 1630 80321
+hitl:
+  replies:
+  - match: .*
+    reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+  default_reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+memory: carry
+checks:
+- id: format
+  type: python
+  code: |
+    import re
+    lines = [l.rstrip() for l in path('stats/report-05.txt').read_text(encoding="utf-8").strip().splitlines()]
+    pats = [r"requests: \d+", r"errors: \d+", r"error_rate: \d+\.\d{2}%", r"p95_ms: \d+", r"slowest_endpoint: /\S*"]
+    assert len(lines) == 5, f"expected exactly 5 lines, got {len(lines)}: {lines}"
+    for line, pat in zip(lines, pats):
+        assert re.fullmatch(pat, line), f"line {line!r} does not match the required format {pat!r}"
+- id: requests
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-05.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'requests', 51
+    assert key in vals, f"no '{key}:' line in stats/report-05.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: errors
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-05.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'errors', 4
+    assert key in vals, f"no '{key}:' line in stats/report-05.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: error-rate
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-05.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'error_rate', '7.84'
+    assert key in vals, f"no '{key}:' line in stats/report-05.txt"
+    got = vals[key]
+    got_num = float(got.rstrip("%").strip())
+    assert abs(got_num - float(want)) < 0.006, f"error_rate: got {got}, expected {want}%"
+- id: p95-ms
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-05.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'p95_ms', 900
+    assert key in vals, f"no '{key}:' line in stats/report-05.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: slowest-endpoint
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-05.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'slowest_endpoint', '/api/analytics/daily'
+    assert key in vals, f"no '{key}:' line in stats/report-05.txt"
+    got = vals[key]
+    assert got == want, f"slowest_endpoint: got {got!r}, expected {want!r}"
+required:
+- format
+- requests
+- errors
+- error-rate
+- p95-ms
+- slowest-endpoint

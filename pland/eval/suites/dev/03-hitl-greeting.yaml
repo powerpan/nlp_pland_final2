@@ -1,0 +1,24 @@
+# dev 03 — HITL clarification: the language is only known after asking the simulated user
+id: dev-hitl-greeting
+title: Greeting script in the user's preferred language (must ask)
+category: hitl
+prompt: |
+  Write me a tiny greeting script in my preferred programming language — ask me which language that is, don't guess.
+  The script takes a name as its first command-line argument and prints exactly `Hello, <name>!`.
+  Save it in the workspace root as `greet` plus the usual file extension for that language.
+hitl:
+  replies:
+  - match: (?i)language|prefer|which|python|bash|shell|script
+    reply: Bash — a plain shell script, please.
+  default_reply: I prefer Bash (a plain .sh shell script). Use your best judgement for anything else.
+checks:
+- {id: asked, type: hitl, kind: clarify, min: 1}
+- {id: script-exists, type: file_exists, path: greet.sh}
+- id: script-works
+  type: python
+  code: |
+    import subprocess
+    for name in ["Ada", "Grace Hopper"]:
+        r = subprocess.run(["bash", str(path("greet.sh")), name], capture_output=True, text=True, timeout=30)
+        assert r.returncode == 0, f"bash greet.sh {name!r} exited {r.returncode}: {r.stderr[-300:]}"
+        assert r.stdout.strip() == f"Hello, {name}!", f"bash greet.sh {name!r} printed {r.stdout!r}"

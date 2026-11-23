@@ -1,0 +1,61 @@
+# midterm 07 — git push to a local bare repository created in setup (no real remote needed); the push asks for approval
+id: mid-git-push-bare
+title: Commit meeting notes and push them to a (local bare) remote
+category: git
+prompt: |
+  The bare repository `remote/notes.git` in your workspace acts as our team's git server. Please:
+
+  1. Create a new git repository in `notes/` on branch `main`.
+  2. Commit a file `notes.md` whose first line is the heading `# Meeting notes 2026-10-21`.
+  3. In a second commit, add a section `## Action items` to `notes.md` with these three Markdown bullet points:
+     `Alice: update the roadmap`, `Bob: fix the login bug`, `Carol: book the venue`.
+  4. Add `remote/notes.git` as the remote `origin` of the `notes/` repository and push `main` to it.
+
+  Leave the working tree of `notes/` clean.
+setup:
+  commands: [git init --bare -b main remote/notes.git]
+checks:
+- {id: remote-has-commits, type: git_commits, repo: remote/notes.git, ref: main, min: 2}
+- id: remote-up-to-date
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    bare, local = path("remote/notes.git"), path("notes")
+    r = git("--git-dir", str(bare), "rev-parse", "refs/heads/main")
+    assert r.returncode == 0, "the bare repository has no branch main: nothing was pushed"
+    h = git("rev-parse", "HEAD", cwd=local)
+    assert h.returncode == 0, "notes/ is not a git repository with commits"
+    assert r.stdout.strip() == h.stdout.strip(), "remote main is not the local HEAD (latest commit not pushed)"
+- id: pushed-content
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import re
+    r = git("--git-dir", str(path("remote/notes.git")), "show", "main:notes.md")
+    assert r.returncode == 0, "notes.md is not in the pushed main branch"
+    md = r.stdout
+    first = next((l for l in md.splitlines() if l.strip()), "")
+    assert first.strip() == "# Meeting notes 2026-10-21", f"first line is {first!r}"
+    assert re.search(r"(?m)^##\s+Action items\s*$", md), "no '## Action items' heading"
+    for item in ['Alice: update the roadmap', 'Bob: fix the login bug', 'Carol: book the venue']:
+        assert re.search(r"(?m)^\s*[-*+]\s+(\[[ xX]\]\s+)?" + re.escape(item) + r"\s*$", md), f"missing bullet {item!r}"
+- {id: clean-tree, type: git_clean, repo: notes}
+- id: origin-configured
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import os
+    r = git("remote", "get-url", "origin", cwd=path("notes"))
+    assert r.returncode == 0, "notes/ has no remote named origin"
+    url = r.stdout.strip()
+    target = url if os.path.isabs(url) else os.path.join(str(path("notes")), url)
+    assert os.path.realpath(target.removeprefix("file://")) == os.path.realpath(str(path("remote/notes.git"))), \
+        f"origin points to {url!r}, not remote/notes.git"
+- {id: push-approved, type: hitl, kind: approval, min: 1}
+required: [remote-has-commits, remote-up-to-date, pushed-content, clean-tree]

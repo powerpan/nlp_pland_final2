@@ -1,0 +1,161 @@
+# memory_evolution 04 — log format: took= ms/s. The simulated user refuses to repeat the conventions; only memory from earlier tasks helps.
+# expected: {'requests': 49, 'errors': 4, 'error_rate': '8.16', 'p95_ms': 1163, 'slowest_endpoint': '/api/exports/csv'}
+# traps (field changed if the convention is ignored): {'health': ['requests', 'error_rate', 'p95_ms', 'slowest_endpoint'], '4xx': ['errors', 'error_rate'], 'query': ['slowest_endpoint'], 'p95': ['p95_ms'], 'unit': 'took= ms/s'}
+id: memevo-04
+title: 'Log statistics #4 (took= ms/s)'
+category: memory
+prompt: |
+  Compute our standard request statistics for `logs/app-04.log` and write them to `stats/report-04.txt`.
+
+  `logs/app-04.log` is an application log in logfmt (`key=value` pairs separated by spaces). Request lines look like
+  `ts=<timestamp> level=<level> method=<METHOD> path=<path incl. query string> status=<status> took=<latency with unit, e.g. 45ms or 1.2s>`;
+  the file also contains other log lines that are not requests.
+
+  Apply our team's conventions for request-log statistics (if you don't know them, ask me).
+
+  The file must contain exactly these five lines, in this order, and nothing else:
+  requests: <number of requests counted>
+  errors: <number of requests counted as errors>
+  error_rate: <errors / requests × 100, with exactly two decimals>%
+  p95_ms: <95th-percentile latency in whole milliseconds>
+  slowest_endpoint: <endpoint with the highest mean latency>
+setup:
+  files:
+    logs/app-04.log: |
+      ts=2026-10-04T08:00:00Z level=info msg="server started" port=8080
+      ts=2026-10-04T08:00:28Z level=info method=GET path=/api/search?q=bag status=200 took=0.106s
+      ts=2026-10-04T08:00:59Z level=info method=GET path=/api/search?q=coat&page=4 status=200 took=91ms
+      ts=2026-10-04T08:01:00Z level=info method=GET path=/api/orders?id=65 status=204 took=0.125s
+      ts=2026-10-04T08:01:22Z level=info method=GET path=/api/users?id=70 status=200 took=0.047s
+      ts=2026-10-04T08:01:43Z level=info method=GET path=/healthz status=200 took=2349ms
+      ts=2026-10-04T08:02:00Z level=info method=GET path=/login status=304 took=109ms
+      ts=2026-10-04T08:02:07Z level=warn method=GET path=/login?id=28 status=403 took=85ms
+      ts=2026-10-04T08:02:25Z level=info method=GET path=/api/search?q=black+friday status=200 took=2.08s
+      ts=2026-10-04T08:02:34Z level=info method=GET path=/api/items status=200 took=48ms
+      ts=2026-10-04T08:02:56Z level=info method=GET path=/api/orders status=200 took=101ms
+      ts=2026-10-04T08:03:27Z level=info method=GET path=/api/cart?id=46 status=200 took=178ms
+      ts=2026-10-04T08:03:31Z level=info method=GET path=/login?id=66 status=200 took=185ms
+      ts=2026-10-04T08:20:13Z level=info msg="cache warmed" entries=5120
+      ts=2026-10-04T08:03:50Z level=info method=GET path=/api/users status=200 took=0.095s
+      ts=2026-10-04T08:04:27Z level=info method=GET path=/api/items status=200 took=32ms
+      ts=2026-10-04T08:04:30Z level=info method=GET path=/api/cart?id=71 status=200 took=84ms
+      ts=2026-10-04T08:05:01Z level=info method=GET path=/api/search?q=shoes status=200 took=0.222s
+      ts=2026-10-04T08:05:16Z level=error method=GET path=/api/exports/csv status=503 took=0.826s
+      ts=2026-10-04T08:05:53Z level=info method=GET path=/api/users?id=90 status=200 took=116ms
+      ts=2026-10-04T08:06:01Z level=info method=GET path=/api/cart status=200 took=0.117s
+      ts=2026-10-04T08:06:04Z level=info method=GET path=/login status=200 took=166ms
+      ts=2026-10-04T08:06:31Z level=info method=GET path=/login?id=86 status=200 took=0.256s
+      ts=2026-10-04T08:06:34Z level=info method=GET path=/api/items?id=47 status=200 took=0.04s
+      ts=2026-10-04T08:06:55Z level=info method=GET path=/api/cart status=201 took=70ms
+      ts=2026-10-04T08:07:35Z level=error method=GET path=/login?id=40 status=503 took=240ms
+      ts=2026-10-04T08:07:43Z level=info method=GET path=/api/users status=200 took=128ms
+      ts=2026-10-04T08:07:46Z level=info method=GET path=/api/search?q=shoes status=200 took=0.173s
+      ts=2026-10-04T08:47:02Z level=warn msg="slow disk" device=sda1
+      ts=2026-10-04T08:07:50Z level=info method=GET path=/api/orders?id=89 status=200 took=0.14s
+      ts=2026-10-04T08:08:28Z level=warn method=GET path=/api/search?q=coat&page=3 status=403 took=0.114s
+      ts=2026-10-04T08:09:00Z level=info method=GET path=/login status=200 took=219ms
+      ts=2026-10-04T08:09:02Z level=info method=GET path=/healthz status=200 took=2441ms
+      ts=2026-10-04T08:09:33Z level=info method=GET path=/api/search?q=scarf&page=3 status=200 took=205ms
+      ts=2026-10-04T08:09:38Z level=info method=GET path=/api/items status=200 took=70ms
+      ts=2026-10-04T08:09:41Z level=info method=GET path=/api/cart status=200 took=91ms
+      ts=2026-10-04T08:09:46Z level=info method=GET path=/login status=200 took=0.221s
+      ts=2026-10-04T08:10:18Z level=info method=GET path=/api/cart status=204 took=127ms
+      ts=2026-10-04T08:10:45Z level=info method=GET path=/api/exports/csv status=200 took=1288ms
+      ts=2026-10-04T08:11:13Z level=info method=GET path=/api/orders status=200 took=0.206s
+      ts=2026-10-04T08:11:25Z level=info method=GET path=/api/users?id=63 status=200 took=71ms
+      ts=2026-10-04T08:11:47Z level=info method=GET path=/healthz status=200 took=2312ms
+      #### log rotated ####
+      ts=2026-10-04T08:11:58Z level=info method=GET path=/api/exports/csv status=200 took=1025ms
+      ts=2026-10-04T08:12:20Z level=error method=GET path=/api/users status=502 took=0.138s
+      ts=2026-10-04T08:12:24Z level=info method=GET path=/api/items status=200 took=0.041s
+      ts=2026-10-04T08:12:42Z level=info method=GET path=/health status=200 took=1758ms
+      ts=2026-10-04T08:12:57Z level=info method=GET path=/api/cart status=200 took=0.091s
+      ts=2026-10-04T08:13:02Z level=info method=GET path=/login status=200 took=0.105s
+      ts=2026-10-04T08:13:03Z level=info method=GET path=/api/items status=200 took=0.051s
+      ts=2026-10-04T08:13:22Z level=info method=GET path=/healthz status=200 took=1618ms
+      ts=2026-10-04T08:14:01Z level=warn method=POST path=/api/orders status=401 took=0.075s
+      ts=2026-10-04T08:14:12Z level=info method=GET path=/api/cart status=200 took=0.163s
+      ts=2026-10-04T08:14:20Z level=error method=GET path=/api/items status=503 took=60ms
+      ts=2026-10-04T08:14:39Z level=info method=GET path=/api/orders status=200 took=106ms
+      ts=2026-10-04T08:14:44Z level=info method=GET path=/api/exports/csv status=200 took=1.163s
+      ts=2026-10-04T08:15:17Z level=info method=GET path=/login?id=87 status=200 took=100ms
+      ts=2026-10-04T08:15:39Z level=info method=GET path=/api/items?id=56 status=200 took=0.087s
+hitl:
+  replies:
+  - match: .*
+    reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+  default_reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+memory: carry
+checks:
+- id: format
+  type: python
+  code: |
+    import re
+    lines = [l.rstrip() for l in path('stats/report-04.txt').read_text(encoding="utf-8").strip().splitlines()]
+    pats = [r"requests: \d+", r"errors: \d+", r"error_rate: \d+\.\d{2}%", r"p95_ms: \d+", r"slowest_endpoint: /\S*"]
+    assert len(lines) == 5, f"expected exactly 5 lines, got {len(lines)}: {lines}"
+    for line, pat in zip(lines, pats):
+        assert re.fullmatch(pat, line), f"line {line!r} does not match the required format {pat!r}"
+- id: requests
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-04.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'requests', 49
+    assert key in vals, f"no '{key}:' line in stats/report-04.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: errors
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-04.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'errors', 4
+    assert key in vals, f"no '{key}:' line in stats/report-04.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: error-rate
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-04.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'error_rate', '8.16'
+    assert key in vals, f"no '{key}:' line in stats/report-04.txt"
+    got = vals[key]
+    got_num = float(got.rstrip("%").strip())
+    assert abs(got_num - float(want)) < 0.006, f"error_rate: got {got}, expected {want}%"
+- id: p95-ms
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-04.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'p95_ms', 1163
+    assert key in vals, f"no '{key}:' line in stats/report-04.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: slowest-endpoint
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-04.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'slowest_endpoint', '/api/exports/csv'
+    assert key in vals, f"no '{key}:' line in stats/report-04.txt"
+    got = vals[key]
+    assert got == want, f"slowest_endpoint: got {got!r}, expected {want!r}"
+required:
+- format
+- requests
+- errors
+- error-rate
+- p95-ms
+- slowest-endpoint

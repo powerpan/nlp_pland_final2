@@ -1,0 +1,162 @@
+# memory_evolution 02 — log format: float ms. The simulated user refuses to repeat the conventions; only memory from earlier tasks helps.
+# expected: {'requests': 53, 'errors': 3, 'error_rate': '5.66', 'p95_ms': 861, 'slowest_endpoint': '/api/invoices/pdf'}
+# traps (field changed if the convention is ignored): {'health': ['requests', 'error_rate', 'p95_ms', 'slowest_endpoint'], '4xx': ['errors', 'error_rate'], 'query': ['slowest_endpoint'], 'p95': ['p95_ms'], 'unit': 'float ms'}
+id: memevo-02
+title: 'Log statistics #2 (float ms)'
+category: memory
+prompt: |
+  Compute our standard request statistics for `logs/events-02.jsonl` and write them to `stats/report-02.txt`.
+
+  `logs/events-02.jsonl` has one JSON object per line:
+  `{"time": ..., "req": {"method": ..., "url": <path incl. query string>}, "res": {"status": ...}, "duration_ms": <latency in ms, may have decimals>}`.
+
+  Apply our team's conventions for request-log statistics (if you don't know them, ask me).
+
+  The file must contain exactly these five lines, in this order, and nothing else:
+  requests: <number of requests counted>
+  errors: <number of requests counted as errors>
+  error_rate: <errors / requests × 100, with exactly two decimals>%
+  p95_ms: <95th-percentile latency in whole milliseconds>
+  slowest_endpoint: <endpoint with the highest mean latency>
+setup:
+  files:
+    logs/events-02.jsonl: |
+      {"time": "2026-10-02T08:00:09Z", "req": {"method": "GET", "url": "/login"}, "res": {"status": 200}, "duration_ms": 201.8}
+      {"time": "2026-10-02T08:00:23Z", "req": {"method": "GET", "url": "/login"}, "res": {"status": 200}, "duration_ms": 241.8}
+      {"time": "2026-10-02T08:00:29Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 196.9}
+      {"time": "2026-10-02T08:01:00Z", "req": {"method": "GET", "url": "/login"}, "res": {"status": 200}, "duration_ms": 163.7}
+      {"time": "2026-10-02T08:01:06Z", "req": {"method": "GET", "url": "/api/users"}, "res": {"status": 204}, "duration_ms": 87.2}
+      {"time": "2026-10-02T08:01:21Z", "req": {"method": "GET", "url": "/api/items"}, "res": {"status": 500}, "duration_ms": 108.2}
+      {"time": "2026-10-02T08:01:50Z", "req": {"method": "GET", "url": "/api/users"}, "res": {"status": 200}, "duration_ms": 61.3}
+      {"time": "2026-10-02T08:02:14Z", "req": {"method": "GET", "url": "/api/invoices/pdf"}, "res": {"status": 200}, "duration_ms": 895.3}
+      {"time": "2026-10-02T08:02:37Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 203.2}
+      {"time": "2026-10-02T08:03:08Z", "req": {"method": "GET", "url": "/api/items?id=59"}, "res": {"status": 500}, "duration_ms": 117.8}
+      {"time": "2026-10-02T08:03:13Z", "req": {"method": "GET", "url": "/api/cart?id=50"}, "res": {"status": 200}, "duration_ms": 149.1}
+      {"time": "2026-10-02T08:03:37Z", "req": {"method": "GET", "url": "/login?id=72"}, "res": {"status": 403}, "duration_ms": 100.0}
+      {"time": "2026-10-02T08:03:38Z", "req": {"method": "GET", "url": "/api/invoices/pdf"}, "res": {"status": 200}, "duration_ms": 536.4}
+      {"time": "2026-10-02T08:03:46Z", "req": {"method": "GET", "url": "/api/cart"}, "res": {"status": 500}, "duration_ms": 87.4}
+      {"time": "2026-10-02T08:04:22Z", "req": {"method": "GET", "url": "/api/items"}, "res": {"status": 200}, "duration_ms": 116.3}
+      {"time": "2026-10-02T08:04:39Z", "req": {"method": "GET", "url": "/healthz"}, "res": {"status": 200}, "duration_ms": 2406.0}
+      {"time": "2026-10-02T08:04:42Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 134.7}
+      {"time": "2026-10-02T08:04:43Z", "req": {"method": "GET", "url": "/api/users?id=93"}, "res": {"status": 200}, "duration_ms": 86.6}
+      {"time": "2026-10-02T08:05:07Z", "req": {"method": "GET", "url": "/api/users"}, "res": {"status": 200}, "duration_ms": 120.6}
+      {"time": "2026-10-02T09:13:07Z", "req": {"method": "GET", "url": "/api/users"
+      {"time": "2026-10-02T08:05:47Z", "req": {"method": "GET", "url": "/api/users"}, "res": {"status": 400}, "duration_ms": 89.6}
+      {"time": "2026-10-02T08:06:07Z", "req": {"method": "GET", "url": "/api/search?q=coat&page=2"}, "res": {"status": 200}, "duration_ms": 96.2}
+      {"time": "2026-10-02T08:06:31Z", "req": {"method": "GET", "url": "/healthz"}, "res": {"status": 200}, "duration_ms": 2471.3}
+      {"time": "2026-10-02T08:06:50Z", "req": {"method": "POST", "url": "/login"}, "res": {"status": 201}, "duration_ms": 233.0}
+      {"time": "2026-10-02T08:07:21Z", "req": {"method": "GET", "url": "/api/cart?id=29"}, "res": {"status": 200}, "duration_ms": 130.6}
+      {"time": "2026-10-02T08:07:22Z", "req": {"method": "GET", "url": "/api/invoices/pdf"}, "res": {"status": 200}, "duration_ms": 508.9}
+      {"time": "2026-10-02T08:07:53Z", "req": {"method": "GET", "url": "/api/users"}, "res": {"status": 200}, "duration_ms": 127.1}
+      {"time": "2026-10-02T08:08:06Z", "req": {"method": "GET", "url": "/api/cart"}, "res": {"status": 404}, "duration_ms": 123.4}
+      {"time": "2026-10-02T08:08:15Z", "req": {"method": "GET", "url": "/api/items"}, "res": {"status": 200}, "duration_ms": 39.0}
+      {"time": "2026-10-02T08:08:53Z", "req": {"method": "GET", "url": "/api/cart"}, "res": {"status": 200}, "duration_ms": 122.2}
+      {"time": "2026-10-02T08:09:18Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 138.7}
+      {"time": "2026-10-02T08:09:58Z", "req": {"method": "GET", "url": "/api/cart"}, "res": {"status": 401}, "duration_ms": 97.8}
+      {"time": "2026-10-02T08:10:11Z", "req": {"method": "POST", "url": "/login?id=76"}, "res": {"status": 201}, "duration_ms": 221.7}
+      {"time": "2026-10-02T08:10:27Z", "req": {"method": "GET", "url": "/healthz"}, "res": {"status": 200}, "duration_ms": 1561.9}
+      {"time": "2026-10-02T08:10:33Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 96.4}
+      {"time": "2026-10-02T08:10:39Z", "req": {"method": "GET", "url": "/api/items"}, "res": {"status": 200}, "duration_ms": 47.8}
+      {"time": "2026-10-02T08:11:14Z", "req": {"method": "GET", "url": "/api/invoices/pdf"}, "res": {"status": 404}, "duration_ms": 509.2}
+      {"time": "2026-10-02T08:11:24Z", "req": {"method": "GET", "url": "/api/search?q=winter+sale"}, "res": {"status": 200}, "duration_ms": 1520.0}
+      {"time": "2026-10-02T08:11:51Z", "req": {"method": "GET", "url": "/api/search?q=red+shirt"}, "res": {"status": 200}, "duration_ms": 248.3}
+      {"time": "2026-10-02T09:41:55Z", "req": {"meth
+      {"time": "2026-10-02T08:12:31Z", "req": {"method": "GET", "url": "/health/ready"}, "res": {"status": 200}, "duration_ms": 2143.1}
+      {"time": "2026-10-02T08:12:34Z", "req": {"method": "GET", "url": "/login?id=5"}, "res": {"status": 200}, "duration_ms": 218.0}
+      {"time": "2026-10-02T08:12:36Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 165.4}
+      {"time": "2026-10-02T08:12:49Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 128.2}
+      {"time": "2026-10-02T08:13:00Z", "req": {"method": "GET", "url": "/api/invoices/pdf"}, "res": {"status": 200}, "duration_ms": 860.9}
+      {"time": "2026-10-02T08:13:24Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 115.6}
+      {"time": "2026-10-02T08:14:04Z", "req": {"method": "GET", "url": "/api/orders?id=3"}, "res": {"status": 200}, "duration_ms": 198.3}
+      {"time": "2026-10-02T08:14:08Z", "req": {"method": "GET", "url": "/healthz"}, "res": {"status": 200}, "duration_ms": 1758.3}
+      {"time": "2026-10-02T08:14:13Z", "req": {"method": "GET", "url": "/api/orders"}, "res": {"status": 200}, "duration_ms": 177.6}
+      {"time": "2026-10-02T08:14:19Z", "req": {"method": "GET", "url": "/api/cart"}, "res": {"status": 401}, "duration_ms": 93.2}
+      {"time": "2026-10-02T08:14:30Z", "req": {"method": "GET", "url": "/api/invoices/pdf"}, "res": {"status": 200}, "duration_ms": 575.1}
+      {"time": "2026-10-02T08:14:34Z", "req": {"method": "GET", "url": "/login"}, "res": {"status": 404}, "duration_ms": 186.3}
+      {"time": "2026-10-02T08:14:44Z", "req": {"method": "GET", "url": "/api/orders?id=12"}, "res": {"status": 200}, "duration_ms": 174.6}
+      {"time": "2026-10-02T08:15:07Z", "req": {"method": "POST", "url": "/api/orders"}, "res": {"status": 401}, "duration_ms": 172.4}
+      {"time": "2026-10-02T08:15:08Z", "req": {"method": "GET", "url": "/login"}, "res": {"status": 200}, "duration_ms": 80.8}
+      {"time": "2026-10-02T08:15:09Z", "req": {"method": "GET", "url": "/api/users"}, "res": {"status": 200}, "duration_ms": 47.6}
+      {"time": "2026-10-02T08:15:13Z", "req": {"method": "GET", "url": "/api/search?q=scarf&page=3"}, "res": {"status": 200}, "duration_ms": 134.7}
+      {"time": "2026-10-02T08:15:31Z", "req": {"method": "GET", "url": "/api/search?q=red+shirt"}, "res": {"status": 200}, "duration_ms": 164.2}
+      {"time": "2026-10-02T08:15:59Z", "req": {"method": "GET", "url": "/api/cart"}, "res": {"status": 200}, "duration_ms": 97.0}
+      {"time": "2026-10-02T08:16:13Z", "req": {"method": "GET", "url": "/login?id=20"}, "res": {"status": 200}, "duration_ms": 105.7}
+hitl:
+  replies:
+  - match: .*
+    reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+  default_reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+memory: carry
+checks:
+- id: format
+  type: python
+  code: |
+    import re
+    lines = [l.rstrip() for l in path('stats/report-02.txt').read_text(encoding="utf-8").strip().splitlines()]
+    pats = [r"requests: \d+", r"errors: \d+", r"error_rate: \d+\.\d{2}%", r"p95_ms: \d+", r"slowest_endpoint: /\S*"]
+    assert len(lines) == 5, f"expected exactly 5 lines, got {len(lines)}: {lines}"
+    for line, pat in zip(lines, pats):
+        assert re.fullmatch(pat, line), f"line {line!r} does not match the required format {pat!r}"
+- id: requests
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-02.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'requests', 53
+    assert key in vals, f"no '{key}:' line in stats/report-02.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: errors
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-02.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'errors', 3
+    assert key in vals, f"no '{key}:' line in stats/report-02.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: error-rate
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-02.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'error_rate', '5.66'
+    assert key in vals, f"no '{key}:' line in stats/report-02.txt"
+    got = vals[key]
+    got_num = float(got.rstrip("%").strip())
+    assert abs(got_num - float(want)) < 0.006, f"error_rate: got {got}, expected {want}%"
+- id: p95-ms
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-02.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'p95_ms', 861
+    assert key in vals, f"no '{key}:' line in stats/report-02.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: slowest-endpoint
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-02.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'slowest_endpoint', '/api/invoices/pdf'
+    assert key in vals, f"no '{key}:' line in stats/report-02.txt"
+    got = vals[key]
+    assert got == want, f"slowest_endpoint: got {got!r}, expected {want!r}"
+required:
+- format
+- requests
+- errors
+- error-rate
+- p95-ms
+- slowest-endpoint

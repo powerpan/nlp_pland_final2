@@ -1,0 +1,30 @@
+# dev 01 — file read/write with computed values
+id: dev-file-wordcount
+title: Count lines/words of a text file
+category: files
+prompt: |
+  Read `notes/poem.txt` and write `counts.txt` in the workspace root with exactly these three lines:
+
+  lines: <number of non-empty lines>
+  words: <number of whitespace-separated words>
+  top_word: <most frequent word, compared case-insensitively, written in lowercase>
+setup:
+  files:
+    notes/poem.txt: |
+      The quick brown fox jumps over the lazy dog
+      The dog sleeps in the sun
+
+      A fox is quick and the dog is lazy
+      The end
+checks:
+- {id: counts-exists, type: file_exists, path: counts.txt}
+- id: counts-correct
+  type: python
+  code: |
+    import re
+    text = path("counts.txt").read_text(encoding="utf-8")
+    want = {"lines": "4", "words": "26", "top_word": "the"}
+    for key, val in want.items():
+        m = re.search(r"(?im)^\W*" + key + r"\W*[:=]\s*`?([\w]+)", text)
+        assert m, f"no '{key}:' line in counts.txt"
+        assert m.group(1).lower() == val, f"{key}: got {m.group(1)!r}, expected {val!r}"

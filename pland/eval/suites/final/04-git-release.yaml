@@ -1,0 +1,135 @@
+# final 04 — git workflow: branch, --no-ff merge, release commit, annotated tag, push branch+tag to a local bare remote
+id: final-git-release
+title: Feature branch, --no-ff merge, version bump, annotated tag, push
+category: git
+prompt: |
+  `app/` is a git repository whose remote `origin` is the bare repository `remote/app.git` (already up to date with
+  `main` and tag `v0.1.0`). Ship release 0.2.0 with this workflow:
+
+  1. Create the branch `feature/greet-name` from `main`. On it, change `greet()` in `app/greeter.py` to
+     `greet(name=None)`: it returns `Hello, <name>!` for a non-empty name (surrounding whitespace stripped) and
+     `Hello, world!` when the name is None, empty or only whitespace. Add tests for the new behaviour to
+     `app/test_greeter.py`. Commit on the branch.
+  2. Merge the branch into `main` with a merge commit (`git merge --no-ff`); keep the branch.
+  3. On `main`, change `VERSION` to `0.2.0` and add a `## 0.2.0` section describing the change to `CHANGELOG.md`,
+     above `## 0.1.0`. Commit with the message `chore(release): 0.2.0`.
+  4. Create the annotated tag `v0.2.0` on that commit.
+  5. Push `main`, the branch `feature/greet-name` and the tag `v0.2.0` to `origin`.
+
+  At the end the working tree must be clean and the tests must pass.
+setup:
+  files:
+    app/greeter.py: |
+      def greet():
+          return "Hello, world!"
+    app/test_greeter.py: |
+      from greeter import greet
+
+
+      def test_default_greeting():
+          assert greet() == "Hello, world!"
+    app/VERSION: |
+      0.1.0
+    app/CHANGELOG.md: |
+      # Changelog
+
+      ## 0.1.0
+
+      - Initial release.
+  commands:
+  - git init -q --bare -b main remote/app.git
+  - 'cd app && git init -q -b main && git add -A && git commit -qm ''chore(release): 0.1.0'' && git tag -a v0.1.0 -m ''Release 0.1.0'' && git remote add origin ../remote/app.git && git push -q origin main v0.1.0'
+checks:
+- {id: clean-tree, type: git_clean, repo: app}
+- id: main-pushed
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    bare = str(path("remote/app.git"))
+    remote_main = git("--git-dir", bare, "rev-parse", "refs/heads/main").stdout.strip()
+    local_main = git("rev-parse", "refs/heads/main", cwd=path("app")).stdout.strip()
+    assert remote_main and remote_main == local_main, "origin/main is not the local main (not pushed?)"
+    merges = git("--git-dir", bare, "rev-list", "--merges", "--count", "v0.1.0..main").stdout.strip()
+    assert merges.isdigit() and int(merges) >= 1, "main has no merge commit since v0.1.0 (use git merge --no-ff)"
+- id: feature-branch
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    bare = str(path("remote/app.git"))
+    r = git("--git-dir", bare, "rev-parse", "refs/heads/feature/greet-name")
+    assert r.returncode == 0, "branch feature/greet-name was not pushed to origin"
+    anc = git("--git-dir", bare, "merge-base", "--is-ancestor", "refs/heads/feature/greet-name", "refs/heads/main")
+    assert anc.returncode == 0, "feature/greet-name is not merged into main"
+    changed = git("--git-dir", bare, "log", "--format=%H", "v0.1.0..refs/heads/feature/greet-name", "--", "greeter.py").stdout.split()
+    assert changed, "no commit on feature/greet-name changes greeter.py"
+- id: annotated-tag
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import re
+    bare = str(path("remote/app.git"))
+    r = git("--git-dir", bare, "cat-file", "-t", "refs/tags/v0.2.0")
+    assert r.returncode == 0, "tag v0.2.0 was not pushed to origin"
+    assert r.stdout.strip() == "tag", "v0.2.0 is a lightweight tag; an annotated tag is required"
+    msg = git("--git-dir", bare, "log", "-1", "--format=%s", "v0.2.0^{commit}").stdout.strip()
+    assert re.match(r"chore\(release\): 0\.2\.0\b", msg), f"the tagged commit's message is {msg!r}"
+    anc = git("--git-dir", bare, "merge-base", "--is-ancestor", "v0.2.0^{commit}", "refs/heads/main")
+    assert anc.returncode == 0, "the tagged commit is not on main"
+- id: release-files
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    bare = str(path("remote/app.git"))
+    ver = git("--git-dir", bare, "show", "v0.2.0:VERSION").stdout.strip()
+    assert ver == "0.2.0", f"VERSION at v0.2.0 is {ver!r}"
+    log = git("--git-dir", bare, "show", "v0.2.0:CHANGELOG.md").stdout
+    i, j = log.find("## 0.2.0"), log.find("## 0.1.0")
+    assert i != -1 and j != -1 and i < j, "CHANGELOG.md at v0.2.0 needs a '## 0.2.0' section above '## 0.1.0'"
+- id: code-at-tag
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    import io, subprocess, sys, tarfile, tempfile
+    bare = str(path("remote/app.git"))
+    r = subprocess.run(["git", "--git-dir", bare, "archive", "--format=tar", "v0.2.0"], capture_output=True, timeout=60)
+    assert r.returncode == 0, "cannot read the tree of v0.2.0"
+    with tempfile.TemporaryDirectory() as d:
+        with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+            tf.extractall(d)
+        g = load("greeter_at_tag", Path(d) / "greeter.py")
+        for args, want in [((), "Hello, world!"), ((None,), "Hello, world!"), (("",), "Hello, world!"),
+                           (("   ",), "Hello, world!"), (("Ada",), "Hello, Ada!"), (("  Bob ",), "Hello, Bob!")]:
+            got = g.greet(*args)
+            assert got == want, f"greet{args} = {got!r}, expected {want!r}"
+        pytest_in(d, 2)
+- {id: push-approved, type: hitl, kind: approval, min: 1}
+required:
+- clean-tree
+- main-pushed
+- feature-branch
+- annotated-tag
+- release-files
+- code-at-tag

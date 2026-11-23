@@ -1,0 +1,79 @@
+# midterm 01 — files: read CSV setup data, write a Markdown report; numbers are parsed and recomputed
+id: mid-files-sales-report
+title: Sales CSV → Markdown report with computed statistics
+category: files
+prompt: |
+  `data/sales.csv` lists this month's orders, one row per order (revenue of an order = units × unit_price).
+  Write a Markdown report `report.md` in the workspace root that contains these labelled lines (amounts rounded to
+  2 decimals, no currency symbol needed):
+
+  Orders: <number of orders>
+  Total revenue: <sum of all order revenues>
+  Average order value: <total revenue / number of orders>
+  Top product by units: <product with the most units sold>
+  Top product by revenue: <product with the highest total revenue>
+
+  followed by a Markdown table with the columns `Region | Revenue`: one row per region, sorted by revenue from
+  highest to lowest.
+setup:
+  files:
+    data/sales.csv: |
+      order_id,date,region,product,units,unit_price
+      1001,2026-09-01,North,Widget,4,12.50
+      1002,2026-09-01,South,Gadget,2,30.00
+      1003,2026-09-02,East,Widget,10,12.50
+      1004,2026-09-03,West,Gizmo,1,99.99
+      1005,2026-09-03,North,Gadget,3,30.00
+      1006,2026-09-04,South,Widget,6,12.50
+      1007,2026-09-05,East,Gizmo,2,99.99
+      1008,2026-09-05,West,Widget,8,12.50
+      1009,2026-09-06,North,Gizmo,1,99.99
+      1010,2026-09-07,South,Gadget,5,30.00
+      1011,2026-09-08,East,Gadget,1,30.00
+      1012,2026-09-08,West,Gadget,4,30.00
+      1013,2026-09-09,North,Widget,7,12.50
+      1014,2026-09-10,South,Gizmo,3,99.99
+      1015,2026-09-10,East,Widget,2,12.50
+      1016,2026-09-11,West,Gizmo,2,99.99
+      1017,2026-09-12,North,Gadget,6,30.00
+      1018,2026-09-12,South,Widget,9,12.50
+checks:
+- {id: report-exists, type: file_exists, path: report.md}
+- id: totals
+  type: python
+  code: |
+    import re
+    text = path("report.md").read_text(encoding="utf-8")
+    E = {'orders': 18, 'total': 2104.91, 'aov': 116.94, 'top_units': 'Widget', 'top_revenue': 'Gizmo', 'regions': {'South': 697.47, 'West': 519.97, 'North': 507.49, 'East': 379.98}}
+    def num(label):
+        m = re.search(r"(?im)^[\s>*_\-]*" + label + r"[\s*_]*[:=][\s*_]*\$?\s*(-?[\d,]+(?:\.\d+)?)", text)
+        assert m, f"no '{label}:' line with a number in report.md"
+        return float(m.group(1).replace(",", ""))
+    assert num("orders") == E["orders"], f"Orders: got {num('orders')}, expected {E['orders']}"
+    assert abs(num("total revenue") - E["total"]) <= 0.011, f"Total revenue: got {num('total revenue')}, expected {E['total']}"
+    assert abs(num("average order value") - E["aov"]) <= 0.011, f"Average order value: got {num('average order value')}, expected {E['aov']}"
+- id: top-products
+  type: python
+  code: |
+    import re
+    text = path("report.md").read_text(encoding="utf-8")
+    E = {'orders': 18, 'total': 2104.91, 'aov': 116.94, 'top_units': 'Widget', 'top_revenue': 'Gizmo', 'regions': {'South': 697.47, 'West': 519.97, 'North': 507.49, 'East': 379.98}}
+    for label, want in [("top product by units", E["top_units"]), ("top product by revenue", E["top_revenue"])]:
+        m = re.search(r"(?im)^[\s>*_\-]*" + label + r"[\s*_]*[:=][\s*_`]*([A-Za-z]+)", text)
+        assert m, f"no '{label}:' line in report.md"
+        assert m.group(1).lower() == want.lower(), f"{label}: got {m.group(1)!r}, expected {want!r}"
+- id: region-table
+  type: python
+  code: |
+    import re
+    text = path("report.md").read_text(encoding="utf-8")
+    E = {'orders': 18, 'total': 2104.91, 'aov': 116.94, 'top_units': 'Widget', 'top_revenue': 'Gizmo', 'regions': {'South': 697.47, 'West': 519.97, 'North': 507.49, 'East': 379.98}}
+    pos = {}
+    for region, want in E["regions"].items():
+        m = re.search(r"(?im)^\s*\|?\s*\**" + region + r"\**\s*\|\s*\$?\s*([\d,]+(?:\.\d+)?)", text)
+        assert m, f"no table row for region {region}"
+        got = float(m.group(1).replace(",", ""))
+        assert abs(got - want) <= 0.011, f"{region}: got {got}, expected {want}"
+        pos[region] = m.start()
+    order = sorted(pos, key=pos.get)
+    assert order == list(E["regions"]), f"rows not sorted by revenue (desc): {order}"

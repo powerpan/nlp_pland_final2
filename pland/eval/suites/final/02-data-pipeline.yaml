@@ -1,0 +1,192 @@
+# final 02 — data pipeline: messy multi-format inputs, exact outputs, and a hidden re-run on unseen data
+id: final-data-pipeline
+title: Re-runnable data-cleaning pipeline over messy CSV + JSONL exports
+category: files
+prompt: |
+  Write a re-runnable data pipeline `pipeline.py` (single file, standard library only) in the workspace root and run
+  it. `python pipeline.py`, started from the workspace root, must read the exports in `raw/` and write the results
+  to `out/`. We will re-run it on next month's exports (same file names and formats, different rows), so it must
+  compute everything from the files — no hard-coded values.
+
+  Inputs:
+  - `raw/store_orders.csv` — columns `order_id,date,customer,sku,qty,unit_price,currency`; `date` is either
+    `YYYY-MM-DD` or `DD/MM/YYYY`; `unit_price` may contain thousands separators (`"1,049.00"`) or be empty.
+  - `raw/web_orders.jsonl` — one JSON object per line with the keys `id`, `ts` (UTC timestamp such as
+    `2026-10-05T14:03:00Z`), `customer`, `sku`, `quantity`, `price` (string or number; may be missing or invalid)
+    and `cur` (currency).
+  - `raw/products.csv` — `sku,name,category`.
+  - `raw/fx.csv` — `currency,usd_rate` (the USD value of one unit of the currency).
+
+  Rules:
+  1. Process `store_orders.csv` first, then `web_orders.jsonl`, each in file order. A record whose order id already
+     appeared in an earlier record (valid or not) is a duplicate: drop it and count it in `duplicates_removed`
+     (duplicates are not counted as invalid).
+  2. A non-duplicate record is invalid — drop it and count it in `invalid_rows` — if its quantity is not a positive
+     whole number (in the CSV: digits only), its sku is not in products.csv, its price is missing or not a number,
+     or its currency is not in fx.csv.
+  3. Customer names: trim, collapse inner runs of whitespace to one space, then title-case (`" alice  cooper "` →
+     `Alice Cooper`).
+  4. `revenue_usd` of an order = quantity × unit price × usd_rate, rounded to 2 decimals.
+  5. The order date is the calendar date `YYYY-MM-DD` of `date` / `ts`.
+
+  Outputs:
+  - `out/clean_orders.csv` with the header `order_id,date,customer,sku,category,qty,revenue_usd`, one row per valid
+    order sorted by date, then order_id; `revenue_usd` written with exactly 2 decimals.
+  - `out/summary.json` with exactly these keys: `valid_orders`, `invalid_rows`, `duplicates_removed` (integers),
+    `total_revenue_usd` (sum of the per-order revenues, rounded to 2 decimals), `revenue_by_category` and
+    `revenue_by_month` (objects mapping category / `YYYY-MM` to revenue, rounded to 2 decimals), and
+    `top_customer` (the customer with the highest total revenue).
+setup:
+  files:
+    raw/products.csv: |
+      sku,name,category
+      KB-01,Mechanical keyboard,Peripherals
+      MS-02,Wireless mouse,Peripherals
+      MN-27,27in monitor,Displays
+      MN-32,32in monitor,Displays
+      DK-10,Standing desk,Furniture
+      CH-20,Ergonomic chair,Furniture
+      CB-05,USB-C cable,Accessories
+    raw/fx.csv: |
+      currency,usd_rate
+      USD,1.0
+      EUR,1.08
+      GBP,1.27
+    raw/store_orders.csv: |
+      order_id,date,customer,sku,qty,unit_price,currency
+      S-1001,2026-09-02,Alice Cooper,KB-01,1,"1,049.00",EUR
+      S-1002,03/09/2026,bob  marley,MS-02,2,25.50,USD
+      S-1003,2026-09-05, carol king ,MN-27,1,329.99,GBP
+      S-1004,07/09/2026,ALICE COOPER,CB-05,4,9.99,USD
+      S-1005,2026-09-09,Dave Grohl,XX-99,1,10.00,USD
+      S-1006,2026-09-12,bob marley,DK-10,1,"1,299.00",USD
+      S-1007,15/09/2026,Erin Moran,CH-20,0,349.00,EUR
+      S-1002,2026-09-16,Bob Marley,MS-02,1,25.50,USD
+      S-1008,2026-09-20,Frank Ocean,MN-32,2,,USD
+      S-1009,22/09/2026,carol  king,KB-01,1,"1,049.00",CHF
+      S-1010,2026-09-28,Grace Slick,CH-20,2,349.00,EUR
+      S-1011,02/10/2026,dave grohl,MN-27,1,329.99,GBP
+      S-1012,2026-10-04,Alice cooper,MS-02,3,25.50,USD
+    raw/web_orders.jsonl: |
+      {"id": "W-2001", "ts": "2026-09-30T22:15:00Z", "customer": "Erin Moran", "sku": "MN-32", "quantity": 1, "price": "549.00", "cur": "USD"}
+      {"id": "W-2002", "ts": "2026-10-01T08:00:00Z", "customer": "frank ocean", "sku": "CB-05", "quantity": 10, "price": 9.99, "cur": "USD"}
+      {"id": "S-1012", "ts": "2026-10-04T10:00:00Z", "customer": "Alice Cooper", "sku": "MS-02", "quantity": 3, "price": "25.50", "cur": "USD"}
+      {"id": "W-2003", "ts": "2026-10-06T12:30:00Z", "customer": "Grace  Slick", "sku": "DK-10", "quantity": 1, "price": "1,299.00", "cur": "GBP"}
+      {"id": "W-2004", "ts": "2026-10-07T09:10:00Z", "customer": "Bob Marley", "sku": "KB-01", "quantity": -1, "price": "1049", "cur": "EUR"}
+      {"id": "W-2005", "ts": "2026-10-09T18:45:00Z", "customer": "carol king", "sku": "MN-32", "quantity": 1, "price": "n/a", "cur": "USD"}
+      {"id": "S-1005", "ts": "2026-10-10T11:11:00Z", "customer": "Dave Grohl", "sku": "CB-05", "quantity": 2, "price": "9.99", "cur": "USD"}
+      {"id": "W-2006", "ts": "2026-10-12T07:05:00Z", "customer": "Henry Rollins", "sku": "CH-20", "quantity": 2, "price": 349, "cur": "EUR"}
+      {"id": "W-2007", "ts": "2026-10-15T16:20:00Z", "customer": "erin moran", "sku": "KB-01", "quantity": 1, "price": "1,049.00", "cur": "EUR"}
+      {"id": "W-2008", "ts": "2026-10-18T13:00:00Z", "customer": "Ivy Smith", "sku": "MS-02", "quantity": 2.5, "price": "25.50", "cur": "USD"}
+      {"id": "W-2009", "ts": "2026-10-20T20:00:00Z", "customer": "Grace Slick", "sku": "MN-27", "quantity": 1, "price": "329.99", "cur": "USD"}
+checks:
+- id: outputs-exist
+  type: python
+  code: |
+    for f in ("pipeline.py", "out/clean_orders.csv", "out/summary.json"):
+        assert path(f).is_file(), f"{f} is missing"
+- id: summary-counts
+  type: python
+  code: |
+    import csv, io, json, re
+    def compare_summary(s, E):
+        assert set(s) == set(E), f"summary.json keys {sorted(s)} != {sorted(E)}"
+        for k in ("valid_orders", "invalid_rows", "duplicates_removed"):
+            assert s[k] == E[k], f"{k} = {s[k]!r}, expected {E[k]}"
+        assert abs(float(s["total_revenue_usd"]) - E["total_revenue_usd"]) <= 0.011, f"total_revenue_usd = {s['total_revenue_usd']}, expected {E['total_revenue_usd']}"
+        for k in ("revenue_by_category", "revenue_by_month"):
+            assert set(s[k]) == set(E[k]), f"{k} keys {sorted(s[k])} != {sorted(E[k])}"
+            for kk, v in E[k].items():
+                assert abs(float(s[k][kk]) - v) <= 0.011, f"{k}[{kk}] = {s[k][kk]}, expected {v}"
+        assert s["top_customer"] == E["top_customer"], f"top_customer = {s['top_customer']!r}, expected {E['top_customer']!r}"
+    def compare_csv(text, expected_text):
+        rows = [r for r in csv.reader(io.StringIO(text)) if r]
+        exp = [r for r in csv.reader(io.StringIO(expected_text)) if r]
+        assert rows and rows[0] == exp[0], f"header {rows[0] if rows else None} != {exp[0]}"
+        assert len(rows) == len(exp), f"{len(rows) - 1} data rows, expected {len(exp) - 1}"
+        for got, want in zip(rows[1:], exp[1:]):
+            assert got[:6] == want[:6], f"row {got} != expected {want}"
+            assert re.fullmatch(r"\d+\.\d{2}", got[6]) and abs(float(got[6]) - float(want[6])) <= 0.011, f"revenue_usd {got[6]!r} != {want[6]}"
+    s, E = json.loads(path("out/summary.json").read_text(encoding="utf-8")), {'valid_orders': 14, 'invalid_rows': 7, 'duplicates_removed': 3, 'total_revenue_usd': 8706.78, 'revenue_by_category': {'Accessories': 139.86, 'Displays': 1717.17, 'Furniture': 4456.41, 'Peripherals': 2393.34}, 'revenue_by_month': {'2026-09': 4244.81, '2026-10': 4461.97}, 'top_customer': 'Grace Slick'}
+    for k in ("valid_orders", "invalid_rows", "duplicates_removed"):
+        assert s.get(k) == E[k], f"{k} = {s.get(k)!r}, expected {E[k]}"
+- id: summary-full
+  type: python
+  code: |
+    import csv, io, json, re
+    def compare_summary(s, E):
+        assert set(s) == set(E), f"summary.json keys {sorted(s)} != {sorted(E)}"
+        for k in ("valid_orders", "invalid_rows", "duplicates_removed"):
+            assert s[k] == E[k], f"{k} = {s[k]!r}, expected {E[k]}"
+        assert abs(float(s["total_revenue_usd"]) - E["total_revenue_usd"]) <= 0.011, f"total_revenue_usd = {s['total_revenue_usd']}, expected {E['total_revenue_usd']}"
+        for k in ("revenue_by_category", "revenue_by_month"):
+            assert set(s[k]) == set(E[k]), f"{k} keys {sorted(s[k])} != {sorted(E[k])}"
+            for kk, v in E[k].items():
+                assert abs(float(s[k][kk]) - v) <= 0.011, f"{k}[{kk}] = {s[k][kk]}, expected {v}"
+        assert s["top_customer"] == E["top_customer"], f"top_customer = {s['top_customer']!r}, expected {E['top_customer']!r}"
+    def compare_csv(text, expected_text):
+        rows = [r for r in csv.reader(io.StringIO(text)) if r]
+        exp = [r for r in csv.reader(io.StringIO(expected_text)) if r]
+        assert rows and rows[0] == exp[0], f"header {rows[0] if rows else None} != {exp[0]}"
+        assert len(rows) == len(exp), f"{len(rows) - 1} data rows, expected {len(exp) - 1}"
+        for got, want in zip(rows[1:], exp[1:]):
+            assert got[:6] == want[:6], f"row {got} != expected {want}"
+            assert re.fullmatch(r"\d+\.\d{2}", got[6]) and abs(float(got[6]) - float(want[6])) <= 0.011, f"revenue_usd {got[6]!r} != {want[6]}"
+    compare_summary(json.loads(path("out/summary.json").read_text(encoding="utf-8")), {'valid_orders': 14, 'invalid_rows': 7, 'duplicates_removed': 3, 'total_revenue_usd': 8706.78, 'revenue_by_category': {'Accessories': 139.86, 'Displays': 1717.17, 'Furniture': 4456.41, 'Peripherals': 2393.34}, 'revenue_by_month': {'2026-09': 4244.81, '2026-10': 4461.97}, 'top_customer': 'Grace Slick'})
+- id: clean-orders
+  type: python
+  code: |
+    import csv, io, json, re
+    def compare_summary(s, E):
+        assert set(s) == set(E), f"summary.json keys {sorted(s)} != {sorted(E)}"
+        for k in ("valid_orders", "invalid_rows", "duplicates_removed"):
+            assert s[k] == E[k], f"{k} = {s[k]!r}, expected {E[k]}"
+        assert abs(float(s["total_revenue_usd"]) - E["total_revenue_usd"]) <= 0.011, f"total_revenue_usd = {s['total_revenue_usd']}, expected {E['total_revenue_usd']}"
+        for k in ("revenue_by_category", "revenue_by_month"):
+            assert set(s[k]) == set(E[k]), f"{k} keys {sorted(s[k])} != {sorted(E[k])}"
+            for kk, v in E[k].items():
+                assert abs(float(s[k][kk]) - v) <= 0.011, f"{k}[{kk}] = {s[k][kk]}, expected {v}"
+        assert s["top_customer"] == E["top_customer"], f"top_customer = {s['top_customer']!r}, expected {E['top_customer']!r}"
+    def compare_csv(text, expected_text):
+        rows = [r for r in csv.reader(io.StringIO(text)) if r]
+        exp = [r for r in csv.reader(io.StringIO(expected_text)) if r]
+        assert rows and rows[0] == exp[0], f"header {rows[0] if rows else None} != {exp[0]}"
+        assert len(rows) == len(exp), f"{len(rows) - 1} data rows, expected {len(exp) - 1}"
+        for got, want in zip(rows[1:], exp[1:]):
+            assert got[:6] == want[:6], f"row {got} != expected {want}"
+            assert re.fullmatch(r"\d+\.\d{2}", got[6]) and abs(float(got[6]) - float(want[6])) <= 0.011, f"revenue_usd {got[6]!r} != {want[6]}"
+    compare_csv(path("out/clean_orders.csv").read_text(encoding="utf-8"), 'order_id,date,customer,sku,category,qty,revenue_usd\nS-1001,2026-09-02,Alice Cooper,KB-01,Peripherals,1,1132.92\nS-1002,2026-09-03,Bob Marley,MS-02,Peripherals,2,51.00\nS-1003,2026-09-05,Carol King,MN-27,Displays,1,419.09\nS-1004,2026-09-07,Alice Cooper,CB-05,Accessories,4,39.96\nS-1006,2026-09-12,Bob Marley,DK-10,Furniture,1,1299.00\nS-1010,2026-09-28,Grace Slick,CH-20,Furniture,2,753.84\nW-2001,2026-09-30,Erin Moran,MN-32,Displays,1,549.00\nW-2002,2026-10-01,Frank Ocean,CB-05,Accessories,10,99.90\nS-1011,2026-10-02,Dave Grohl,MN-27,Displays,1,419.09\nS-1012,2026-10-04,Alice Cooper,MS-02,Peripherals,3,76.50\nW-2003,2026-10-06,Grace Slick,DK-10,Furniture,1,1649.73\nW-2006,2026-10-12,Henry Rollins,CH-20,Furniture,2,753.84\nW-2007,2026-10-15,Erin Moran,KB-01,Peripherals,1,1132.92\nW-2009,2026-10-20,Grace Slick,MN-27,Displays,1,329.99\n')
+- id: rerun-on-new-data
+  type: python
+  timeout: 180
+  code: |
+    import csv, io, json, re
+    def compare_summary(s, E):
+        assert set(s) == set(E), f"summary.json keys {sorted(s)} != {sorted(E)}"
+        for k in ("valid_orders", "invalid_rows", "duplicates_removed"):
+            assert s[k] == E[k], f"{k} = {s[k]!r}, expected {E[k]}"
+        assert abs(float(s["total_revenue_usd"]) - E["total_revenue_usd"]) <= 0.011, f"total_revenue_usd = {s['total_revenue_usd']}, expected {E['total_revenue_usd']}"
+        for k in ("revenue_by_category", "revenue_by_month"):
+            assert set(s[k]) == set(E[k]), f"{k} keys {sorted(s[k])} != {sorted(E[k])}"
+            for kk, v in E[k].items():
+                assert abs(float(s[k][kk]) - v) <= 0.011, f"{k}[{kk}] = {s[k][kk]}, expected {v}"
+        assert s["top_customer"] == E["top_customer"], f"top_customer = {s['top_customer']!r}, expected {E['top_customer']!r}"
+    def compare_csv(text, expected_text):
+        rows = [r for r in csv.reader(io.StringIO(text)) if r]
+        exp = [r for r in csv.reader(io.StringIO(expected_text)) if r]
+        assert rows and rows[0] == exp[0], f"header {rows[0] if rows else None} != {exp[0]}"
+        assert len(rows) == len(exp), f"{len(rows) - 1} data rows, expected {len(exp) - 1}"
+        for got, want in zip(rows[1:], exp[1:]):
+            assert got[:6] == want[:6], f"row {got} != expected {want}"
+            assert re.fullmatch(r"\d+\.\d{2}", got[6]) and abs(float(got[6]) - float(want[6])) <= 0.011, f"revenue_usd {got[6]!r} != {want[6]}"
+    import shutil, subprocess, sys, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        shutil.copy(path("pipeline.py"), d / "pipeline.py")
+        (d / "raw").mkdir()
+        for name, text in {'products.csv': 'sku,name,category\nKB-01,Mechanical keyboard,Peripherals\nMS-02,Wireless mouse,Peripherals\nMN-27,27in monitor,Displays\nMN-32,32in monitor,Displays\nDK-10,Standing desk,Furniture\nCH-20,Ergonomic chair,Furniture\nCB-05,USB-C cable,Accessories\n', 'fx.csv': 'currency,usd_rate\nUSD,1.0\nEUR,1.08\nGBP,1.27\n', 'store_orders.csv': 'order_id,date,customer,sku,qty,unit_price,currency\nS-2001,01/11/2026,  zoe   baker,MN-32,1,549.00,EUR\nS-2002,2026-11-02,Yuri Gagarin,KB-01,2,"1,049.00",USD\nS-2003,2026-11-03,zoe baker,CB-05,12,9.99,GBP\nS-2004,05/11/2026,Xena Warrior,DK-10,1,"1,299.00",EUR\nS-2005,2026-11-06,Will Turner,CH-20,-2,349.00,USD\nS-2003,2026-11-07,Zoe Baker,CB-05,1,9.99,GBP\nS-2006,08/11/2026,will turner,MS-02,1,abc,USD\nS-2007,2026-11-30,Yuri  GAGARIN,MN-27,3,329.99,USD\nS-2008,2026-12-01,Victor Hugo,CH-20,1,349.00,JPY\n', 'web_orders.jsonl': '{"id": "W-3001", "ts": "2026-11-01T09:00:00Z", "customer": "victor hugo", "sku": "MS-02", "quantity": 4, "price": 25.5, "cur": "GBP"}\n{"id": "S-2006", "ts": "2026-11-08T10:00:00Z", "customer": "Will Turner", "sku": "MS-02", "quantity": 1, "price": "25.50", "cur": "USD"}\n{"id": "W-3002", "ts": "2026-11-15T14:00:00Z", "customer": "Xena Warrior", "sku": "MN-27", "quantity": 2, "price": "329.99", "cur": "EUR"}\n{"id": "W-3003", "ts": "2026-11-20T23:59:00Z", "customer": "Uma Thurman", "sku": "ZZ-00", "quantity": 1, "price": "5.00", "cur": "USD"}\n{"id": "W-3004", "ts": "2026-12-02T08:30:00Z", "customer": "yuri gagarin", "sku": "CB-05", "quantity": 3, "price": "9.99", "cur": "EUR"}\n{"id": "W-3005", "ts": "2026-12-03T12:00:00Z", "customer": "Uma Thurman", "sku": "DK-10", "quantity": 1, "cur": "USD"}\n{"id": "W-3006", "ts": "2026-12-04T15:45:00Z", "customer": "Zoe Baker", "sku": "CH-20", "quantity": 1, "price": "349.00", "cur": "USD"}\n'}.items():
+            (d / "raw" / name).write_text(text, encoding="utf-8")
+        r = subprocess.run([sys.executable, "pipeline.py"], cwd=d, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, "pipeline.py failed on next month's data: " + (r.stdout + r.stderr)[-800:]
+        compare_summary(json.loads((d / "out/summary.json").read_text(encoding="utf-8")), {'valid_orders': 9, 'invalid_rows': 5, 'duplicates_removed': 2, 'total_revenue_usd': 6459.75, 'revenue_by_category': {'Accessories': 184.62, 'Displays': 2295.67, 'Furniture': 1751.92, 'Peripherals': 2227.54}, 'revenue_by_month': {'2026-11': 6078.38, '2026-12': 381.37}, 'top_customer': 'Yuri Gagarin'})
+        compare_csv((d / "out/clean_orders.csv").read_text(encoding="utf-8"), 'order_id,date,customer,sku,category,qty,revenue_usd\nS-2001,2026-11-01,Zoe Baker,MN-32,Displays,1,592.92\nW-3001,2026-11-01,Victor Hugo,MS-02,Peripherals,4,129.54\nS-2002,2026-11-02,Yuri Gagarin,KB-01,Peripherals,2,2098.00\nS-2003,2026-11-03,Zoe Baker,CB-05,Accessories,12,152.25\nS-2004,2026-11-05,Xena Warrior,DK-10,Furniture,1,1402.92\nW-3002,2026-11-15,Xena Warrior,MN-27,Displays,2,712.78\nS-2007,2026-11-30,Yuri Gagarin,MN-27,Displays,3,989.97\nW-3004,2026-12-02,Yuri Gagarin,CB-05,Accessories,3,32.37\nW-3006,2026-12-04,Zoe Baker,CH-20,Furniture,1,349.00\n')

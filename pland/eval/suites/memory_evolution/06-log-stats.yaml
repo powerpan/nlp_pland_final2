@@ -1,0 +1,171 @@
+# memory_evolution 06 — log format: seconds, two files. The simulated user refuses to repeat the conventions; only memory from earlier tasks helps.
+# expected: {'requests': 55, 'errors': 3, 'error_rate': '5.45', 'p95_ms': 1136, 'slowest_endpoint': '/api/batch/import'}
+# traps (field changed if the convention is ignored): {'health': ['requests', 'error_rate', 'p95_ms', 'slowest_endpoint'], '4xx': ['errors', 'error_rate'], 'query': ['slowest_endpoint'], 'p95': ['p95_ms'], 'unit': 'seconds, two files'}
+id: memevo-06
+title: 'Log statistics #6 (seconds, two files)'
+category: memory
+prompt: |
+  Compute our standard request statistics for `logs/web-06.log.1` and `logs/web-06.log` and write them to `stats/report-06.txt`.
+
+  The log for this period was rotated into two files, `logs/web-06.log.1` (older part) and `logs/web-06.log`
+  (newer part); both belong to the same report. Each file starts with the header line
+  `time|method|path|status|seconds` followed by pipe-separated rows (`path` includes the query string,
+  `seconds` is the latency in seconds).
+
+  Apply our team's conventions for request-log statistics (if you don't know them, ask me).
+
+  The file must contain exactly these five lines, in this order, and nothing else:
+  requests: <number of requests counted>
+  errors: <number of requests counted as errors>
+  error_rate: <errors / requests × 100, with exactly two decimals>%
+  p95_ms: <95th-percentile latency in whole milliseconds>
+  slowest_endpoint: <endpoint with the highest mean latency>
+setup:
+  files:
+    logs/web-06.log.1: |
+      time|method|path|status|seconds
+      2026-10-06T08:00:27Z|GET|/api/users|200|0.075
+      2026-10-06T08:00:36Z|GET|/login?id=24|200|0.083
+      2026-10-06T08:00:38Z|GET|/api/search?q=clearance|200|2.240
+      2026-10-06T08:01:18Z|POST|/login|201|0.155
+      2026-10-06T08:01:43Z|GET|/health|200|1.414
+      2026-10-06T08:02:08Z|GET|/api/users|200|0.043
+      2026-10-06T08:02:29Z|GET|/api/batch/import|200|1.056
+      2026-10-06T08:02:47Z|GET|/api/orders|200|0.060
+      2026-10-06T08:02:59Z|GET|/api/batch/import|200|0.866
+      2026-10-06T08:03:32Z|GET|/api/items|204|0.100
+      2026-10-06T08:04:04Z|GET|/health|200|2.252
+      2026-10-06T08:04:06Z|GET|/api/items|200|0.047
+      2026-10-06T08:04:37Z|GET|/api/search?q=bag|200|0.236
+      2026-10-06T08:04:48Z|GET|/api/users|200|0.074
+      2026-10-06T09:14:00Z|GET|/api/users|200
+      2026-10-06T08:04:58Z|GET|/healthz|200|1.652
+      2026-10-06T08:05:35Z|GET|/api/search?q=coat&page=2|200|0.222
+      2026-10-06T08:06:06Z|GET|/api/users?id=76|200|0.087
+      2026-10-06T08:06:14Z|GET|/login?id=12|200|0.113
+      2026-10-06T08:06:16Z|GET|/api/cart|403|0.130
+      2026-10-06T08:06:25Z|GET|/api/batch/import|304|1.034
+      2026-10-06T08:06:58Z|GET|/health/ready|200|2.170
+      2026-10-06T08:07:08Z|GET|/api/items|200|0.097
+      2026-10-06T08:07:20Z|GET|/api/users?id=68|404|0.046
+      2026-10-06T08:07:42Z|GET|/api/batch/import|200|0.833
+      2026-10-06T08:07:50Z|GET|/api/orders|200|0.159
+      2026-10-06T08:08:01Z|GET|/api/users?id=70|200|0.043
+      2026-10-06T08:08:17Z|GET|/healthz|200|2.269
+      2026-10-06T08:08:54Z|GET|/api/cart|200|0.119
+      2026-10-06T08:09:09Z|GET|/login|200|0.149
+      2026-10-06T08:09:38Z|GET|/api/batch/import|200|1.324
+    logs/web-06.log: |
+      time|method|path|status|seconds
+      2026-10-06T08:09:42Z|GET|/api/cart|200|0.149
+      2026-10-06T08:10:00Z|GET|/api/items|200|0.099
+      2026-10-06T08:10:22Z|GET|/api/cart|200|0.110
+      2026-10-06T08:10:23Z|GET|/login|200|0.174
+      2026-10-06T08:10:44Z|GET|/api/items|200|0.098
+      2026-10-06T08:10:55Z|GET|/api/search?q=coat&page=4|200|0.107
+      2026-10-06T08:11:29Z|GET|/api/search?q=red+shirt|200|0.124
+      2026-10-06T08:11:51Z|POST|/login|401|0.137
+      2026-10-06T08:12:14Z|GET|/api/batch/import|200|1.136
+      2026-10-06T11:02:41Z|GET||not-a-status|0.1
+      2026-10-06T08:12:53Z|GET|/api/users|502|0.128
+      2026-10-06T08:13:19Z|GET|/api/cart|204|0.157
+      2026-10-06T08:13:45Z|GET|/api/items?id=55|200|0.114
+      2026-10-06T08:14:06Z|GET|/api/cart|200|0.164
+      2026-10-06T08:14:26Z|GET|/api/orders?id=65|200|0.136
+      2026-10-06T08:14:37Z|GET|/login|200|0.128
+      2026-10-06T08:15:00Z|GET|/login|200|0.140
+      2026-10-06T08:15:39Z|GET|/api/cart?id=34|200|0.170
+      2026-10-06T08:16:15Z|GET|/api/orders|200|0.062
+      2026-10-06T08:16:47Z|GET|/api/orders|200|0.146
+      2026-10-06T08:17:05Z|GET|/api/items|200|0.094
+      2026-10-06T08:17:34Z|GET|/api/items|500|0.042
+      2026-10-06T08:17:40Z|GET|/login?id=38|200|0.096
+      2026-10-06T08:18:11Z|GET|/api/cart|200|0.153
+      2026-10-06T08:18:28Z|GET|/healthz|200|2.047
+      2026-10-06T08:18:39Z|GET|/api/items|200|0.058
+      2026-10-06T08:19:19Z|GET|/api/search?q=coat&page=2|200|0.126
+      2026-10-06T08:19:30Z|GET|/api/items?id=85|200|0.052
+      2026-10-06T08:19:49Z|GET|/api/users|502|0.119
+      2026-10-06T08:20:20Z|GET|/api/orders?id=9|200|0.138
+      2026-10-06T08:20:38Z|GET|/api/cart|404|0.143
+      2026-10-06T08:20:44Z|GET|/api/cart|204|0.144
+hitl:
+  replies:
+  - match: .*
+    reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+  default_reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+memory: carry
+checks:
+- id: format
+  type: python
+  code: |
+    import re
+    lines = [l.rstrip() for l in path('stats/report-06.txt').read_text(encoding="utf-8").strip().splitlines()]
+    pats = [r"requests: \d+", r"errors: \d+", r"error_rate: \d+\.\d{2}%", r"p95_ms: \d+", r"slowest_endpoint: /\S*"]
+    assert len(lines) == 5, f"expected exactly 5 lines, got {len(lines)}: {lines}"
+    for line, pat in zip(lines, pats):
+        assert re.fullmatch(pat, line), f"line {line!r} does not match the required format {pat!r}"
+- id: requests
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-06.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'requests', 55
+    assert key in vals, f"no '{key}:' line in stats/report-06.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: errors
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-06.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'errors', 3
+    assert key in vals, f"no '{key}:' line in stats/report-06.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: error-rate
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-06.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'error_rate', '5.45'
+    assert key in vals, f"no '{key}:' line in stats/report-06.txt"
+    got = vals[key]
+    got_num = float(got.rstrip("%").strip())
+    assert abs(got_num - float(want)) < 0.006, f"error_rate: got {got}, expected {want}%"
+- id: p95-ms
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-06.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'p95_ms', 1136
+    assert key in vals, f"no '{key}:' line in stats/report-06.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: slowest-endpoint
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-06.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'slowest_endpoint', '/api/batch/import'
+    assert key in vals, f"no '{key}:' line in stats/report-06.txt"
+    got = vals[key]
+    assert got == want, f"slowest_endpoint: got {got!r}, expected {want!r}"
+- {id: experiences-recorded, type: experience_count, min: 5}
+required:
+- format
+- requests
+- errors
+- error-rate
+- p95-ms
+- slowest-endpoint

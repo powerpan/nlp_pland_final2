@@ -1,0 +1,64 @@
+# midterm 15 — memory (part B): the preference from task 11 is NOT restated; output must still follow it
+id: mid-memory-pref-recall
+title: 'Memory B: new report without restating the preference'
+category: memory
+prompt: |
+  Please write a short report on `data/inventory.csv` with the lines `Products: <number of distinct SKUs>` and
+  `Stock value: <sum of quantity × unit_cost over all rows, 2 decimals>`.
+setup:
+  files:
+    data/inventory.csv: |
+      sku,name,warehouse,quantity,unit_cost
+      A-100,Desk lamp,Berlin,12,18.50
+      A-100,Desk lamp,Hamburg,5,18.50
+      B-200,Office chair,Berlin,4,129.00
+      C-300,Notebook A5,Berlin,150,1.20
+      C-300,Notebook A5,Munich,80,1.20
+      D-400,Monitor arm,Munich,7,45.90
+      E-500,USB-C hub,Hamburg,22,24.75
+      F-600,Whiteboard,Munich,3,89.00
+hitl:
+  default_reply: Just follow my usual preferences for reports — I told you about them before.
+checks:
+- id: report-in-folder
+  type: python
+  code: |
+    import re
+    def reports():
+        d = path("reports")
+        files = sorted(p for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".md", ".txt")) if d.is_dir() else []
+        assert files, "no .md/.txt report in reports/"
+        return files
+    def first_line(p):
+        return next((l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()), "").strip()
+    reports()
+- id: owner-line
+  type: python
+  code: |
+    import re
+    def reports():
+        d = path("reports")
+        files = sorted(p for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".md", ".txt")) if d.is_dir() else []
+        assert files, "no .md/.txt report in reports/"
+        return files
+    def first_line(p):
+        return next((l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()), "").strip()
+    bad = [(p.name, first_line(p)) for p in reports() if first_line(p) != "Owner: Dana"]
+    assert not bad, f"first line must be exactly 'Owner: Dana' (remembered preference): {bad}"
+- id: numbers
+  type: python
+  code: |
+    import re
+    def reports():
+        d = path("reports")
+        files = sorted(p for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".md", ".txt")) if d.is_dir() else []
+        assert files, "no .md/.txt report in reports/"
+        return files
+    def first_line(p):
+        return next((l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()), "").strip()
+    text = "\n".join(p.read_text(encoding="utf-8") for p in reports())
+    E = {'products': 6, 'stock value': 2239.3}
+    m = re.search(r"(?im)^[\s*_\-]*products[\s*_]*:[\s*_]*(\d+)", text)
+    assert m and int(m.group(1)) == E["products"], f"Products: expected {E['products']}"
+    m = re.search(r"(?im)^[\s*_\-]*stock value[\s*_]*:[\s*_]*\$?\s*([\d,]+(?:\.\d+)?)", text)
+    assert m and abs(float(m.group(1).replace(",", "")) - E["stock value"]) <= 0.011, f"Stock value: expected {E['stock value']}"

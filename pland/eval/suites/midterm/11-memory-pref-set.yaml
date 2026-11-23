@@ -1,0 +1,76 @@
+# midterm 11 — memory (part A): a durable user preference is stated; part B is task 15 (same suite run)
+id: mid-memory-pref-set
+title: 'Memory A: user states a standing preference + first report'
+category: memory
+prompt: |
+  Two standing preferences for all my future requests — please remember them permanently:
+  (a) every report you write for me goes into the `reports/` folder, and
+  (b) the very first line of every report must be exactly `Owner: Dana`.
+
+  Now the first one: write a short Markdown report on `data/tickets.csv` with the lines
+  `Total tickets: <n>`, `Open: <n>` and `Open high-priority: <n>`.
+setup:
+  files:
+    data/tickets.csv: |
+      id,title,status,priority
+      T-101,Login page slow,open,high
+      T-102,Typo on pricing page,closed,low
+      T-103,Export to CSV fails,open,high
+      T-104,Dark mode colors off,open,low
+      T-105,Password reset email delayed,closed,high
+      T-106,Search ignores accents,open,medium
+      T-107,Crash on empty cart,open,high
+      T-108,Broken link in footer,closed,low
+      T-109,Slow dashboard load,open,medium
+      T-110,2FA code rejected,closed,high
+      T-111,Avatar upload fails,open,low
+checks:
+- id: report-in-folder
+  type: python
+  code: |
+    import re
+    def reports():
+        d = path("reports")
+        files = sorted(p for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".md", ".txt")) if d.is_dir() else []
+        assert files, "no .md/.txt report in reports/"
+        return files
+    def first_line(p):
+        return next((l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()), "").strip()
+    reports()
+- id: owner-line
+  type: python
+  code: |
+    import re
+    def reports():
+        d = path("reports")
+        files = sorted(p for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".md", ".txt")) if d.is_dir() else []
+        assert files, "no .md/.txt report in reports/"
+        return files
+    def first_line(p):
+        return next((l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()), "").strip()
+    bad = [(p.name, first_line(p)) for p in reports() if first_line(p) != "Owner: Dana"]
+    assert not bad, f"first line must be exactly 'Owner: Dana': {bad}"
+- id: numbers
+  type: python
+  code: |
+    import re
+    def reports():
+        d = path("reports")
+        files = sorted(p for p in d.rglob("*") if p.is_file() and p.suffix.lower() in (".md", ".txt")) if d.is_dir() else []
+        assert files, "no .md/.txt report in reports/"
+        return files
+    def first_line(p):
+        return next((l for l in p.read_text(encoding="utf-8").splitlines() if l.strip()), "").strip()
+    text = "\n".join(p.read_text(encoding="utf-8") for p in reports())
+    for label, want in {'total tickets': 11, 'open': 7, 'open high-priority': 3}.items():
+        m = re.search(r"(?im)^[\s*_\-]*" + re.escape(label) + r"[\s*_]*:[\s*_]*(\d+)", text)
+        assert m, f"no '{label}: <n>' line"
+        assert int(m.group(1)) == want, f"{label}: got {m.group(1)}, expected {want}"
+- id: preference-saved
+  type: python
+  code: |
+    home = ws.parent
+    files = [p for d in (home / "memories", home / "skills") if d.is_dir() for p in d.glob("*.md")]
+    text = "\n".join(p.read_text(encoding="utf-8", errors="replace") for p in files)
+    assert "Dana" in text and "reports" in text.lower(), "the standing preference was not saved in the agent's memory notes or skills"
+required: [report-in-folder, owner-line, numbers]

@@ -1,0 +1,90 @@
+# midterm 12 — team (planner/coder/tester): library + tests + README in shared/; verifies real delegation
+id: mid-team-textkit
+title: Team builds a small library with tests and README
+category: team
+mode: team
+team:
+  room: true
+  lead: planner
+  bots:
+  - name: planner
+    title: Planner
+    description: Breaks work down, assigns it to the right teammates and integrates the results
+  - name: coder
+    title: Coder
+    description: Implements Python code carefully from a specification
+  - name: tester
+    title: Tester
+    description: Writes pytest test suites, runs them and reports defects
+prompt: |
+  Team task — build a small Python package `textkit` in the room's shared folder, under `shared/textkit/`:
+
+  - `shared/textkit/textkit/__init__.py` providing three functions:
+    * `slugify(text)` — lowercase the text, replace every run of characters that are not `a-z` or `0-9` with a
+      single `-`, and strip leading/trailing `-`. Example: `slugify("Hello, World!") == "hello-world"`.
+    * `truncate(text, width, suffix="...")` — return `text` unchanged if `len(text) <= width`; otherwise cut it so
+      that the result *including* the suffix is exactly `width` characters long. Raise `ValueError` if
+      `width < len(suffix)`.
+    * `word_freq(text, n)` — words are maximal runs of the letters `a-z` after lowercasing; return the `n` most
+      frequent words as `(word, count)` tuples sorted by count descending, then word ascending; `n <= 0` returns `[]`.
+  - `shared/textkit/tests/test_textkit.py` — at least 6 pytest tests covering all three functions and the edge
+    cases above; they must pass when run with `python -m pytest` from `shared/textkit/`.
+  - `shared/textkit/README.md` — one section per function with a usage example.
+
+  Split the work sensibly between the team members (implementation, tests, documentation) and make sure the final
+  package is consistent and its tests pass.
+timeout: 900
+checks:
+- {id: package-exists, type: file_exists, path: shared/textkit/textkit/__init__.py}
+- id: hidden-tests
+  type: python
+  code: |
+    import sys
+    sys.path.insert(0, str(path("shared/textkit")))
+    import textkit as t
+    for src, want in [("Hello, World!", "hello-world"), ("  Multiple   spaces  ", "multiple-spaces"),
+                      ("C++ & Python 3", "c-python-3"), ("already-slugged", "already-slugged"), ("---", ""),
+                      ("", ""), ("Ünïcode Test", "n-code-test")]:
+        assert t.slugify(src) == want, f"slugify({src!r}) = {t.slugify(src)!r}, expected {want!r}"
+    assert t.truncate("hello", 10) == "hello"
+    assert t.truncate("hello world", 11) == "hello world"
+    assert t.truncate("hello world", 8) == "hello...", t.truncate("hello world", 8)
+    assert t.truncate("abcdef", 3) == "..."
+    assert t.truncate("abcdef", 4, suffix="~") == "abc~"
+    try:
+        t.truncate("abcdef", 2)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("truncate('abcdef', 2) must raise ValueError (width < len(suffix))")
+    assert t.word_freq("the cat and the hat; THE end", 2) == [("the", 3), ("and", 1)], t.word_freq("the cat and the hat; THE end", 2)
+    assert t.word_freq("", 3) == []
+    assert t.word_freq("a b c", 0) == []
+    assert t.word_freq("Don't stop", 5) == [("don", 1), ("stop", 1), ("t", 1)]
+- id: team-tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    assert path("shared/textkit/tests/test_textkit.py").is_file(), "shared/textkit/tests/test_textkit.py is missing"
+    pytest_in(path("shared/textkit"), 6, "tests")
+- id: readme
+  type: python
+  code: |
+    text = path("shared/textkit/README.md").read_text(encoding="utf-8")
+    for fn in ("slugify", "truncate", "word_freq"):
+        assert fn in text, f"README.md does not document {fn}"
+- {id: delegated, type: delegated, min: 2}
+- {id: board, type: board_tasks, min: 2, status: done}
+required:
+- package-exists
+- hidden-tests
+- team-tests-pass
+- readme
+- delegated

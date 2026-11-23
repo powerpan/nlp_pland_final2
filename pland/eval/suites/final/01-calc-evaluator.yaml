@@ -1,0 +1,100 @@
+# final 01 — coding project: tokenizer + recursive-descent parser; hidden checks compare with Python semantics
+id: final-calc-evaluator
+title: 'Safe expression evaluator: tokenizer + parser, CLI, tests'
+category: coding
+prompt: |
+  Build a small, safe arithmetic expression evaluator as a Python package `calc/` in the workspace root
+  (standard library only).
+
+  API: `from calc import evaluate, CalcError`
+  - `evaluate(expr, variables=None)` returns an `int` or a `float`; `variables` is an optional dict of names to numbers.
+  - `CalcError` must be a subclass of `ValueError`. Raise it for every invalid input: syntax errors, unknown names
+    or functions, wrong number of function arguments, and division or modulo by zero.
+
+  Language — results must equal what Python itself computes for the same expression, including int vs float:
+  - integer and decimal literals (`42`, `3.5`, `.5`), parentheses, and spaces/tabs anywhere between tokens;
+  - binary operators `+ - * / // % **` with Python's precedence and associativity: `**` binds tighter than a unary
+    minus on its left and is right-associative (`-2**2 == -4`, `2**3**2 == 512`, `2**-1 == 0.5`);
+    `* / // %` bind tighter than `+ -`, all left-associative; `/` is true division (`4/2 == 2.0`);
+  - unary `+` and `-`, also repeated (`--3 == 3`);
+  - variables: identifiers `[A-Za-z_][A-Za-z0-9_]*` looked up in `variables`;
+  - function calls `abs(x)` (exactly one argument), `min(a, b, ...)` and `max(a, b, ...)` (at least one argument).
+
+  Do not use `eval`, `exec`, `compile` or the `ast` module anywhere in the package: write a tokenizer and a parser.
+
+  Also provide:
+  - a command-line entry point: `python -m calc "<expr>"` prints the result with `print()` and exits 0; on a
+    `CalcError` it prints `error: <message>` to stderr and exits 1;
+  - pytest tests in `tests/` (at least 10 test cases) that pass with `python -m pytest tests`.
+checks:
+- {id: package-exists, type: file_exists, path: calc/__init__.py}
+- id: no-eval
+  type: python
+  code: |
+    import re
+    files = sorted(path("calc").rglob("*.py"))
+    assert files, "calc/ has no Python files"
+    bad = []
+    for f in files:
+        src = re.sub(r"#.*", "", f.read_text(encoding="utf-8", errors="replace"))
+        for pat in (r"(?<![\w.])(eval|exec|compile)\s*\(", r"(?m)^\s*(import\s+ast\b|from\s+ast\s+import)", r"__import__\s*\(\s*['\"]ast"):
+            bad += [f"{f.name}: {m.group(0)}" for m in re.finditer(pat, src)]
+    assert not bad, f"forbidden eval/exec/compile/ast usage: {bad}"
+- id: hidden-values
+  type: python
+  code: |
+    import math
+    from calc import evaluate, CalcError
+    assert issubclass(CalcError, ValueError), "CalcError must subclass ValueError"
+    env = {"__builtins__": {}, "min": min, "max": max, "abs": abs}
+    cases = [(e, None) for e in ['1+2', '  3  ', '2*(3+4)', '2 * (3 + 4) - 5 % 3', '10 - 2 - 3', '100 / 10 / 5', '7/2', '4/2', '7//2', '-7 // 2', '-7 % 3', '7.5 // 2', '10 % 4 * 3', '-2**2', '(-2)**2', '2**3**2', '2**-1', '-2 ** -2', '2 ** -1 ** 2', '--3', '+-+3', '2 - -3', '-(3 + 4) * 2', '.5 + 1', '3.25 * 4', '2 ** 100', '0 ** 0', 'max(1, 2.5, -3)', 'min(4, 2) + abs(-3)', 'abs(-2**2)', 'max(min(5, 9), 2 * 3)', '(((1)))', '1 +\t2']] + [('2*x + y', {'x': 3, 'y': 0.5}), ('max(x, y) ** 2', {'x': -4, 'y': 3}), ('rate * 100 // 7', {'rate': 1.5}), ('_a1 - B2', {'_a1': 10, 'B2': 2.5}), ('-x**2', {'x': 3})]
+    wrong = []
+    for expr, vars_ in cases:
+        want = eval(expr, dict(env, **(vars_ or {})))
+        try:
+            got = evaluate(expr, vars_) if vars_ else evaluate(expr)
+        except Exception as exc:
+            wrong.append(f"{expr!r} raised {type(exc).__name__}: {exc}")
+            continue
+        same = type(got) is type(want) and (got == want or (isinstance(want, float) and math.isclose(got, want, rel_tol=1e-12)))
+        if not same:
+            wrong.append(f"{expr!r} -> {got!r}, Python gives {want!r}")
+    assert not wrong, f"{len(wrong)} wrong result(s): " + "; ".join(wrong[:8])
+- id: hidden-errors
+  type: python
+  code: |
+    from calc import evaluate, CalcError
+    wrong = []
+    for expr, vars_ in [(e, None) for e in ['', '   ', '1 +', '(1', '1)', '2 3', '1 + * 2', 'foo(1)', 'x + 1', '1/0', '5 // 0', '5 % 0', 'min()', 'abs(1, 2)', '3 $ 4', '1.2.3', '()', '2 ** ', 'max(1 2)']] + [("x + 1", {"y": 1})]:
+        try:
+            evaluate(expr, vars_)
+        except CalcError:
+            continue
+        except Exception as exc:
+            wrong.append(f"{expr!r} raised {type(exc).__name__} instead of CalcError")
+            continue
+        wrong.append(f"{expr!r} did not raise")
+    assert not wrong, "; ".join(wrong)
+- id: cli
+  type: python
+  code: |
+    import subprocess, sys
+    run = lambda e: subprocess.run([sys.executable, "-m", "calc", e], cwd=ws, capture_output=True, text=True, timeout=30)
+    for expr, out in [("2*(3+4)", "14"), ("2**-1", "0.5"), ("7/2", "3.5")]:
+        r = run(expr)
+        assert r.returncode == 0 and r.stdout.strip() == out, f"python -m calc {expr!r}: exit {r.returncode}, stdout {r.stdout!r}, stderr {r.stderr[-300:]!r}"
+    r = run("1/0")
+    assert r.returncode == 1, f"python -m calc '1/0' should exit 1, got {r.returncode}"
+    assert r.stderr.strip().startswith("error:"), f"stderr should start with 'error:', got {r.stderr!r}"
+- id: agent-tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    pytest_in(ws, 10, "tests")

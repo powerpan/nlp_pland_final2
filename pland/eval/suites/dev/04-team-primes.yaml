@@ -1,0 +1,41 @@
+# dev 04 — 2-bot group room; verifies a real delegation and the shared-folder deliverables
+id: dev-team-primes
+title: 'Two bots: coder writes is_prime, lead publishes the list'
+category: team
+mode: team
+team:
+  room: true
+  lead: lead
+  bots:
+  - name: lead
+    title: Lead
+    description: 'Coordinates the team: plans, delegates and integrates results'
+  - name: coder
+    title: Coder
+    description: Writes and tests Python code
+prompt: |
+  Small team task, two steps:
+  1. The coder bot writes `shared/primes.py` with a function `is_prime(n: int) -> bool` (False for n < 2) and verifies it.
+     Lead: hand this step to the coder bot instead of writing the code yourself.
+  2. The lead then writes `shared/PRIMES.md` listing every prime below 50, one number per line, produced by running
+     that function.
+timeout: 420
+checks:
+- id: primes-module
+  type: python
+  code: |
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("primes", path("shared/primes.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    want = {n for n in range(-5, 200) if n > 1 and all(n % d for d in range(2, int(n ** 0.5) + 1))}
+    bad = [n for n in range(-5, 200) if bool(mod.is_prime(n)) != (n in want)]
+    assert not bad, f"is_prime wrong for {bad[:10]}"
+- id: primes-list
+  type: python
+  code: |
+    import re
+    text = path("shared/PRIMES.md").read_text(encoding="utf-8")
+    nums = [int(x) for x in re.findall(r"(?m)^\s*(?:[-*+]\s*|\d+[.)]\s+)?`?(\d+)`?\s*$", text)]
+    assert nums == [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47], f"PRIMES.md lists {nums}"
+- {id: delegated-to-coder, type: delegated, min: 1, to: [coder]}

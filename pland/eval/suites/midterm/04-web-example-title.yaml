@@ -1,0 +1,36 @@
+# midterm 04 — web: fetch a stable page; the check fetches the same URL at check time and compares
+id: mid-web-example-title
+title: Fetch a web page and record its title and first sentence
+category: web
+prompt: |
+  Fetch the web page https://example.com and save:
+  1. its HTML page title (just the title text) to `web/title.txt`;
+  2. the first sentence of the page's first paragraph (`<p>` element) to `web/first_sentence.txt`.
+checks:
+- id: title
+  type: python
+  code: |
+    import html, re, urllib.request
+    got = path("web/title.txt").read_text(encoding="utf-8").strip().strip("\"'`").strip()
+    try:
+        req = urllib.request.Request("https://example.com", headers={"User-Agent": "Mozilla/5.0 (pland-eval)"})
+        page = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+        want = html.unescape(re.search(r"(?is)<title[^>]*>(.*?)</title>", page).group(1)).strip()
+    except Exception:
+        want = "Example Domain"  # offline fallback: the title of example.com has been stable for decades
+    assert got == want, f"web/title.txt contains {got!r}, the page title is {want!r}"
+- id: first-sentence
+  type: python
+  code: |
+    import html, re, urllib.request
+    norm = lambda s: " ".join(html.unescape(s).replace("’", "'").lower().split()).strip(" .\"'`")
+    got = norm(path("web/first_sentence.txt").read_text(encoding="utf-8"))
+    try:
+        req = urllib.request.Request("https://example.com", headers={"User-Agent": "Mozilla/5.0 (pland-eval)"})
+        page = urllib.request.urlopen(req, timeout=20).read().decode("utf-8", "replace")
+        para = re.sub(r"<[^>]+>", " ", re.search(r"(?is)<p[^>]*>(.*?)</p>", page).group(1))
+        para = " ".join(html.unescape(para).split())
+        want = norm(re.match(r"(.+?[.!?])(\s|$)", para + " ").group(1))
+        assert got == want, f"first_sentence.txt: {got!r} != {want!r}"
+    except (OSError, AttributeError):
+        assert "documentation examples" in got, f"unexpected sentence {got!r} (offline fallback check)"

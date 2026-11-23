@@ -1,0 +1,38 @@
+# midterm 08 — HITL clarification: the source unit is ambiguous; only the simulated user's reply fixes it
+id: mid-hitl-clarify-temps
+title: Convert temperatures 'to the other unit' (unit only known after asking)
+category: hitl
+prompt: |
+  Convert the temperatures in `readings/temps.txt` to the other unit and save them as `readings/converted.txt`:
+  one converted value per line (just the number), in the same order, rounded to one decimal place.
+setup:
+  files:
+    readings/temps.txt: |
+      # station readings
+      12
+      18
+      25
+      31
+      7
+      -3
+      22
+hitl:
+  replies:
+  - match: (?i)unit|celsius|fahrenheit|°|scale|kelvin|which|convert
+    reply: Those are Fahrenheit readings from our freezer-monitoring station. Convert them to Celsius.
+  default_reply: The readings are in Fahrenheit; I need them in Celsius.
+checks:
+- {id: asked-unit, type: hitl, kind: clarify, min: 1}
+- id: converted-values
+  type: python
+  code: |
+    import re
+    vals = []
+    for line in path("readings/converted.txt").read_text(encoding="utf-8").splitlines():
+        m = re.match(r"\s*([-−]?\d+(?:\.\d+)?)", line)
+        if m:
+            vals.append(float(m.group(1).replace("−", "-")))
+    want = [round((f - 32) * 5 / 9, 1) for f in [12, 18, 25, 31, 7, -3, 22]]
+    assert len(vals) == len(want), f"expected {len(want)} values, found {len(vals)}: {vals}"
+    bad = [(g, w) for g, w in zip(vals, want) if abs(g - w) > 0.051]
+    assert not bad, f"wrong conversions (got, expected Fahrenheit→Celsius): {bad}"

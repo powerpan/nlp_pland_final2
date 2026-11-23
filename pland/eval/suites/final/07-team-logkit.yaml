@@ -1,0 +1,114 @@
+# final 07 — team with dependent subtasks tracked on the board; hidden tests + CLI on an unseen log file
+id: final-team-logkit
+title: Team builds a package with dependent subtasks (parser → stats → CLI → tests/docs)
+category: team
+mode: team
+team:
+  room: true
+  lead: architect
+  bots:
+  - name: architect
+    title: Architect
+    description: Designs interfaces, plans work with dependencies on the team board, delegates and integrates
+  - name: coder
+    title: Coder
+    description: Implements Python code carefully from a specification
+  - name: tester
+    title: Tester
+    description: Writes pytest test suites, runs them and reports defects
+prompt: |
+  Team task — build the log-analysis package `logkit` in the room's shared folder, under `shared/logkit/`
+  (standard library only). Log lines look like:
+
+      2026-10-01T12:00:03Z INFO [auth] login ok user=alice ms=120
+
+  i.e. `<timestamp> <LEVEL> [<component>] <message>`, single spaces between the parts.
+
+  1. `logkit/parser.py` — `parse_line(line) -> dict | None`. Surrounding whitespace is ignored. The timestamp must
+     match `YYYY-MM-DDTHH:MM:SSZ`, LEVEL is one of `DEBUG INFO WARN ERROR`, the component matches `[a-z0-9_-]+`, and
+     the message (everything after `] `) must be non-empty; otherwise return `None`. Return
+     `{"ts", "level", "component", "message", "fields"}` where `fields` maps every whitespace-separated message token of
+     the form `key=value` (key `[A-Za-z_][A-Za-z0-9_]*`, value non-empty) to its value string; a later duplicate key wins.
+  2. `logkit/stats.py` (needs the parser's record format) — `summarize(records) -> dict` with the keys `total` (number
+     of records), `by_level` and `by_component` (counts, only for values that occur), `errors_by_component` (number of
+     ERROR records per component, only components with at least one), and `slowest`: `{"component", "ms"}` of the
+     record with the largest integer `ms` field (value made of digits only; ties → the first such record), or `None`.
+  3. `logkit/__main__.py` (needs 1 and 2) — `python -m logkit <logfile>`, run from `shared/logkit/`, prints
+     `json.dumps(result, sort_keys=True)` where `result` is the `summarize` output of all parseable lines plus
+     `"malformed"`: the number of non-blank lines that `parse_line` rejects. A missing file: message on stderr, exit 2.
+  4. `logkit/__init__.py` exporting `parse_line` and `summarize`; tests in `shared/logkit/tests/` (at least 8, passing
+     with `python -m pytest tests` from `shared/logkit/`); and `shared/logkit/README.md` describing the API and the CLI.
+
+  Plan this on the team board as separate tasks with their dependencies (parser → stats → CLI; tests and README after
+  the code they cover), delegate them to the teammates, and verify the integrated package at the end.
+timeout: 1200
+checks:
+- {id: package-exists, type: file_exists, path: shared/logkit/logkit/__init__.py}
+- id: hidden-parser
+  type: python
+  code: |
+    import sys
+    sys.path.insert(0, str(path("shared/logkit")))
+    from logkit import parse_line
+    r = parse_line("2026-10-01T12:00:03Z INFO [auth] login ok user=alice ms=120")
+    assert r == {"ts": "2026-10-01T12:00:03Z", "level": "INFO", "component": "auth", "message": "login ok user=alice ms=120",
+                 "fields": {"user": "alice", "ms": "120"}}, r
+    r = parse_line("  2026-10-01T12:00:03Z WARN [db-pool_2] slow query a=1 a=2 c= =4\n")
+    assert r and r["component"] == "db-pool_2" and r["fields"] == {"a": "2"}, r
+    for bad in ["2026-10-01T12:00:03Z FATAL [x] boom", "2026-10-01T12:00:03Z INFO [X] upper", "2026-10-01T12:00:03Z INFO [x]",
+                "", "INFO [x] no timestamp", "2026-10-01 12:00:03 INFO [x] space ts", "2026-10-01T12:00:03Z INFO x no brackets"]:
+        assert parse_line(bad) is None, f"parse_line({bad!r}) should be None"
+- id: hidden-stats
+  type: python
+  code: |
+    import sys
+    sys.path.insert(0, str(path("shared/logkit")))
+    from logkit import parse_line, summarize
+    lines = ["2026-10-01T00:00:01Z INFO [a] x ms=5", "2026-10-01T00:00:02Z ERROR [b] y ms=9",
+             "2026-10-01T00:00:03Z ERROR [c] z ms=9", "2026-10-01T00:00:04Z INFO [c] w ms=x1"]
+    s = summarize([parse_line(l) for l in lines])
+    assert s == {"total": 4, "by_level": {"INFO": 2, "ERROR": 2}, "by_component": {"a": 1, "b": 1, "c": 2},
+                 "errors_by_component": {"b": 1, "c": 1}, "slowest": {"component": "b", "ms": 9}}, s
+    assert summarize([]) == {"total": 0, "by_level": {}, "by_component": {}, "errors_by_component": {}, "slowest": None}, summarize([])
+- id: hidden-cli
+  type: python
+  code: |
+    import json, subprocess, sys, tempfile
+    cwd = path("shared/logkit")
+    with tempfile.TemporaryDirectory() as d:
+        log = Path(d) / "hidden.log"
+        log.write_text('2026-10-02T08:00:00Z INFO [api] request ok path=/users ms=35\n2026-10-02T08:00:01Z INFO [api] request ok path=/orders ms=120\n2026-10-02T08:00:02Z WARN [cache] miss key=user:42\n2026-10-02T08:00:03Z ERROR [db] query failed table=orders ms=1500\nthis line is garbage\n2026-10-02T08:00:04Z DEBUG [scheduler] tick n=1\n\n2026-10-02T08:00:05Z ERROR [api] upstream error path=/pay ms=1500\n2026-10-02T08:00:06Z NOTICE [api] unknown level\n2026-10-02T08:00:07Z INFO [Auth] bad component case\n2026-10-02T08:00:08Z ERROR [db] deadlock ms=abc\n2026-10-02 08:00:09 INFO [api] wrong timestamp format\n2026-10-02T08:00:10Z INFO [auth] login user=bob ms=80 ms=81\n', encoding="utf-8")
+        r = subprocess.run([sys.executable, "-m", "logkit", str(log)], cwd=cwd, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, "python -m logkit failed: " + (r.stdout + r.stderr)[-600:]
+        got = json.loads(r.stdout)
+        assert got == {'total': 8, 'by_level': {'INFO': 3, 'WARN': 1, 'ERROR': 3, 'DEBUG': 1}, 'by_component': {'api': 3, 'cache': 1, 'db': 2, 'scheduler': 1, 'auth': 1}, 'errors_by_component': {'db': 2, 'api': 1}, 'slowest': {'component': 'db', 'ms': 1500}, 'malformed': 4}, f"CLI output {got} != expected {{'total': 8, 'by_level': {'INFO': 3, 'WARN': 1, 'ERROR': 3, 'DEBUG': 1}, 'by_component': {'api': 3, 'cache': 1, 'db': 2, 'scheduler': 1, 'auth': 1}, 'errors_by_component': {'db': 2, 'api': 1}, 'slowest': {'component': 'db', 'ms': 1500}, 'malformed': 4}}"
+        r = subprocess.run([sys.executable, "-m", "logkit", str(Path(d) / "missing.log")], cwd=cwd, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 2, f"missing file should exit 2, got {r.returncode}"
+- id: team-tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    pytest_in(path("shared/logkit"), 8, "tests")
+- id: readme
+  type: python
+  code: |
+    text = path("shared/logkit/README.md").read_text(encoding="utf-8")
+    for word in ("parse_line", "summarize", "python -m logkit"):
+        assert word in text, f"README.md does not mention {word!r}"
+- {id: delegated, type: delegated, min: 2}
+- {id: board-planned, type: board_tasks, min: 3}
+required:
+- package-exists
+- hidden-parser
+- hidden-stats
+- hidden-cli
+- team-tests-pass
+- delegated
+- board-planned

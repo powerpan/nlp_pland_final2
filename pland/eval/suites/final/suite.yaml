@@ -1,0 +1,15 @@
+# PlanD eval suite `final` (format: pland/eval/SCHEMA.md)
+description: |-
+  Final suite: 8 harder, multi-step tasks, each completable by a capable agent in roughly 40 steps / 10 minutes:
+  a tokenizer+parser project with hidden tests and a CLI, a data pipeline that is re-run on unseen data, a
+  debugging task spread over four modules, a git release workflow (branch, --no-ff merge, annotated tag, push to a
+  local bare remote), a live-data research report verified against the source API at check time, an
+  under-specified export that needs a clarification round-trip, and two team tasks — one with dependent subtasks
+  (parser → stats → CLI → tests/docs) and one combining web research with coding.
+defaults:
+  timeout: 900
+  max_iterations: 50
+  memory: carry
+  hitl:
+    approvals: approve
+    default_reply: Use your best judgement and state any assumption you make.

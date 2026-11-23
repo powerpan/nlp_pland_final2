@@ -1,0 +1,159 @@
+# memory_evolution 03 — log format: mixed ms/s suffix. The simulated user refuses to repeat the conventions; only memory from earlier tasks helps.
+# expected: {'requests': 51, 'errors': 3, 'error_rate': '5.88', 'p95_ms': 604, 'slowest_endpoint': '/api/recommendations'}
+# traps (field changed if the convention is ignored): {'health': ['requests', 'error_rate', 'p95_ms', 'slowest_endpoint'], '4xx': ['errors', 'error_rate'], 'query': ['slowest_endpoint'], 'p95': ['p95_ms'], 'unit': 'mixed ms/s suffix'}
+id: memevo-03
+title: 'Log statistics #3 (mixed ms/s suffix)'
+category: memory
+prompt: |
+  Compute our standard request statistics for `logs/requests-03.csv` and write them to `stats/report-03.txt`.
+
+  `logs/requests-03.csv` is a CSV file with the header `timestamp,client,method,endpoint,status,latency`;
+  `endpoint` is the requested path (incl. query string) and `latency` carries a unit suffix, e.g. `87ms` or `1.25s`.
+
+  Apply our team's conventions for request-log statistics (if you don't know them, ask me).
+
+  The file must contain exactly these five lines, in this order, and nothing else:
+  requests: <number of requests counted>
+  errors: <number of requests counted as errors>
+  error_rate: <errors / requests × 100, with exactly two decimals>%
+  p95_ms: <95th-percentile latency in whole milliseconds>
+  slowest_endpoint: <endpoint with the highest mean latency>
+setup:
+  files:
+    logs/requests-03.csv: |
+      timestamp,client,method,endpoint,status,latency
+      2026-10-03T08:00:12Z,c858,GET,/health/ready,200,1.921s
+      2026-10-03T08:00:15Z,c679,GET,/api/search?q=coat&page=4,200,0.258s
+      2026-10-03T08:00:34Z,c364,GET,/api/search?q=gift+ideas,200,1440ms
+      2026-10-03T08:01:01Z,c507,GET,/api/recommendations,200,712ms
+      2026-10-03T08:01:03Z,c584,GET,/api/search?q=socks,200,0.113s
+      2026-10-03T08:01:27Z,c947,GET,/health/ready,200,2371ms
+      2026-10-03T08:01:43Z,c641,GET,/api/users,200,0.068s
+      2026-10-03T08:02:12Z,c802,GET,/api/orders?id=20,200,154ms
+      2026-10-03T08:02:20Z,c941,GET,/api/orders,200,0.165s
+      2026-10-03T08:02:22Z,c500,POST,/api/orders,201,0.201s
+      2026-10-03T08:02:36Z,c396,GET,/api/items,200,0.041s
+      2026-10-03T08:02:38Z,c942,GET,/api/items?id=64,200,118ms
+      2026-10-03T08:02:55Z,c522,GET,/healthz,200,1618ms
+      2026-10-03T08:02:58Z,c139,GET,/api/search?q=shoes,200,0.249s
+      2026-10-03T08:03:11Z,c445,GET,/api/search?q=socks,200,0.09s
+      2026-10-03T08:03:17Z,c312,GET,/api/orders?id=84,200,0.16s
+      2026-10-03T08:03:46Z,c914,GET,/api/users?id=92,200,138ms
+      2026-10-03T08:04:19Z,c354,GET,/api/recommendations,200,0.532s
+      2026-10-03T08:04:52Z,c819,GET,/login,200,113ms
+      2026-10-03T08:05:09Z,c357,GET,/api/users,200,92ms
+      2026-10-03T08:05:31Z,c355,GET,/api/cart,200,112ms
+      2026-10-03T08:06:07Z,c850,GET,/login?id=38,404,94ms
+      2026-10-03T08:06:22Z,c121,GET,/api/cart,404,122ms
+      2026-10-03T08:06:25Z,c998,GET,/api/users?id=20,200,132ms
+      2026-10-03T08:06:29Z,c381,GET,/healthz,200,1462ms
+      2026-10-03T08:06:52Z,c807,GET,/api/items,200,109ms
+      2026-10-03T08:06:57Z,c905,GET,/api/orders,200,188ms
+      2026-10-03T08:07:15Z,c460,GET,/api/search?q=coat&page=3,200,184ms
+      2026-10-03T08:07:42Z,c605,POST,/login,401,0.084s
+      2026-10-03T08:07:53Z,c666,GET,/api/users,200,0.1s
+      2026-10-03T08:08:00Z,c225,GET,/api/orders,200,0.218s
+      2026-10-03T08:08:36Z,c848,GET,/api/cart?id=41,200,137ms
+      2026-10-03T08:08:54Z,c924,GET,/api/items,200,46ms
+      2026-10-03T08:09:10Z,c195,GET,/api/items,204,0.036s
+      2026-10-03T08:09:47Z,c484,GET,/api/search?q=scarf&page=3,304,0.183s
+      2026-10-03T08:10:05Z,c689,GET,/api/users,201,0.08s
+      2026-10-03T08:10:08Z,c341,GET,/login,200,237ms
+      2026-10-03T08:10:16Z,c834,GET,/api/search?q=socks,200,109ms
+      2026-10-03T08:10:38Z,c822,GET,/api/search?q=red+shirt,500,136ms
+      2026-10-03T08:10:40Z,c209,GET,/api/search?q=scarf&page=4,200,203ms
+      2026-10-03T08:11:01Z,c272,GET,/api/recommendations,200,0.604s
+      2026-10-03T08:11:28Z,c768,GET,/api/search?q=coat&page=2,200,0.225s
+      2026-10-03T08:12:02Z,c737,GET,/api/search?q=socks,200,137ms
+      2026-10-03T08:12:18Z,c745,GET,/api/cart,503,105ms
+      2026-10-03T08:12:52Z,c648,GET,/api/orders,200,0.182s
+      2026-10-03T08:13:20Z,c164,GET,/healthz,200,1755ms
+      2026-10-03T08:13:24Z,c297,GET,/api/orders,200,117ms
+      2026-10-03T08:13:49Z,c974,GET,/api/items,200,49ms
+      2026-10-03T08:14:27Z,c485,GET,/api/items,502,0.082s
+      2026-10-03T08:15:04Z,c612,GET,/api/search?q=scarf&page=4,200,0.191s
+      2026-10-03T08:15:24Z,c288,GET,/api/users,401,0.127s
+      2026-10-03T08:15:43Z,c165,GET,/api/orders?id=62,304,209ms
+      2026-10-03T08:15:57Z,c520,GET,/api/search?q=red+shirt,200,0.206s
+      2026-10-03T08:16:24Z,c628,GET,/api/users?id=45,200,0.069s
+      2026-10-03T08:17:01Z,c457,GET,/api/search?q=socks,200,215ms
+      2026-10-03T08:17:17Z,c990,GET,/login,200,119ms
+hitl:
+  replies:
+  - match: .*
+    reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+  default_reply: Same conventions as always — I explained them in detail last time and I'm not going to repeat them.
+memory: carry
+checks:
+- id: format
+  type: python
+  code: |
+    import re
+    lines = [l.rstrip() for l in path('stats/report-03.txt').read_text(encoding="utf-8").strip().splitlines()]
+    pats = [r"requests: \d+", r"errors: \d+", r"error_rate: \d+\.\d{2}%", r"p95_ms: \d+", r"slowest_endpoint: /\S*"]
+    assert len(lines) == 5, f"expected exactly 5 lines, got {len(lines)}: {lines}"
+    for line, pat in zip(lines, pats):
+        assert re.fullmatch(pat, line), f"line {line!r} does not match the required format {pat!r}"
+- id: requests
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-03.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'requests', 51
+    assert key in vals, f"no '{key}:' line in stats/report-03.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: errors
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-03.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'errors', 3
+    assert key in vals, f"no '{key}:' line in stats/report-03.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: error-rate
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-03.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'error_rate', '5.88'
+    assert key in vals, f"no '{key}:' line in stats/report-03.txt"
+    got = vals[key]
+    got_num = float(got.rstrip("%").strip())
+    assert abs(got_num - float(want)) < 0.006, f"error_rate: got {got}, expected {want}%"
+- id: p95-ms
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-03.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'p95_ms', 604
+    assert key in vals, f"no '{key}:' line in stats/report-03.txt"
+    got = vals[key]
+    assert re.fullmatch(r"\d+", got) and int(got) == want, f"{key}: got {got!r}, expected {want}"
+- id: slowest-endpoint
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path('stats/report-03.txt').read_text(encoding="utf-8").splitlines() if l.strip()]
+    vals = dict(l.split(":", 1) for l in lines if ":" in l)
+    vals = {k.strip(): v.strip() for k, v in vals.items()}
+    key, want = 'slowest_endpoint', '/api/recommendations'
+    assert key in vals, f"no '{key}:' line in stats/report-03.txt"
+    got = vals[key]
+    assert got == want, f"slowest_endpoint: got {got!r}, expected {want!r}"
+required:
+- format
+- requests
+- errors
+- error-rate
+- p95-ms
+- slowest-endpoint

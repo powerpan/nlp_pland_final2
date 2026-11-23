@@ -1,0 +1,134 @@
+# midterm 03 — debugging: buggy module + failing tests; tests must pass, test file must stay unchanged
+id: mid-debug-stats
+title: Fix a buggy statistics module so its tests pass
+category: coding
+prompt: |
+  `stats_utils.py` has bugs: `python -m pytest test_stats_utils.py` fails. Find and fix the bugs in `stats_utils.py`
+  so that every function behaves as its docstring says and all tests pass. Do not modify `test_stats_utils.py`.
+setup:
+  files:
+    stats_utils.py: |
+      """Small statistics helpers used by the reporting scripts."""
+
+
+      def mean(values):
+          """Arithmetic mean. Raises ValueError for an empty sequence."""
+          if not values:
+              raise ValueError("mean of empty data")
+          return sum(values) / len(values)
+
+
+      def median(values):
+          """Median of the values (which need not be sorted); the input must not be modified.
+          For an even count it is the mean of the two middle values. Raises ValueError for an empty sequence."""
+          if not values:
+              raise ValueError("median of empty data")
+          n = len(values)
+          mid = n // 2
+          if n % 2:
+              return values[mid]
+          return (values[mid] + values[mid + 1]) / 2
+
+
+      def sample_variance(values):
+          """Sample variance (divides by n - 1). Raises ValueError for fewer than two values."""
+          if len(values) < 2:
+              raise ValueError("variance needs at least two values")
+          m = mean(values)
+          return sum((x - m) ** 2 for x in values) / len(values)
+
+
+      def mode(values):
+          """Most common value; ties are broken in favour of the smallest value. Raises ValueError for empty data."""
+          if not values:
+              raise ValueError("mode of empty data")
+          counts = {}
+          for v in values:
+              counts[v] = counts.get(v, 0) + 1
+          return max(counts, key=lambda v: counts[v])
+    test_stats_utils.py: |
+      import pytest
+
+      from stats_utils import mean, median, mode, sample_variance
+
+
+      def test_mean():
+          assert mean([1, 2, 3, 4]) == 2.5
+
+
+      def test_mean_empty():
+          with pytest.raises(ValueError):
+              mean([])
+
+
+      def test_median_odd_unsorted():
+          assert median([5, 1, 3]) == 3
+
+
+      def test_median_even():
+          assert median([4, 1, 3, 2]) == 2.5
+
+
+      def test_median_does_not_modify_input():
+          data = [3, 1, 2]
+          median(data)
+          assert data == [3, 1, 2]
+
+
+      def test_sample_variance():
+          assert sample_variance([2, 4, 4, 4, 5, 5, 7, 9]) == pytest.approx(32 / 7)
+
+
+      def test_mode_tie_prefers_smallest():
+          assert mode([3, 1, 3, 1, 2]) == 1
+checks:
+- id: tests-unchanged
+  type: python
+  code: |
+    import hashlib
+    def norm_hash(p):
+        t = "\n".join(l.rstrip() for l in Path(p).read_text(encoding="utf-8").strip().splitlines())
+        return hashlib.sha256(t.encode("utf-8")).hexdigest()
+    assert norm_hash(path("test_stats_utils.py")) == '4e8d90219d77a3d4bbfeea98fb1d30cdf09ef7998e09fa29d5bcc10912a48bae', "test_stats_utils.py was modified"
+- id: tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    pytest_in(ws, 7, "test_stats_utils.py")
+- id: hidden-behaviour
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    s = load("stats_under_test", path("stats_utils.py"))
+    assert s.median([7]) == 7
+    assert s.median([10, 2]) == 6
+    assert s.median([6, 1, 5, 2, 4, 3]) == 3.5
+    data = [9, 1, 8, 2]
+    assert s.median(data) == 5 and data == [9, 1, 8, 2], "median must not modify its input"
+    assert abs(s.sample_variance([1, 2]) - 0.5) < 1e-9
+    assert abs(s.sample_variance([1, 2, 3, 4]) - 5 / 3) < 1e-9
+    assert s.mode([5]) == 5
+    assert s.mode([2, 2, 1, 1, 3, 3]) == 1
+    assert s.mode(["b", "a", "b", "a"]) == "a"
+    assert s.mode([4, 4, 1]) == 4
+    for fn in (s.median, s.mode, s.mean):
+        try:
+            fn([])
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{fn.__name__}([]) must raise ValueError")

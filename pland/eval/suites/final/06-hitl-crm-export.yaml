@@ -1,0 +1,113 @@
+# final 06 — HITL: the required output format is only available from the simulated user; exact output + re-run on new data
+id: final-hitl-crm-export
+title: Export users in 'the format our CRM importer expects' (spec only via clarification)
+category: hitl
+prompt: |
+  Export our user list `data/users.json` to `export/users.csv` in the format our CRM importer expects.
+  Also save the converter you used as `export/convert.py` (standard library only) so we can re-run it next month as
+  `python export/convert.py <input.json> <output.csv>`.
+setup:
+  files:
+    data/users.json: |
+      [
+        {
+          "id": 1,
+          "first_name": "Ada",
+          "last_name": "Lovelace",
+          "email": "ada@example.org",
+          "signup": "2025-12-10T08:15:00Z",
+          "active": true
+        },
+        {
+          "id": 2,
+          "first_name": "Alan",
+          "last_name": "Turing",
+          "email": "ALAN@example.org",
+          "signup": "2026-01-03T17:40:00Z",
+          "active": false
+        },
+        {
+          "id": 3,
+          "first_name": "Grace",
+          "last_name": "Hopper",
+          "email": null,
+          "signup": "2026-02-14T09:00:00Z",
+          "active": true
+        },
+        {
+          "id": 4,
+          "first_name": "Edsger",
+          "last_name": "Dijkstra",
+          "email": " edsger@example.org ",
+          "signup": "2025-11-30T23:59:00Z",
+          "active": true
+        },
+        {
+          "id": 5,
+          "first_name": "Barbara",
+          "last_name": "Liskov",
+          "email": "barbara@example.org",
+          "signup": "2026-03-01T00:00:00Z",
+          "active": false
+        },
+        {
+          "id": 6,
+          "first_name": "Ken",
+          "last_name": "Thompson",
+          "email": "",
+          "signup": "2026-03-05T12:00:00Z",
+          "active": true
+        },
+        {
+          "id": 7,
+          "first_name": "Donald",
+          "last_name": "Knuth",
+          "email": "don@example.org",
+          "signup": "2024-07-19T10:30:00Z",
+          "active": true
+        }
+      ]
+hitl:
+  replies:
+  - match: .*
+    reply: |-
+      Our CRM importer expects exactly this:
+      - delimiter `;` (semicolon), UTF-8, no quoting, `\n` line endings;
+      - a header row, exactly: email;full_name;signup_date;active
+      - email: trimmed and lowercased; skip users whose email is missing or empty;
+      - full_name: `Last, First` (e.g. `Lovelace, Ada`);
+      - signup_date: `DD.MM.YYYY` — the date part of the UTC `signup` timestamp;
+      - active: `1` for true, `0` for false;
+      - rows sorted by email, ascending.
+  default_reply: |-
+    Our CRM importer expects exactly this:
+    - delimiter `;` (semicolon), UTF-8, no quoting, `\n` line endings;
+    - a header row, exactly: email;full_name;signup_date;active
+    - email: trimmed and lowercased; skip users whose email is missing or empty;
+    - full_name: `Last, First` (e.g. `Lovelace, Ada`);
+    - signup_date: `DD.MM.YYYY` — the date part of the UTC `signup` timestamp;
+    - active: `1` for true, `0` for false;
+    - rows sorted by email, ascending.
+checks:
+- {id: asked-format, type: hitl, kind: clarify, min: 1}
+- id: export-exact
+  type: python
+  code: |
+    got = path("export/users.csv").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip("\n").split("\n")
+    want = 'email;full_name;signup_date;active\nada@example.org;Lovelace, Ada;10.12.2025;1\nalan@example.org;Turing, Alan;03.01.2026;0\nbarbara@example.org;Liskov, Barbara;01.03.2026;0\ndon@example.org;Knuth, Donald;19.07.2024;1\nedsger@example.org;Dijkstra, Edsger;30.11.2025;1\n'.rstrip("\n").split("\n")
+    assert got[:1] == want[:1], f"header {got[:1]} != {want[:1]}"
+    assert got == want, "export differs; expected:\n" + "\n".join(want) + "\ngot:\n" + "\n".join(got)
+- id: converter-rerun
+  type: python
+  code: |
+    import json, shutil, subprocess, sys, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        shutil.copy(path("export/convert.py"), d / "convert.py")
+        (d / "next.json").write_text(json.dumps([{'id': 10, 'first_name': 'Margaret', 'last_name': 'Hamilton', 'email': 'Margaret.Hamilton@Example.org', 'signup': '2026-04-02T06:00:00Z', 'active': True}, {'id': 11, 'first_name': 'Linus', 'last_name': 'Torvalds', 'email': None, 'signup': '2026-04-03T07:00:00Z', 'active': True}, {'id': 12, 'first_name': 'Frances', 'last_name': 'Allen', 'email': 'fran@example.org', 'signup': '2026-01-31T23:00:00Z', 'active': False}, {'id': 13, 'first_name': 'John', 'last_name': 'Backus', 'email': '  backus@example.org', 'signup': '2025-05-09T12:00:00Z', 'active': True}]), encoding="utf-8")
+        r = subprocess.run([sys.executable, "convert.py", "next.json", "next.csv"], cwd=d, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, "convert.py failed: " + (r.stdout + r.stderr)[-600:]
+        got = (d / "next.csv").read_text(encoding="utf-8").replace("\r\n", "\n").rstrip("\n").split("\n")
+        want = 'email;full_name;signup_date;active\nbackus@example.org;Backus, John;09.05.2025;1\nfran@example.org;Allen, Frances;31.01.2026;0\nmargaret.hamilton@example.org;Hamilton, Margaret;02.04.2026;1\n'.rstrip("\n").split("\n")
+        assert got == want, "convert.py output on new data differs; expected:\n" + "\n".join(want) + "\ngot:\n" + "\n".join(got)
+required: [export-exact, converter-rerun]

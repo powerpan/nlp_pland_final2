@@ -1,0 +1,99 @@
+# midterm 14 — team (planner/analyst/reviewer): dependent subtasks (compute → independent review) on shared data
+id: mid-team-payroll
+title: Analyst computes, reviewer independently verifies a payroll analysis
+category: team
+mode: team
+team:
+  room: true
+  lead: planner
+  bots:
+  - name: planner
+    title: Planner
+    description: Breaks work down, assigns it to the right teammates and integrates the results
+  - name: analyst
+    title: Analyst
+    description: Analyses data with Python and reports exact numbers
+  - name: reviewer
+    title: Reviewer
+    description: Independently re-checks numbers and reviews documents for errors
+prompt: |
+  Team task — payroll analysis. The inputs are in the room's shared folder: `shared/data/employees.csv`
+  (id,name,department,annual_salary,start_date) and `shared/data/departments.csv` (department,annual_budget).
+
+  Deliverables:
+  1. `shared/analysis/summary.json` — a JSON object with exactly these keys:
+     - `headcount`: {department: number of employees}
+     - `avg_salary`: {department: mean annual_salary, rounded to 2 decimals}
+     - `payroll_ratio`: {department: total annual_salary / annual_budget, rounded to 3 decimals}
+     - `over_budget`: alphabetically sorted list of the departments whose total salary exceeds their budget
+     - `longest_tenure`: name of the employee with the earliest start_date
+     Every department listed in departments.csv must appear in the three per-department objects (a department
+     without employees gets headcount 0, avg_salary 0 and payroll_ratio 0).
+  2. `shared/analysis/findings.md` — 3 to 5 bullet points of findings based on those numbers.
+
+  The analyst computes the numbers. The reviewer then independently re-computes them from the CSV files, fixes
+  anything wrong and, once satisfied, appends the final line `Reviewed-by: reviewer` to findings.md.
+setup:
+  files:
+    shared/data/employees.csv: |
+      id,name,department,annual_salary,start_date
+      1,Ana Silva,Engineering,98000,2019-03-11
+      2,Ben Okafor,Engineering,105000,2021-07-01
+      3,Chen Wei,Engineering,87000,2023-01-16
+      4,Dara Novak,Sales,64000,2018-05-02
+      5,Eli Haddad,Sales,71000,2020-09-14
+      6,Fay Lindqvist,Sales,58000,2024-02-05
+      7,Gus Moreau,Support,52000,2017-11-20
+      8,Hana Sato,Support,49500,2022-04-04
+      9,Ivo Petrov,Marketing,76000,2016-08-29
+      10,Jo Mensah,Marketing,69000,2021-12-06
+      11,Kai Brandt,Engineering,112000,2015-02-23
+      12,Lea Rossi,Support,55500,2019-10-07
+    shared/data/departments.csv: |
+      department,annual_budget
+      Engineering,420000
+      Sales,200000
+      Support,150000
+      Marketing,140000
+      Legal,90000
+timeout: 900
+checks:
+- id: summary-structure
+  type: python
+  code: |
+    import json
+    s = json.loads(path("shared/analysis/summary.json").read_text(encoding="utf-8"))
+    assert set(s) == {"headcount", "avg_salary", "payroll_ratio", "over_budget", "longest_tenure"}, f"keys: {sorted(s)}"
+    for k in ("headcount", "avg_salary", "payroll_ratio"):
+        assert set(s[k]) == set({'headcount': {'Engineering': 4, 'Sales': 3, 'Support': 3, 'Marketing': 2, 'Legal': 0}, 'avg_salary': {'Engineering': 100500.0, 'Sales': 64333.33, 'Support': 52333.33, 'Marketing': 72500.0, 'Legal': 0}, 'payroll_ratio': {'Engineering': 0.957, 'Sales': 0.965, 'Support': 1.047, 'Marketing': 1.036, 'Legal': 0.0}, 'over_budget': ['Marketing', 'Support'], 'longest_tenure': 'Kai Brandt'}[k]), f"{k} must have exactly the departments {sorted({'headcount': {'Engineering': 4, 'Sales': 3, 'Support': 3, 'Marketing': 2, 'Legal': 0}, 'avg_salary': {'Engineering': 100500.0, 'Sales': 64333.33, 'Support': 52333.33, 'Marketing': 72500.0, 'Legal': 0}, 'payroll_ratio': {'Engineering': 0.957, 'Sales': 0.965, 'Support': 1.047, 'Marketing': 1.036, 'Legal': 0.0}, 'over_budget': ['Marketing', 'Support'], 'longest_tenure': 'Kai Brandt'}[k])}, got {sorted(s[k])}"
+- id: summary-values
+  type: python
+  code: |
+    import json
+    s, E = json.loads(path("shared/analysis/summary.json").read_text(encoding="utf-8")), {'headcount': {'Engineering': 4, 'Sales': 3, 'Support': 3, 'Marketing': 2, 'Legal': 0}, 'avg_salary': {'Engineering': 100500.0, 'Sales': 64333.33, 'Support': 52333.33, 'Marketing': 72500.0, 'Legal': 0}, 'payroll_ratio': {'Engineering': 0.957, 'Sales': 0.965, 'Support': 1.047, 'Marketing': 1.036, 'Legal': 0.0}, 'over_budget': ['Marketing', 'Support'], 'longest_tenure': 'Kai Brandt'}
+    for d, n in E["headcount"].items():
+        assert s["headcount"].get(d) == n, f"headcount[{d}] = {s['headcount'].get(d)}, expected {n}"
+    for d, v in E["avg_salary"].items():
+        assert abs(float(s["avg_salary"].get(d, -1)) - v) <= 0.011, f"avg_salary[{d}] = {s['avg_salary'].get(d)}, expected {v}"
+    for d, v in E["payroll_ratio"].items():
+        assert abs(float(s["payroll_ratio"].get(d, -1)) - v) <= 0.0011, f"payroll_ratio[{d}] = {s['payroll_ratio'].get(d)}, expected {v}"
+    assert s["over_budget"] == E["over_budget"], f"over_budget = {s['over_budget']}, expected {E['over_budget']}"
+    assert s["longest_tenure"] == E["longest_tenure"], f"longest_tenure = {s['longest_tenure']!r}, expected {E['longest_tenure']!r}"
+- id: findings-reviewed
+  type: python
+  code: |
+    import re
+    lines = [l.strip() for l in path("shared/analysis/findings.md").read_text(encoding="utf-8").splitlines() if l.strip()]
+    bullets = [l for l in lines if re.match(r"^([-*+]|\d+[.)])\s+", l) and "reviewed-by" not in l.lower()]
+    assert 3 <= len(bullets) <= 5, f"expected 3-5 bullet points of findings, found {len(bullets)}"
+    last = lines[-1].strip("-*_> ") if lines else ""
+    assert last == "Reviewed-by: reviewer", f"the last line must be 'Reviewed-by: reviewer', got {last!r}"
+- {id: delegated-analyst, type: delegated, min: 1, to: [analyst]}
+- {id: delegated-reviewer, type: delegated, min: 1, to: [reviewer]}
+- {id: board, type: board_tasks, min: 2, status: done}
+required:
+- summary-structure
+- summary-values
+- findings-reviewed
+- delegated-analyst
+- delegated-reviewer
