@@ -81,10 +81,11 @@ class Backend:
     isolated = False  # True when an OS/container boundary contains the process
 
     def run(self, command: str, cwd: Path, *, timeout: float | None = None, env: dict[str, str] | None = None,
-            mounts: dict[str, Path] | None = None) -> ExecResult:
+            mounts: dict[str, Path] | None = None, cancel=None) -> ExecResult:
         raise NotImplementedError
 
-    def run_python(self, code: str, cwd: Path, *, timeout: float | None = None, mounts: dict[str, Path] | None = None) -> ExecResult:
+    def run_python(self, code: str, cwd: Path, *, timeout: float | None = None, mounts: dict[str, Path] | None = None,
+                   cancel=None) -> ExecResult:
         raise NotImplementedError
 
 
@@ -114,10 +115,13 @@ class LocalBackend(Backend):
     isolated = False
 
     def __init__(self, cfg: SandboxConfig | None = None, python: str | None = None, workspace: Path | None = None,
-                 deny_roots: list[Path] | None = None):
+                 deny_roots: list[Path] | None = None, home_dir: Path | None = None):
         self.cfg = cfg or SandboxConfig()
         self.python = python or sys.executable
         self.workspace = workspace.resolve() if workspace else None
+        # The private HOME stays in the bot's own folder even when a conversation works in a user's folder,
+        # so tool caches and dotfiles never land in the user's project.
+        self.home_dir = home_dir.resolve() if home_dir else (self.workspace / ".home" if self.workspace else None)
         self.seatbelt = (self.cfg.os_sandbox == "auto" and sys.platform == "darwin" and os.path.exists(SANDBOX_EXEC)
                          and self.workspace is not None)
         if self.seatbelt:
@@ -132,11 +136,13 @@ class LocalBackend(Backend):
     def _wrap(self, argv: list[str], cwd: Path, mounts: dict[str, Path] | None, env: dict[str, str]) -> list[str]:
         if not self.seatbelt:
             return argv
+        home = self.home_dir
+        home.mkdir(parents=True, exist_ok=True)
         writable = [self.workspace] + [m.resolve() for m in (mounts or {}).values()]
+        if not any(home == w or w in home.parents for w in writable):
+            writable.append(home)
         if not any(cwd.resolve() == w or w in cwd.resolve().parents for w in writable):
             writable.append(cwd.resolve())
-        home = self.workspace / ".home"
-        home.mkdir(parents=True, exist_ok=True)
         env["HOME"] = str(home)  # the real home is off limits; tools get a private one
         env.setdefault("GIT_AUTHOR_NAME", "pland-agent")
         env.setdefault("GIT_AUTHOR_EMAIL", "agent@pland.local")
@@ -156,7 +162,11 @@ class LocalBackend(Backend):
         except Exception:
             pass
 
-    def _exec(self, argv: list[str], cwd: Path, timeout: float, env: dict[str, str], stdin: str | None = None) -> ExecResult:
+    def _exec(self, argv: list[str], cwd: Path, timeout: float, env: dict[str, str], stdin: str | None = None,
+              cancel=None) -> ExecResult:
+        """Run in a new session/process group. When the command returns, whatever it left running in the
+        background (`cmd &`, nohup) is killed with the group — processes belong to the run that started them.
+        `cancel()` is polled once a second so a stopped run does not wait for a long command to finish."""
         start = time.time()
         proc = subprocess.Popen(
             argv,
@@ -170,28 +180,49 @@ class LocalBackend(Backend):
             start_new_session=True,
             preexec_fn=self._limits if os.name == "posix" else None,
         )
-        try:
-            out, err = proc.communicate(input=stdin, timeout=timeout)
-            return ExecResult(proc.returncode, out, err, False, time.time() - start)
-        except subprocess.TimeoutExpired:
+        deadline = start + timeout
+        pending_input = stdin
+        while True:
             try:
-                os.killpg(proc.pid, signal.SIGKILL)
-            except (ProcessLookupError, PermissionError):
-                proc.kill()
-            out, err = proc.communicate()
-            return ExecResult(-9, out or "", (err or "") + f"\n[killed after {timeout:.0f}s timeout]", True, time.time() - start)
+                out, err = proc.communicate(input=pending_input, timeout=min(1.0, max(0.01, deadline - time.time())))
+                self._kill_group(proc)  # reap background leftovers
+                return ExecResult(proc.returncode, out, err, False, time.time() - start)
+            except subprocess.TimeoutExpired:
+                pending_input = None  # stdin was already written on the first call
+                if proc.poll() is not None:
+                    # The command itself has exited but a background child still holds the output pipe open:
+                    # stop the leftovers now instead of waiting for them.
+                    code = proc.returncode
+                    self._kill_group(proc)
+                    out, err = proc.communicate()
+                    return ExecResult(code, out, err, False, time.time() - start)
+                stopped = cancel is not None and cancel()
+                if time.time() < deadline and not stopped:
+                    continue
+                self._kill_group(proc)
+                out, err = proc.communicate()
+                why = "run cancelled" if stopped else f"killed after {timeout:.0f}s timeout"
+                return ExecResult(-9, out or "", (err or "") + f"\n[{why}]", True, time.time() - start)
 
-    def run(self, command, cwd, *, timeout=None, env=None, mounts=None) -> ExecResult:
+    @staticmethod
+    def _kill_group(proc: subprocess.Popen) -> None:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            if proc.poll() is None:
+                proc.kill()
+
+    def run(self, command, cwd, *, timeout=None, env=None, mounts=None, cancel=None) -> ExecResult:
         cwd.mkdir(parents=True, exist_ok=True)
         e = scrub_env(env)
         argv = self._wrap(["/bin/bash", "-c", command], cwd, mounts, e)
-        return self._exec(argv, cwd, timeout or self.cfg.command_timeout, e)
+        return self._exec(argv, cwd, timeout or self.cfg.command_timeout, e, cancel=cancel)
 
-    def run_python(self, code, cwd, *, timeout=None, mounts=None) -> ExecResult:
+    def run_python(self, code, cwd, *, timeout=None, mounts=None, cancel=None) -> ExecResult:
         cwd.mkdir(parents=True, exist_ok=True)
         e = scrub_env()
         argv = self._wrap([self.python, "-I", "-"], cwd, mounts, e)
-        return self._exec(argv, cwd, timeout or self.cfg.command_timeout, e, stdin=code)
+        return self._exec(argv, cwd, timeout or self.cfg.command_timeout, e, stdin=code, cancel=cancel)
 
 
 class DockerBackend(Backend):
@@ -239,7 +270,7 @@ class DockerBackend(Backend):
             name = self._containers.get(key)
             if name and self._alive(name):
                 return name
-            # Keep each profile workspace and mount set in its own container.
+            # one container per (bot, folder, mounts): conversations in different folders never share one
             ident = f"{self.workspace}|{key}"
             suffix = int(hashlib.sha1(ident.encode()).hexdigest()[:6], 16)
             name = f"pland-{self.profile_name}-{suffix}"
@@ -293,7 +324,7 @@ class DockerBackend(Backend):
             return ExecResult(-9, (exc.stdout or "") if isinstance(exc.stdout, str) else "",
                               f"[killed after {timeout:.0f}s timeout]", True, time.time() - start)
 
-    def run(self, command, cwd, *, timeout=None, env=None, mounts=None) -> ExecResult:
+    def run(self, command, cwd, *, timeout=None, env=None, mounts=None, cancel=None) -> ExecResult:
         name = self._container_for(mounts)
         argv = ["docker", "exec", "-w", self._container_cwd(cwd, mounts)]
         for k, v in (env or {}).items():
@@ -301,7 +332,7 @@ class DockerBackend(Backend):
         argv += [name, "bash", "-c", command]
         return self._exec(argv, timeout or self.cfg.command_timeout)
 
-    def run_python(self, code, cwd, *, timeout=None, mounts=None) -> ExecResult:
+    def run_python(self, code, cwd, *, timeout=None, mounts=None, cancel=None) -> ExecResult:
         name = self._container_for(mounts)
         argv = ["docker", "exec", "-i", "-w", self._container_cwd(cwd, mounts), name, "python", "-"]
         return self._exec(argv, timeout or self.cfg.command_timeout, stdin=code)
@@ -313,12 +344,13 @@ class DockerBackend(Backend):
             self._containers.clear()
 
 
-def make_backend(cfg: SandboxConfig, profile_name: str, workspace: Path, deny_roots: list[Path] | None = None) -> Backend:
+def make_backend(cfg: SandboxConfig, profile_name: str, workspace: Path, deny_roots: list[Path] | None = None,
+                 home_dir: Path | None = None) -> Backend:
     if cfg.backend == "docker":
         return DockerBackend(cfg, profile_name, workspace)
     if cfg.backend != "local":
         raise ValueError(f"unknown sandbox backend {cfg.backend!r} (use local or docker)")
-    return LocalBackend(cfg, workspace=workspace, deny_roots=deny_roots)
+    return LocalBackend(cfg, workspace=workspace, deny_roots=deny_roots, home_dir=home_dir)
 
 
 def quote(s: str) -> str:

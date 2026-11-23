@@ -1,8 +1,7 @@
 """Static safety policy: command classification and file-path confinement.
 
-The dangerous-command patterns and the "hardline" floor follow the design of Hermes Agent's
-`tools/approval_detection.py` (MIT License, Copyright (c) 2025 Nous Research), condensed to the
-POSIX subset relevant here.
+The dangerous-command patterns are adapted from Hermes Agent (MIT License, Copyright (c) 2025 Nous Research;
+see LICENSE).
 """
 
 from __future__ import annotations
@@ -59,7 +58,7 @@ DANGEROUS: list[tuple[str, str]] = [
     (r"\bnpm\s+(publish|unpublish)\b", "publish a package"),
 ]
 
-# Content-level shapes a verb list misses (after Hermes' content checks): secrets in upload bodies, and
+# Content-level shapes a verb list misses: secrets in upload bodies, and
 # invisible/bidirectional Unicode that makes the approved command differ from the one that runs.
 DANGEROUS += [
     (r"\b(curl|wget)\b[^\n]*(-d|--data[\w-]*|--post-data|-F|--form)\s*[\"']?[^\n]*\$\{?\w*(KEY|TOKEN|SECRET|PASSWORD)\w*",

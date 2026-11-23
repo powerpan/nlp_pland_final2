@@ -1,10 +1,12 @@
 """Internet search and page fetching.
 
-Search backends, in order: DeepSeek Search API (same key as the model, results carry summaries
-written for models), Tavily (TAVILY_API_KEY), SearXNG (SEARXNG_URL), then keyless HTML scraping
-of DuckDuckGo and Bing. Fetch: DeepSeek Fetch API (returns Markdown, handles many sites that block
-simple clients), then a direct HTTP GET. A backend that is blocked, rate-limited or misconfigured is
-reported as a *failure*, never as "no results". Fetching blocks private/loopback addresses (SSRF).
+Search backends, in order: DeepSeek Search API (results carry summaries written for models), Tavily
+(TAVILY_API_KEY), SearXNG (SEARXNG_URL), then keyless HTML scraping of DuckDuckGo and Bing. Fetch:
+DeepSeek Fetch API (returns Markdown, handles many sites that block simple clients), then a direct HTTP
+GET. The DeepSeek APIs are used whenever DEEPSEEK_API_KEY is set, whichever provider runs the model: HKGAI
+has no search or fetch API, so with HKGAI as the provider the DeepSeek key still serves the web tools. A
+backend that is blocked, rate-limited or misconfigured is reported as a *failure*, never as "no results".
+Fetching blocks private/loopback addresses (SSRF).
 """
 
 from __future__ import annotations
@@ -30,6 +32,7 @@ class BackendError(Exception):
 
 
 def _deepseek() -> tuple[str, str] | None:
+    """(base URL, key) of the DeepSeek Search/Fetch APIs, or None without a DeepSeek key (model provider aside)."""
     from ..config import load_dotenv
 
     load_dotenv()
@@ -77,7 +80,8 @@ def _fetch_deepseek(url: str) -> tuple[str, str]:
     if r.status_code != 200:
         raise BackendError(f"HTTP {r.status_code} {_api_error(r)}")
     body = r.json()
-    content = re.sub(r"\\([\\`*_{}\[\]()#+\-.!|])", r"\1", body.get("content") or "")
+    # the Fetch API returns Markdown, which escapes punctuation (JSON bodies come back as {\"info\"\:...})
+    content = re.sub(r"\\([^\w\s])", r"\1", body.get("content") or "")
     if not content.strip():
         raise BackendError("empty page")
     return body.get("title") or "", content
@@ -237,7 +241,16 @@ def web_fetch(ctx: ToolContext, a):
     title = text = None
     failures = []
     final_url, status, backend = url, 200, "direct"
-    if _deepseek():
+    # Machine-readable endpoints (…/json, *.json, *.txt, raw files) are best read verbatim, not via Markdown conversion.
+    raw_first = re.search(r"(/json/?$|\.(json|txt|csv|md|ya?ml|xml)$)", url.split("?")[0].lower()) is not None
+    if raw_first:
+        try:
+            r = _client.get(url)
+            if r.status_code < 400 and "html" not in r.headers.get("content-type", ""):
+                title, text, final_url, status = "", r.text, str(r.url), r.status_code
+        except httpx.HTTPError as exc:
+            failures.append(f"direct: {exc}")
+    if text is None and _deepseek():
         try:
             title, text = _fetch_deepseek(url)
             backend = "deepseek"

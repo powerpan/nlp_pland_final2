@@ -1,4 +1,4 @@
-"""Approval gate for permissioned operations (Hermes-style once / session / always / deny)."""
+"""Approval gate for permissioned operations (once / session / always / deny)."""
 
 from __future__ import annotations
 
@@ -75,7 +75,7 @@ class ApprovalGate:
         self.room_id = room_id
         self.run_id = run_id
         self.publish = publish or (lambda *a, **k: None)
-        self.guard = guard  # callable(messages) -> str, used by mode "smart" (Hermes smart approvals)
+        self.guard = guard  # callable(messages) -> str, used by mode "smart"
 
     def _smart(self, category: str, summary: str, detail: str) -> str:
         if not self.guard or not category.startswith(SMART_CATEGORIES) or any(w in category for w in _NEVER_SMART):

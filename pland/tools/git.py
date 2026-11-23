@@ -65,8 +65,8 @@ def git_commit(ctx: ToolContext, a):
     repo = _repo(ctx, a.get("repo"))
     paths = a.get("paths") or []
     for p in paths:
-        ctx.paths.resolve(p if not p.startswith("/") else p)  # confinement check
-    add = _git(ctx, repo, "add", *(paths or ["-A"]))
+        ctx.paths.resolve(p)  # confinement check: absolute paths outside the workspace roots are refused
+    add = _git(ctx, repo, "add", *(["--", *paths] if paths else ["-A"]))  # "--": paths are never read as options
     if add.returncode != 0:
         raise ToolError(_out(add))
     r = _git(ctx, repo, "commit", "-m", a["message"])

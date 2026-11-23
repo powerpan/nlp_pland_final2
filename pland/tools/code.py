@@ -40,6 +40,10 @@ def _cwd(ctx: ToolContext, raw: str | None):
     return path
 
 
+def _cancelled(ctx: ToolContext):
+    return lambda: ctx.runtime.is_cancelled(ctx.profile.name, ctx.session_id)
+
+
 CONTAINER_STILL_ASK = ("delete", "push", "credential", "publish", "secret", "discard", "DROP", "TRUNCATE", "Unicode")
 
 
@@ -48,7 +52,7 @@ def _gate(ctx: ToolContext, verdict, what: str, text: str) -> None:
         raise ToolError(f"Blocked by the safety floor ({verdict.blocked}). This can never run through the agent.")
     if verdict.needs_approval:
         # Inside a container the container contains system-level damage (sudo, chmod, killing processes,
-        # system config), so those need no approval there. Unlike Hermes, the agent's real workspace is
+        # system config), so those need no approval there. The agent's real workspace is
         # bind-mounted into the container, so destroying data still needs a human — as do operations that
         # reach outside (push, credentials, secrets, publishing).
         reasons = verdict.needs_approval
@@ -61,8 +65,9 @@ def _gate(ctx: ToolContext, verdict, what: str, text: str) -> None:
 @tool(
     "run_shell",
     "Run a bash command in your workspace (or a sub-directory via cwd) and return exit code, stdout and stderr. "
-    "Use it for builds, tests, package installs, git inspection, etc. Long-running servers are not supported.",
-    obj({"command": {"type": "string"}, "cwd": {"type": "string"}, "timeout": {"type": "integer", "minimum": 1, "maximum": 1800}}, ["command"]),
+    "Use it for builds, tests, package installs, git inspection, etc. Long-running servers and background jobs are not "
+    "supported: anything still running when the command returns is stopped.",
+    obj({"command": {"type": "string"}, "cwd": {"type": "string"}, "timeout": {"type": "integer", "minimum": 1, "maximum": 600}}, ["command"]),
     "code",
 )
 def run_shell(ctx: ToolContext, a):
@@ -73,7 +78,7 @@ def run_shell(ctx: ToolContext, a):
                         "credentials after the human approves). Do not push by any other means — no scripts, git "
                         "libraries or alternative clients.")
     _gate(ctx, check_command(cmd), "shell", cmd)
-    res = ctx.backend.run(cmd, _cwd(ctx, a.get("cwd")), timeout=a.get("timeout"), mounts=ctx.mounts)
+    res = ctx.backend.run(cmd, _cwd(ctx, a.get("cwd")), timeout=a.get("timeout"), mounts=ctx.mounts, cancel=_cancelled(ctx))
     ctx.emit("exec.finished", kind="shell", command=cmd[:500], exit_code=res.exit_code, duration=round(res.duration, 2))
     return res.render(ctx.settings.sandbox.max_output_chars)
 
@@ -82,12 +87,13 @@ def run_shell(ctx: ToolContext, a):
     "run_python",
     "Execute Python 3 source code in your workspace and return exit code, stdout and stderr. "
     "To keep code, write it to a file with write_file and run it with run_shell instead.",
-    obj({"code": {"type": "string"}, "cwd": {"type": "string"}, "timeout": {"type": "integer", "minimum": 1, "maximum": 1800}}, ["code"]),
+    obj({"code": {"type": "string"}, "cwd": {"type": "string"}, "timeout": {"type": "integer", "minimum": 1, "maximum": 600}}, ["code"]),
     "code",
 )
 def run_python(ctx: ToolContext, a):
     code = a["code"]
     _gate(ctx, scan_python(code), "python", code)
-    res = ctx.backend.run_python(code, _cwd(ctx, a.get("cwd")), timeout=a.get("timeout"), mounts=ctx.mounts)
+    res = ctx.backend.run_python(code, _cwd(ctx, a.get("cwd")), timeout=a.get("timeout"), mounts=ctx.mounts,
+                                 cancel=_cancelled(ctx))
     ctx.emit("exec.finished", kind="python", exit_code=res.exit_code, duration=round(res.duration, 2))
     return res.render(ctx.settings.sandbox.max_output_chars)
