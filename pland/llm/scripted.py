@@ -46,9 +46,11 @@ class ScriptedLLM:
         self.total_usage = Usage()
         self.calls = 0
 
-    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None, temperature=None, on_delta=None) -> LLMResponse:
+    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None, temperature=None, on_delta=None, thinking=None,
+             effort=None, tool_choice=None) -> LLMResponse:
         with self._lock:
-            self.requests.append({"messages": [dict(m) for m in messages], "tools": tools, "json_mode": json_mode})
+            self.requests.append({"messages": [dict(m) for m in messages], "tools": tools, "json_mode": json_mode,
+                                  "thinking": thinking, "effort": effort, "tool_choice": tool_choice})
             self.calls += 1
             if self._fn is not None:
                 step = self._fn(messages, tools)

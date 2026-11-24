@@ -1,6 +1,6 @@
 """Group rooms: several bots and the human in one conversation (Bot Mode group chat).
 
-Turn-taking follows Hermes' group-room design, adapted so that collaboration produces real work:
+Turn-taking is designed so that collaboration produces real work:
 
 * A human message addresses the @mentioned bots (`@all`/`@everyone` or no mention = every member).
 * One addressed bot *leads* the response: the room's configured lead if addressed, else the first
@@ -24,6 +24,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..sessions import SessionStore
 from ..store import dumps, loads, new_id, now
+from ..workspace import chosen
 
 if TYPE_CHECKING:
     from ..runtime import Runtime
@@ -108,9 +109,32 @@ class RoomManager:
         self.rt.bus.publish("room.deleted", room_id=rid)
 
     def shared_dir(self, rid: str) -> Path:
+        """The group's shared folder: a folder the user chose for the group (settings "workspace", see
+        pland/workspace.py), else rooms/<id>/shared under PLAND_HOME."""
+        room = self.get(rid)
+        folder = chosen((room or {}).get("settings"))
+        if folder and Path(folder).is_dir():
+            return Path(folder).resolve()
         path = self.rt.root / "rooms" / rid / "shared"
         path.mkdir(parents=True, exist_ok=True)
         return path
+
+    def set_workspace(self, rid: str, folder: str | None) -> dict[str, Any]:
+        """Point the group's shared folder at `folder` (validated by the caller; None = the default one). A group is
+        one conversation, so its members keep their context; every member reads this note at its next turn
+        (members see all room messages since their last turn) and its `shared/` link is re-pointed then."""
+        room = self.get(rid)
+        if room is None:
+            raise KeyError(rid)
+        before = str(self.shared_dir(rid))
+        updated = self.update(rid, settings={"workspace": folder})
+        after = str(self.shared_dir(rid))
+        if after != before:
+            default = str((self.rt.root / "rooms" / rid / "shared").resolve())
+            name = lambda f: "the group's default shared folder" if f == default else f  # noqa: E731
+            self.post(rid, "system", f"The group's shared folder is now {name(after)} (it was {name(before)}). `shared/` "
+                      "points there from now on; files from the previous folder are no longer reachable.", kind="system")
+        return self.get(rid) or updated
 
     # ------------------------------------------------------------------ messages
     def post(self, rid: str, speaker: str, content: str, *, kind: str = "message", meta: dict | None = None) -> dict[str, Any]:
@@ -179,9 +203,9 @@ class RoomManager:
             )
         elif role == "member":
             lines.append(
-                "A teammate leads this request and will delegate the work. This is a discussion turn: you can read and look "
-                "things up, but you cannot change files or run code now. Reply only if you add something useful — the part "
-                "you are best suited for, a risk, or information you have — in at most 3 sentences. Otherwise reply exactly [PASS]."
+                "A teammate leads this request and will delegate the work. This is a discussion turn: do not start the work "
+                "(no file changes, code or web research now). Reply only if you add something useful — the part you are best "
+                "suited for, a risk, or information you already have — in at most 3 sentences. Otherwise reply exactly [PASS]."
             )
         else:
             lines.append(
@@ -193,6 +217,11 @@ class RoomManager:
         return "\n".join(lines)
 
     def _member_turn(self, room: dict, member: str, role: str, hitl, budget=None) -> str | None:
+        return self._post_member(room, member, self._run_member(room, member, role, hitl, budget))
+
+    def _run_member(self, room: dict, member: str, role: str, hitl, budget=None) -> dict[str, Any] | None:
+        """Run one member's turn (its agent loop in its room session); posting happens separately so
+        independent discussion turns can run concurrently and still be posted in a stable order."""
         from ..agent import Agent
 
         rid = room["id"]
@@ -209,21 +238,42 @@ class RoomManager:
         agent = Agent(self.rt, prof, sid, hitl=hitl or self.rt.default_hitl, room_id=rid, budget=budget,
                       discussion_only=(role == "member"))
         request = "\n".join(m["content"] for m in new_msgs if m["speaker"] == "user") or new_msgs[-1]["content"]
+        # Only the lead's turn does the main work; a discussion turn is a few sentences and a turn caused by an
+        # @mention is a follow-up (a real run spent 30 minutes re-verifying finished work after a courtesy mention).
+        steps = {"member": 6, "mentioned": min(40, agent.settings.max_iterations)}.get(role)
         result = agent.run(self._turn_prompt(room, member, new_msgs, role), meta={"room_turn": True, "role": role},
-                           task_text=request[:4000])
+                           task_text=request[:4000], max_iterations=steps)
         seen = max(all_ids + [last_seen])
         store.patch_meta(sid, {"last_seen": seen})
         self.rt.bus.publish("room.member_turn", room_id=rid, member=member, role=role, state="done", status=result.status)
+        return {"sid": sid, "store": store, "result": result, "seen": seen}
+
+    def _post_member(self, room: dict, member: str, out: dict[str, Any] | None) -> str | None:
+        if out is None:
+            return None
+        rid, result = room["id"], out["result"]
         text = (result.text or "").strip()
         if result.status == "error":
             self.post(rid, member, f"⚠ {member} hit an error: {(result.error or text).splitlines()[0][:300]}", kind="activity")
             return None
         if not text or text.lower().strip(" .") in PASS_TOKENS or text.lower().startswith("[pass]"):
             return None
-        posted = self.post(rid, member, text, meta={"session_id": sid, "run_id": result.run_id})
+        posted = self.post(rid, member, text, meta={"session_id": out["sid"], "run_id": result.run_id})
         # Bot messages are part of the room log; mark them seen for the speaker.
-        store.patch_meta(sid, {"last_seen": max(seen, posted["id"])})
+        out["store"].patch_meta(out["sid"], {"last_seen": max(out["seen"], posted["id"])})
         return text
+
+    def _discussion_round(self, room: dict, members: list[str], hitl, budget) -> list[tuple[str, str | None]]:
+        """Round-1 discussion turns are read-only and independent of each other (each member reacts to the
+        human's request before the lead acts), so they run concurrently; replies are posted in roster order."""
+        if len(members) <= 1:
+            return [(m, self._member_turn(room, m, "member", hitl, budget)) for m in members]
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=min(4, len(members)), thread_name_prefix="room-discuss") as pool:
+            futures = [(m, pool.submit(self._run_member, room, m, "member", hitl, budget)) for m in members]
+            outs = [(m, f.result()) for m, f in futures]
+        return [(m, self._post_member(room, m, out)) for m, out in outs]
 
     def _mentions(self, text: str, members: list[str]) -> list[str]:
         found = []
@@ -251,8 +301,9 @@ class RoomManager:
             from ..budget import Budget
 
             lead_settings = self.rt.profiles.get(lead).settings()
-            # One budget for the whole drive (all member turns and the work they delegate).
-            budget = Budget(lead_settings.max_run_calls, lead_settings.max_run_tokens)
+            # One budget for the whole drive (all member turns and the work they delegate). Several agents share
+            # it — a real implement/review loop ran out at 120 calls — so a drive gets twice the single-run budget.
+            budget = Budget(lead_settings.max_run_calls * 2, lead_settings.max_run_tokens * 2)
             posted = 0
             spoke: list[str] = []
             needs_you = False
@@ -261,12 +312,16 @@ class RoomManager:
             for rnd in range(1, max_rounds + 1):
                 next_round: list[str] = []
                 round_posts = 0
+                pre: dict[str, str | None] = {}
+                if rnd == 1:
+                    discussants = [m for m, r in order if r == "member"]
+                    pre = dict(self._discussion_round(room, discussants, hitl, budget)) if discussants else {}
                 for member, role in order:
                     if posted >= max_msgs:
                         break
                     if budget.near_limit:
                         break
-                    text = self._member_turn(room, member, role, hitl, budget)
+                    text = pre[member] if member in pre else self._member_turn(room, member, role, hitl, budget)
                     if text is None:
                         continue
                     posted += 1

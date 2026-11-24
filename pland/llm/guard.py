@@ -30,7 +30,8 @@ def check_endpoint(provider: str, base_url: str | None) -> None:
         )
     if not base_url:
         raise ForbiddenProviderError(f"No base URL configured for provider '{provider}'.")
-    host = (urlparse(base_url).hostname or "").lower()
+    # A fully qualified name with a trailing dot ("api.openai.com.") is the same host; compare without it.
+    host = (urlparse(base_url).hostname or "").lower().rstrip(".")
     if not host:
         raise ForbiddenProviderError(f"Invalid base URL: {base_url!r}")
     for suffix in _FORBIDDEN_HOST_SUFFIXES:

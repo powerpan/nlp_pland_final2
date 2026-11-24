@@ -1,4 +1,4 @@
-"""Profiles: the unit of agent identity and isolation (borrowed from Hermes' profile model).
+"""Profiles: the unit of agent identity and isolation.
 
 A profile is a directory `<PLAND_HOME>/profiles/<name>/` holding everything that belongs to one
 agent: its configuration (`profile.yaml`), persona (`SOUL.md`), bounded memories, skills, private
@@ -21,7 +21,7 @@ from typing import Any
 
 import yaml
 
-from .config import AgentSettings, pland_home
+from .config import AgentSettings, global_settings, merge_settings, pland_home
 from .store import DB, now, profile_db
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -34,7 +34,8 @@ what is verified and what is left — not a replay of the process. No filler, no
 tool calls the user can see. Plain claims over adjectives; when unsure, say so plainly. Reply in the user's language.
 """
 
-AVATAR_COLORS = ["#6366f1", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#84cc16", "#f97316"]
+# Pigment colours for bot tiles (the web UI picks from the same list for new bots).
+AVATAR_COLORS = ["#c8462a", "#33508c", "#4e7a4a", "#b07a1e", "#7a3e6a", "#2b7a78", "#5b6472", "#9a4a2e", "#6e7b2f", "#3a4fb8"]
 
 
 def slugify(name: str) -> str:
@@ -97,7 +98,9 @@ class Profile:
             return DEFAULT_SOUL.strip()
 
     def settings(self) -> AgentSettings:
-        return AgentSettings.from_dict(self.meta.get("settings"))
+        """This profile's settings on top of the global defaults (PLAND_HOME/settings.yaml)."""
+        root = self.home.parent.parent
+        return AgentSettings.from_dict(merge_settings(global_settings(root), self.meta.get("settings")))
 
     def summary(self) -> dict[str, Any]:
         s = self.settings()
@@ -120,14 +123,39 @@ class Profile:
             yaml.safe_dump(self.meta, allow_unicode=True, sort_keys=False), encoding="utf-8"
         )
 
-    def canonical_chat_id(self) -> str:
-        """The forever 'Bot Chat' session of this profile, created on first use."""
-        row = self.db.one("SELECT id FROM sessions WHERE kind='bot_chat' ORDER BY created LIMIT 1")
-        if row:
-            return row["id"]
+    def bot_chats(self) -> list[dict[str, Any]]:
+        """The bot's Bot Chats, most recently used first: one per working folder (workspace None = its private
+        workspace). A bot has no other conversation list, so folders are what separate its contexts."""
+        from .store import loads
+
+        rows = self.db.query("SELECT id, title, meta, updated, created FROM sessions WHERE kind='bot_chat' "
+                             "ORDER BY updated DESC, created DESC")
+        return [{"id": r["id"], "title": r["title"], "workspace": loads(r["meta"], {}).get("workspace") or None,
+                 "updated": r["updated"], "created": r["created"]} for r in rows]
+
+    def bot_chat_id(self, folder: str | None = None, *, create: bool = True) -> str | None:
+        """The Bot Chat for a working folder (None: the private workspace), created on first use. Switching a
+        bot to another folder opens that folder's chat instead of mixing two projects in one context."""
+        folder = str(folder) if folder else None
+        for chat in sorted(self.bot_chats(), key=lambda c: c["created"]):
+            if chat["workspace"] == folder:
+                return chat["id"]
+        if not create:
+            return None
         from .sessions import SessionStore
 
-        return SessionStore(self).create(title="Bot Chat", kind="bot_chat").id
+        title = f"Bot Chat · {Path(folder).name}" if folder else "Bot Chat"
+        return SessionStore(self).create(title=title, kind="bot_chat", meta={"workspace": folder} if folder else None).id
+
+    def canonical_chat_id(self) -> str:
+        """The bot's home Bot Chat (its private workspace), created on first use; messages from other bots
+        (message_agent) arrive here."""
+        return self.bot_chat_id(None)
+
+    def latest_bot_chat_id(self) -> str | None:
+        """The Bot Chat used most recently (what opening the bot shows)."""
+        chats = self.bot_chats()
+        return chats[0]["id"] if chats else None
 
 
 class ProfileManager:
@@ -222,13 +250,7 @@ class ProfileManager:
                 if val is not None and key in {"title", "description", "bot", "avatar", "hidden"}:
                     profile.meta[key] = val
             if settings:
-                merged = dict(profile.meta.get("settings") or {})
-                for key, val in settings.items():
-                    if isinstance(val, dict) and isinstance(merged.get(key), dict):
-                        merged[key] = {**merged[key], **val}
-                    else:
-                        merged[key] = val
-                profile.meta["settings"] = merged
+                profile.meta["settings"] = merge_settings(profile.meta.get("settings"), settings)
             profile.save_meta()
             if soul is not None:
                 (profile.home / "SOUL.md").write_text(soul.strip() + "\n", encoding="utf-8")

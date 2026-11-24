@@ -1,4 +1,4 @@
-"""Session-scoped task list (after Hermes' todo tool): the agent's own plan for multi-step work.
+"""Session-scoped task list: the agent's own plan for multi-step work.
 
 The list lives in the session's metadata, survives context compaction (it is re-injected with the
 summary) and is shown live in the UI. It is a working plan for one agent; the team board

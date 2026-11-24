@@ -22,9 +22,11 @@ _TASK = {
 
 @tool(
     "delegate_task",
-    "Hand subtasks to teammates (to=<name>) or to temporary subagents of yourself (omit `to`). Each delegate really "
-    "executes the task with its own tools and returns a report. Pass several independent tasks in `tasks` to run them "
-    "in parallel. Each task is tracked on the team board.",
+    "Hand subtasks to teammates (to=<name>) or to temporary subagents of yourself (omit `to`). Prefer the teammate whose "
+    "role fits the subtask (e.g. review → a reviewer, research → a researcher); temporary subagents are for generic "
+    "chores no teammate owns. Each delegate really executes the task with its own tools and returns a report. Pass several independent tasks in `tasks` to run them "
+    "in parallel. Each task is tracked on the team board automatically: pass `task_id` to link an existing board task — "
+    "its status (in_progress → done/failed) and result are updated for you, so don't update them by hand.",
     obj({"tasks": {"type": "array", "items": _TASK, "minItems": 1, "maxItems": 8}}, ["tasks"]),
     "delegation",
 )
@@ -53,7 +55,8 @@ def message_agent_tool(ctx: ToolContext, a):
     "team_tasks",
     "The team task board (scoped to the current group room, or to you outside rooms). Use it to decompose a goal "
     "into subtasks and track ownership/status. actions: add(title, description?, assignee?, depends_on?), "
-    "update(task_id, status?, result?, assignee?), list().",
+    "update(task_id, status?, result?, assignee?), list(). Tasks you hand out with delegate_task(task_id=...) are "
+    "updated automatically; use update only for work you do yourself. Add several tasks with parallel calls.",
     obj({"action": {"type": "string", "enum": ["add", "update", "list"]}, "title": {"type": "string"},
          "description": {"type": "string"}, "assignee": {"type": "string"},
          "depends_on": {"type": "array", "items": {"type": "string"}}, "task_id": {"type": "string"},

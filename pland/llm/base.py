@@ -56,10 +56,11 @@ class Usage:
 
     @property
     def cost_usd(self) -> float:
-        """Estimate at DeepSeek list prices used in the project guide (per 1M tokens: hit $0.006,
-        miss $0.30, output $1.20). Check the official price page for current numbers."""
-        miss = max(0, self.prompt_tokens - self.cached_tokens)
-        return (self.cached_tokens * 0.006 + miss * 0.30 + self.completion_tokens * 1.20) / 1_000_000
+        """Estimate at deepseek-flash peak prices; per-model costs are computed from the ledger
+        (see pland/llm/pricing.py)."""
+        from .pricing import cost
+
+        return cost(self.prompt_tokens, self.cached_tokens, self.completion_tokens)
 
 
 @dataclass
@@ -95,4 +96,7 @@ class LLMClient(Protocol):
         max_tokens: int | None = None,
         temperature: float | None = None,
         on_delta: Any = None,
+        thinking: bool | None = None,
+        effort: str | None = None,
+        tool_choice: str | None = None,
     ) -> LLMResponse: ...

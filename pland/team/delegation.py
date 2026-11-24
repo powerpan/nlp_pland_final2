@@ -6,13 +6,15 @@
   explicitly (goal, context, attached files, and the room's shared folder when inside a room)
   crosses the boundary.
 * no `to`   — a temporary subagent of the delegator itself (fresh context, same workspace, no
-  human channel, no long-term memory writes), Hermes-style.
+  human channel, no long-term memory writes).
 Independent tasks in one call run in parallel threads. Each task can be linked to a team-board
 entry, whose status/result are kept in sync. Delegation chains are tracked to stop cycles
 (A→B→A) and bounded by `max_delegation_depth`.
 """
 
 from __future__ import annotations
+
+import re
 
 import shutil
 import time
@@ -51,6 +53,48 @@ def copy_files(ctx: "ToolContext", paths: list[str], dest: Path) -> list[str]:
     return copied
 
 
+# What comes back from a teammate: the files it was asked for and the ones it wrote, at most this many / this large.
+MAX_RETURN_FILES = 12
+MAX_RETURN_BYTES = 20 * 1024 * 1024
+# Run outcomes that stop a worker before it finishes; with every requested file written, the board counts it as done.
+STOPPED_EARLY = {"max_iterations", "loop_detected", "budget_exceeded"}
+
+
+def return_files(ctx: "ToolContext", worker: Any, to: str) -> list[str]:
+    """Copy what a teammate produced into the delegator's folder, under inbox/from-<to>/ with the same relative paths:
+    the files named as expected output plus the files it wrote in this run. Without this a lead had to message each
+    teammate afterwards to ask for its file (16 extra model calls for one researcher, in the teammate's private chat).
+    Files in the room's shared folder are skipped (the team already sees them), as are copies of the delegator's own
+    attachments (inbox/)."""
+    wanted = list(dict.fromkeys([*worker._deliverables, *worker.written_paths]))
+    home = Path(worker.workspace).resolve()
+    dest = Path(ctx.agent.workspace) / "inbox" / f"from-{to}"
+    out: list[str] = []
+    for rel in wanted:
+        if len(out) >= MAX_RETURN_FILES:
+            break
+        try:
+            src = worker.paths.resolve(rel)
+            inside = src.relative_to(home)
+        except Exception:  # noqa: BLE001 - outside the teammate's workspace (shared/) or refused by its path policy
+            continue
+        if inside.parts[:1] == ("inbox",) or not src.is_file():
+            continue
+        size = src.stat().st_size
+        if size == 0 or size > MAX_RETURN_BYTES:
+            continue
+        target = dest / inside
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, target)
+        out.append((Path("inbox") / f"from-{to}" / inside).as_posix())
+    return out
+
+
+def _requested_files_written(worker: Any) -> bool:
+    """Every file the delegator named as expected output exists and is not empty (False when none were named)."""
+    return bool(worker._deliverables) and not worker._missing_deliverables()
+
+
 def _prerequisites(ctx: "ToolContext", task_id: str | None) -> list[dict[str, Any]]:
     if not task_id:
         return []
@@ -61,6 +105,16 @@ def _prerequisites(ctx: "ToolContext", task_id: str | None) -> list[dict[str, An
         except KeyError:
             continue
     return out
+
+
+_FILE_PATH = re.compile(r"(?<![\w:/.\-~])((?:~/|/|\.{1,2}/)?[\w.\-]+(?:/[\w.\-]+)*\.[A-Za-z][A-Za-z0-9]{1,5})\b")
+
+
+def deliverables(task: dict[str, Any]) -> list[str]:
+    """File paths the delegator named as the expected output (the worker's checkpoint and step limit check them)."""
+    text = re.sub(r"(?:https?://|www\.)\S+", " ", str(task.get("expected_output") or ""))  # URLs are not files
+    found = [m.group(1) for m in _FILE_PATH.finditer(text)]
+    return list(dict.fromkeys(found))[:5]
 
 
 def _message_for(ctx: "ToolContext", task: dict[str, Any], inbox_rel: str | None, attached: list[str]) -> str:
@@ -79,6 +133,9 @@ def _message_for(ctx: "ToolContext", task: dict[str, Any], inbox_rel: str | None
         parts.append("\nThe group room's shared folder is available as `shared/` — put deliverables the team needs there.")
     if task.get("expected_output"):
         parts.append(f"\nEXPECTED OUTPUT:\n{task['expected_output'].strip()}")
+    if inbox_rel is not None:
+        parts.append(f"\nFiles you write for this task are copied back to @{sender.name} automatically when you finish; "
+                     "you do not need to share them.")
     parts.append("\nWork autonomously and verify your result. End with a concise report: what you did, the result with "
                  "evidence, files produced (paths), open issues.")
     return "\n".join(parts)
@@ -97,8 +154,9 @@ def _run_one(ctx: "ToolContext", task: dict[str, Any]) -> dict[str, Any]:
     board = rt.board
     scope = board_scope(ctx)
     tid = task.get("task_id")
+    prior: dict[str, Any] | None = None
     if tid:
-        board.get(tid)  # validate
+        prior = board.get(tid)  # validates the id; a re-delegation of finished work must not erase its result
         pending = [d for d in _prerequisites(ctx, tid) if d["status"] != "done"]
         if pending:
             raise DelegationError("task " + tid + " depends on unfinished tasks: " +
@@ -131,28 +189,53 @@ def _run_one(ctx: "ToolContext", task: dict[str, Any]) -> dict[str, Any]:
             inbox_rel = f"inbox/from-{ctx.profile.name}"
             attached = copy_files(ctx, task.get("files") or [], target.workspace / inbox_rel)
             sess = SessionStore(target).create(title=f"From @{ctx.profile.name}: {goal[:60]}", kind="delegation",
-                                               room_id=ctx.room_id, meta={"from": ctx.profile.name, "task_id": tid, "delivery": delivery})
+                                               room_id=ctx.room_id, meta={"from": ctx.profile.name, "task_id": tid, "delivery": delivery,
+                                                                          "deliverables": deliverables(task)})
             agent = Agent(rt, target, sess.id, hitl=ctx.hitl, room_id=ctx.room_id, role="delegate",
                           depth=ctx.depth + 1, chain=ctx.chain, budget=ctx.agent.budget)
             result = agent.run(_message_for(ctx, task, inbox_rel, attached),
                                task_text=f"{goal}\n{task.get('context') or ''}".strip())
+            returned = return_files(ctx, agent, to)
         else:
             sess = SessionStore(ctx.profile).create(title=f"Subagent: {goal[:60]}", kind="subagent", room_id=ctx.room_id,
-                                                    meta={"parent_session": ctx.session_id, "task_id": tid})
+                                                    meta={"parent_session": ctx.session_id, "task_id": tid,
+                                                          "deliverables": deliverables(task),
+                                                          # a temporary subagent thinks like the chat that spawned it
+                                                          "reasoning": ctx.agent.reasoning,
+                                                          "model": ctx.agent.model_override,
+                                                          # ...and works in the same folder
+                                                          "workspace": str(ctx.agent.workspace) if ctx.agent.custom_workspace else None})
             agent = Agent(rt, ctx.profile, sess.id, hitl=ctx.hitl, room_id=ctx.room_id, role="subagent",
                           depth=ctx.depth + 1, chain=ctx.chain[:-1], reflect=False, budget=ctx.agent.budget)
             result = agent.run(_message_for(ctx, task, None, []))
-        status = "done" if result.status == "completed" else "failed"
+            returned = []  # a subagent works in the delegator's own folder
+        delivered = _requested_files_written(agent)
+        status = "done" if result.status == "completed" or (result.status in STOPPED_EARLY and delivered) else "failed"
         out = {"to": to or "subagent", "task_id": tid, "status": result.status, "session_id": result.session_id,
                "duration_s": round(time.time() - started, 1), "report": result.text[:8000]}
+        if result.status != "completed" and delivered:
+            out["note"] = (f"stopped early ({result.status}), but the requested file(s) were written: "
+                           f"{', '.join(agent._deliverables)} — check that they are complete")
+        if returned:
+            out["files_in_your_folder"] = returned
     except DelegationError as exc:
         status = "failed"
         out = {"to": to or "subagent", "task_id": tid, "status": "rejected", "error": str(exc)}
     except Exception as exc:
         status = "failed"
         out = {"to": to or "subagent", "task_id": tid, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    out["run_budget"] = ctx.agent.budget.describe()
     if tid:
-        board.update(tid, status=status, result=out.get("report") or out.get("error"))
+        if status == "failed" and prior is not None and prior["status"] == "done":
+            # A follow-up (another review round, a fix) that stopped or was refused does not undo finished work.
+            if out["status"] != "rejected":
+                board.update(tid, status="done", result=f"[A follow-up run stopped ({out['status']}) before finishing; "
+                             f"the earlier result below still stands.]\n{prior.get('result') or ''}")
+            else:
+                board.update(tid, status="done")
+        else:
+            text = out.get("report") or out.get("error")
+            board.update(tid, status=status, result=f"[{out['note']}]\n{text}" if out.get("note") else text)
     rt.shared.execute("UPDATE deliveries SET status=?, reply=?, updated=? WHERE id=?",
                       ("done" if status == "done" else "failed", dumps(out), now(), delivery))
     ctx.emit("delegation.finished", delivery_id=delivery, to=to or "subagent", status=out["status"], task_id=tid,
@@ -203,6 +286,8 @@ def message_agent(ctx: "ToolContext", target: str, message: str, timeout: float 
         raise DelegationError("you cannot message yourself")
     if target in ctx.chain:
         raise DelegationError(f"@{target} is waiting on you right now; answer in your own reply instead of messaging it")
+    if ctx.agent.budget.near_limit:
+        raise DelegationError("the run budget is nearly exhausted; finish with what you have")
     prof = rt.profiles.get(target)
     sid = prof.canonical_chat_id()
     lock = rt.session_lock(target, sid)
@@ -221,4 +306,4 @@ def message_agent(ctx: "ToolContext", target: str, message: str, timeout: float 
     rt.shared.execute("UPDATE deliveries SET status=?, reply=?, updated=? WHERE id=?",
                       ("done" if result.ok else "failed", result.text[:8000], now(), delivery))
     ctx.emit("message.replied", to=target, delivery_id=delivery, status=result.status, reply=result.text[:1500])
-    return {"to": target, "status": result.status, "reply": result.text[:8000]}
+    return {"to": target, "status": result.status, "reply": result.text[:8000], "run_budget": ctx.agent.budget.describe()}

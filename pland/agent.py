@@ -14,9 +14,10 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
 import traceback
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import TYPE_CHECKING, Any
 
 from .approvals import ApprovalGate
@@ -24,6 +25,8 @@ from .budget import Budget, BudgetExceeded
 from .config import AgentSettings
 from .hitl import HITLChannel
 from .llm import LLMClient, LLMError, make_client
+from . import workspace as workspaces
+from .llm import reasoning
 from .llm.base import Usage
 from .memory import ExperienceStore
 from .prompts import build_system_prompt
@@ -41,7 +44,10 @@ SUBAGENT_EXCLUDE = {"ask_user", "memory", "skill_save", "message_agent", "team_t
 # Tools that change state; refused during discussion-only room turns. (Refused at call time rather than removed
 # from the schema, so the session's prompt prefix — and DeepSeek's cache — stays stable across turns.)
 MUTATING_TOOLS = {"write_file", "edit_file", "delete_file", "run_shell", "run_python", "git_status", "git_commit",
-                  "git_push", "delegate_task", "message_agent", "share_file", "memory", "skill_save"}
+                  "git_push", "delegate_task", "message_agent", "share_file", "memory", "skill_save",
+                  # also no web research in a discussion turn: doing the work there is shallow (a real run posted a
+                  # misread version number); research goes through delegation, where it is done and verified properly
+                  "web_search", "web_fetch"}
 MAX_TOOL_RESULT = 24_000
 PRUNED_TOOL_OUTPUT = "[Old tool output cleared to save context space — re-run the tool if you need it again]"
 SUMMARY_PROMPT = """You compress the earlier part of an AI agent's working conversation so it can continue the task.
@@ -62,6 +68,11 @@ Max ~900 words."""
 REPEAT_WARN, REPEAT_STOP = 3, 5  # identical tool call (same name + args) within one run
 # No-progress guard: consecutive tool results identical to earlier results of the same tool.
 STALE_NUDGE, STALE_STOP = 3, 6
+# A plan (todo) with open items that has not been touched for this many steps gets one reminder: a researcher once
+# wrote 7 items at step 1 and worked 55 steps without ticking any, so the UI showed 0/7 throughout.
+PLAN_STALE_STEPS = 8
+# Share of the run budget after which the root agent is told what is left (once), so it plans the rest to fit.
+BUDGET_NOTE_AT = 0.7
 
 
 @dataclass
@@ -97,6 +108,24 @@ class LoopDetected(Exception):
     pass
 
 
+# DeepSeek's own tool-call markup, which the model sometimes writes as plain text instead of a real tool call
+# (seen in a wrap-up report: "<｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name=...>").
+TOOL_MARKUP = re.compile(r"<[|｜]{1,2}\s*DSML\s*[|｜]{1,2}|<[|｜]tool[▁_ ]calls?[▁_ ]begin[|｜]>|<[|｜]tool[▁_ ]call[▁_ ]begin[|｜]>")
+
+
+WRITE_TOOLS = ("write_file", "edit_file")
+
+
+def strip_tool_markup(text: str) -> str:
+    """Remove leaked tool-call markup (from the first marker on: it is never prose)."""
+    m = TOOL_MARKUP.search(text or "")
+    return (text[:m.start()] if m else text or "").rstrip()
+
+
+class WorkspaceUnavailable(Exception):
+    """The folder chosen for this conversation is gone; the run stops instead of working elsewhere."""
+
+
 class Agent:
     def __init__(
         self,
@@ -130,6 +159,7 @@ class Agent:
         self.system_extra = system_extra
         self.reflect_enabled = self.settings.reflection if reflect is None else reflect
         self._llm = llm
+        self._llm_injected = llm is not None
         exclude = set(exclude_tools or set())
         if role == "subagent":
             exclude |= SUBAGENT_EXCLUDE
@@ -138,8 +168,15 @@ class Agent:
         if not runtime.profiles.list(bots_only=True):
             exclude |= {"message_agent"}
         self.tools = {t.name: t for t in select_tools(self.settings.toolsets, exclude)}
-        self.backend = runtime.backend_for(profile, self.settings)
-        roots = {"": profile.workspace}
+        # The conversation's folder (pland/workspace.py): one chosen for this session, else the private workspace.
+        try:
+            meta = self.sessions.get(session_id).meta
+        except KeyError:
+            meta = {}
+        self.workspace, self.workspace_error = workspaces.resolve(profile.workspace, meta)
+        self.custom_workspace = self.workspace != profile.workspace.resolve()
+        self.backend = runtime.backend_for(profile, self.settings, self.workspace)
+        roots = {"": self.workspace}
         self.room = runtime.rooms.get(room_id) if room_id else None
         if self.room:
             roots["shared"] = runtime.rooms.shared_dir(room_id)
@@ -152,7 +189,18 @@ class Agent:
         self._call_sigs: dict[str, int] = {}
         self._result_sigs: dict[int, int] = {}
         self._stale_streak = 0
+        self._hot_turns = 0  # remaining iterations sampled at a higher temperature to break repetition
         self.discussion_only = discussion_only
+        self.reasoning: str | None = None  # this chat's thinking intensity override ("off" or a level), set per run
+        self.model_override: str | None = None  # this chat's model override, set per run
+        self._wrote_file = False  # a file was written in this run (the step checkpoint looks at it)
+        self.written_paths: list[str] = []  # files written in this run, as given to the tool (returned to a delegator)
+        self._deliverables: list[str] = []  # output files a delegator asked for (session meta "deliverables")
+        self._write_only_steps = 0  # steps left during which only file-writing tools are offered
+        self._step = 0  # current step of the run
+        self._plan_step = 0  # step of the last `todo` call (the stale-plan reminder counts from it)
+        self._plan_nudged = False
+        self._budget_noted = False  # the root agent was told that most of the run budget is spent
 
     # ------------------------------------------------------------------ helpers
     @property
@@ -163,8 +211,12 @@ class Agent:
 
     def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None, *,
              purpose: str = "turn", **kw: Any):
-        """Every model call goes through here: budget check, call, ledger entry."""
-        self.budget.check(root=self.is_root)
+        """Every model call goes through here: budget check, call, ledger entry. Reflection (learning after a run,
+        often in the background while the run that spawned it goes on) is recorded in the ledger but not charged to
+        the run's caps, so it never takes calls away from the task."""
+        charged = purpose != "reflection"
+        if charged:
+            self.budget.check(root=self.is_root)
         started = time.time()
         try:
             resp = self.llm.chat(messages, tools, **kw)
@@ -173,7 +225,8 @@ class Agent:
                                        session_id=self.session_id, purpose=purpose, model=getattr(self.llm, "model", "?"),
                                        usage=Usage(), duration=time.time() - started, ok=False, error=str(exc))
             raise
-        self.budget.charge(resp.usage)
+        if charged:
+            self.budget.charge(resp.usage)
         self.runtime.ledger.record(root_run=self.budget.root_run, run_id=self.run_id, profile=self.profile.name,
                                    session_id=self.session_id, purpose=purpose, model=resp.model or getattr(self.llm, "model", "?"),
                                    usage=resp.usage, duration=time.time() - started, ok=True)
@@ -186,7 +239,8 @@ class Agent:
     def _context(self, tool_call_id: str | None = None) -> ToolContext:
         gate = ApprovalGate(self.profile, self.settings.approvals, self.hitl, self.session_id, room_id=self.room_id,
                             run_id=self.run_id, publish=self.runtime.bus.publish,
-                            guard=lambda msgs: self.chat(msgs, None, purpose="approval", max_tokens=8, temperature=0).content)
+                            guard=lambda msgs: self.chat(msgs, None, purpose="approval", max_tokens=8, temperature=0,
+                                                         thinking=False).content)
         return ToolContext(
             runtime=self.runtime, agent=self, profile=self.profile, settings=self.settings, session_id=self.session_id,
             run_id=self.run_id, backend=self.backend, paths=self.paths, hitl=self.hitl, approvals=gate,
@@ -197,11 +251,26 @@ class Agent:
         return build_system_prompt(
             self.runtime, self.profile, role=self.role, room=self.room, backend_name=self.backend.name,
             extra=self.system_extra, tool_names=set(self.tools),
+            workspace=self.workspace if self.custom_workspace else None,
         )
 
     def _ensure_system(self) -> None:
         if not self.sessions.messages(self.session_id):
             self.sessions.append(self.session_id, {"role": "system", "content": self._system_prompt()})
+
+    def _note_workspace(self) -> None:
+        """Tell the model when this conversation's folder changed since its last turn. The stored system prompt
+        names the folder it started in and is never rewritten (that would break the prompt cache)."""
+        current = str(self.workspace)
+        seen = self.sessions.get(self.session_id).meta.get("workspace_seen")
+        if seen and seen != current:
+            self.sessions.append(self.session_id, {"role": "user", "content": (
+                f"[system] The working folder of this conversation is now {current} (it was {seen}). Paths are "
+                "relative to the new folder; files in the previous one are no longer accessible.")},
+                meta={"workspace_note": True})
+            self.emit("workspace.changed", workspace=current, previous=seen)
+        if seen != current:
+            self.sessions.patch_meta(self.session_id, {"workspace_seen": current})
 
     def _check_cancel(self) -> None:
         if self.runtime.is_cancelled(self.profile.name, self.session_id):
@@ -225,7 +294,7 @@ class Agent:
             sys_msgs = [m for m in msgs if m.get("role") == "system"][:1]
             rest = [m for m in msgs if m.get("role") != "system"]
             summary = "[Summary of the earlier part of this conversation]\n" + sess.meta["summary"]
-            if sess.meta.get("todos"):  # the working plan survives compaction (as in Hermes)
+            if sess.meta.get("todos"):  # the working plan survives compaction
                 from .tools.plan import render
 
                 summary += "\n\n[Your task list, preserved across compaction]\n" + render(sess.meta["todos"])
@@ -248,7 +317,7 @@ class Agent:
         return i
 
     def _maybe_compact(self) -> None:
-        """Two-phase compaction after Hermes' ContextCompressor. Phase 1 (no model call): clear old tool
+        """Two-phase compaction. Phase 1 (no model call): clear old tool
         outputs outside the protected tail. Phase 2, only if still over budget: fold the middle turns into
         a structured summary that updates the previous one, keeping the tail verbatim. Done rarely and in
         large steps, so DeepSeek's prefix cache stays warm between compactions."""
@@ -277,7 +346,7 @@ class Agent:
                                         + f"TURNS TO FOLD IN:\n{digest}"},
         ]
         try:
-            summary = self.chat(prompt, purpose="compaction", max_tokens=3000).content.strip()
+            summary = self.chat(prompt, purpose="compaction", max_tokens=3000, thinking=False).content.strip()
         except (LLMError, BudgetExceeded):
             summary = (prev + "\n" + digest[-4000:]).strip()
         self.sessions.patch_meta(self.session_id, {"compacted_upto": old[-1]["id"], "summary": summary})
@@ -299,6 +368,32 @@ class Agent:
         return (f"{text}\n\n<relevant_past_experience note=\"from your own earlier tasks; apply lessons if relevant, ignore otherwise\">\n"
                 f"{block}\n</relevant_past_experience>"), ids
 
+    def _session_reasoning(self) -> str | None:
+        """The chat's own thinking intensity (`/reasoning` in the CLI, the composer menu on the web), if set:
+        "off", "default" (thinking on at the provider's depth) or a level. None: use the profile setting."""
+        try:
+            word = str(self.sessions.get(self.session_id).meta.get("reasoning") or "").strip().lower()
+            return "default" if word == "default" else reasoning.parse(word)
+        except (ValueError, KeyError):
+            return None
+
+    def _apply_session_model(self) -> None:
+        """A chat may pin its own model (`/model` in the CLI, the model menu on the web)."""
+        override = str(self.sessions.get(self.session_id).meta.get("model") or "").strip() or None
+        self.model_override = override
+        if override and override != self.settings.model.model and not self._llm_injected:
+            self.settings.model = replace(self.settings.model, model=override)
+            self._llm = None
+
+    def _turn_thinking(self) -> dict[str, Any]:
+        """Thinking switch for a main-loop call: discussion turns are a few sentences and never think; a
+        per-chat override beats the profile setting."""
+        if self.discussion_only or self.reasoning == "off":
+            return {"thinking": False}
+        if self.reasoning:
+            return {"thinking": True, "effort": self.reasoning}
+        return {}
+
     # ------------------------------------------------------------------ main loop
     def run(self, text: str | None, *, meta: dict[str, Any] | None = None, max_iterations: int | None = None,
             task_text: str | None = None) -> RunResult:
@@ -319,8 +414,14 @@ class Agent:
         try:
             # pid lets a restarted server tell a live run from an interrupted one
             self.sessions.patch_meta(self.session_id, {"pid": os.getpid()})
+            self.reasoning = self._session_reasoning()
+            self._apply_session_model()
+            self._deliverables = list(self.sessions.get(self.session_id).meta.get("deliverables") or [])
+            if self.workspace_error:
+                raise WorkspaceUnavailable(self.workspace_error)
             self.sessions.update(self.session_id, status="running")
             self._ensure_system()
+            self._note_workspace()
             self.emit("run.started", text=(text or "")[:2000], role=self.role, depth=self.depth)
             if text is not None:
                 content, _ = self._with_experience(text, task_text)
@@ -344,6 +445,10 @@ class Agent:
             except Exception:
                 final_text = f"Stopped: {exc}"
                 self.sessions.append(self.session_id, {"role": "assistant", "content": final_text}, meta={"error": True})
+        except WorkspaceUnavailable as exc:
+            status, error = "error", str(exc)
+            final_text = str(exc)
+            self.sessions.append(self.session_id, {"role": "assistant", "content": final_text}, meta={"error": True})
         except LLMError as exc:
             status, error = "error", str(exc)
             final_text = f"Model error: {exc}"
@@ -372,7 +477,7 @@ class Agent:
                     self.emit("reflection.failed", error=str(exc))
 
             if self.settings.background_reflection:
-                # Like Hermes' background review: the answer is returned now, learning happens afterwards.
+                # The answer is returned now; learning happens afterwards.
                 self.runtime.track_reflection(self.runtime.spawn(_reflect, name="reflection"))
             else:
                 _reflect()
@@ -400,16 +505,19 @@ class Agent:
                 return []
         return []
 
+    def _answer_unrun(self, calls: list[dict[str, Any]], text: str, **meta: Any) -> None:
+        """Give every call that will not run a result, so the stored transcript stays complete and valid."""
+        for c in calls:
+            self.sessions.append(self.session_id, {"role": "tool", "tool_call_id": c["id"], "content": text},
+                                 meta={"tool": c["function"]["name"], **meta})
+
     def _run_tool_calls(self, calls: list[dict[str, Any]]) -> int:
         n = 0
         for i, tc in enumerate(calls):
             try:
                 self._check_cancel()
             except Cancelled:
-                for rest in calls[i:]:  # every call gets a result, so the transcript stays valid for the API
-                    self.sessions.append(self.session_id, {"role": "tool", "tool_call_id": rest["id"],
-                                                           "content": "(cancelled by the user before this call ran)"},
-                                         meta={"tool": rest["function"]["name"], "cancelled": True})
+                self._answer_unrun(calls[i:], "(cancelled by the user before this call ran)", cancelled=True)
                 raise
             name = tc["function"]["name"]
             raw = tc["function"].get("arguments") or "{}"
@@ -419,47 +527,77 @@ class Agent:
             sig = name + "\x00" + " ".join(raw.split())
             self._call_sigs[sig] = self._call_sigs.get(sig, 0) + 1
             repeats = self._call_sigs[sig]
+            stop: LoopDetected | None = None
+            args: dict[str, Any] | None = None
             if repeats >= REPEAT_STOP:
-                raise LoopDetected(f"the same {name} call was repeated {repeats} times with identical arguments")
-            if repeats >= REPEAT_WARN:
+                stop = LoopDetected(f"the same {name} call was repeated {repeats} times with identical arguments")
+                out = f"ERROR: not run — {stop}. The loop guard is stopping this run."
+            elif repeats >= REPEAT_WARN:
+                self._hot_turns = 2  # degeneration sign: loosen sampling for the next turns
                 out = (f"ERROR: you already made this exact {name} call {repeats - 1} times with identical arguments and "
                        f"got the same result. Do not repeat it; change your approach or finish with what you have.")
             elif t is None:
                 out = f"ERROR: unknown tool '{name}'. Available: {', '.join(sorted(self.tools))}"
             elif self.discussion_only and name in MUTATING_TOOLS:
-                out = (f"ERROR: this is a discussion turn — {name} is not available now. Share your input in your reply "
-                       "(or [PASS]); the lead will delegate work to you if needed.")
+                out = (f"ERROR: this is a discussion turn — {name} is not available now. Say briefly which part you can "
+                       "take on (or [PASS]); the lead will delegate the actual work to you.")
             else:
                 try:
                     args = json.loads(raw) if raw.strip() else {}
                     if not isinstance(args, dict):
                         raise ValueError("arguments must be a JSON object")
                 except (json.JSONDecodeError, ValueError) as exc:
+                    args = None
+                    self._hot_turns = 2  # malformed arguments often come from runaway, repetitive generation
                     out = f"ERROR: invalid JSON arguments for {name}: {exc}"
                 else:
                     out = execute(t, self._context(tc["id"]), args)
             if len(out) > MAX_TOOL_RESULT:
-                out = out[: MAX_TOOL_RESULT // 2] + f"\n... [{len(out) - MAX_TOOL_RESULT} chars truncated] ...\n" + out[-MAX_TOOL_RESULT // 2 :]
-            out = self._progress_guard(name, out)
+                out = (out[: MAX_TOOL_RESULT // 2] + f"\n... [{len(out) - MAX_TOOL_RESULT} chars cut from the middle of this "
+                       "result; read files in parts with read_file offset/limit, or narrow the command] ...\n"
+                       + out[-MAX_TOOL_RESULT // 2 :])
+            if stop is None:
+                out, stop = self._progress_guard(name, raw, out)
+            # The result is recorded even when the guard stops the run here: the call did run (an edit is on disk).
             self.sessions.append(self.session_id, {"role": "tool", "tool_call_id": tc["id"], "content": out},
                                  meta={"tool": name, "duration": round(time.time() - started, 3)})
-            self.emit("tool.finished", tool=name, call_id=tc["id"], ok=not out.startswith("ERROR"),
-                      preview=out[:600], duration=round(time.time() - started, 2))
+            ok = not out.startswith("ERROR")
+            if name in WRITE_TOOLS and ok:
+                self._wrote_file = True
+                path = (args or {}).get("path")
+                if isinstance(path, str) and path.strip() and path not in self.written_paths:
+                    self.written_paths.append(path)
+            if name == "todo" and ok and (args or {}).get("todos") is not None:  # a plan write, not a read
+                self._plan_step, self._plan_nudged = self._step, False
+            self.emit("tool.finished", tool=name, call_id=tc["id"], ok=ok, preview=out[:600],
+                      duration=round(time.time() - started, 2))
             n += 1
+            if stop is not None:
+                self._answer_unrun(calls[i + 1 :], f"(not run: the loop guard stopped this run — {stop})")
+                raise stop
         return n
 
-    def _progress_guard(self, name: str, out: str) -> str:
-        """Detect a run that keeps getting the same results (near-identical calls, cosmetic variations)."""
-        key = hash((name, out))
+    def _progress_guard(self, name: str, raw: str, out: str) -> tuple[str, LoopDetected | None]:
+        """Detect a run that keeps getting the same results (near-identical calls, cosmetic variations). Returns the
+        result (with a nudge appended once the streak is long) and the exception that stops the run, if any.
+
+        A successful write or edit changes the workspace, so its confirmation ("Edited x (1 replacement)") is the
+        same text for every edit of a file without meaning "no progress": it is keyed by its arguments as well. The
+        very same write repeated still counts (and the identical-call guard catches it first)."""
+        if name in WRITE_TOOLS and not out.startswith("ERROR"):
+            key = hash((name, " ".join(raw.split()), out))
+        else:
+            key = hash((name, out))
         seen = self._result_sigs.get(key, 0)
         self._result_sigs[key] = seen + 1
         self._stale_streak = self._stale_streak + 1 if seen >= 1 else 0
         if self._stale_streak >= STALE_STOP:
-            raise LoopDetected(f"the last {self._stale_streak} tool results repeated earlier results (no progress)")
+            stop = LoopDetected(f"the last {self._stale_streak} tool results repeated earlier results (no progress)")
+            return out + f"\n\n[progress guard] {stop}; stopping this run.", stop
         if self._stale_streak >= STALE_NUDGE:
             out += (f"\n\n[progress guard] The last {self._stale_streak} tool results were identical to earlier ones — you are "
                     "not making progress. Stop repeating checks; either change approach or write your final answer now.")
-        return out
+        return out, None
 
     def _loop(self, usage: Usage, max_iter: int) -> tuple[int, int, str, str]:
         iterations = tool_calls = 0
@@ -467,6 +605,9 @@ class Agent:
         if pending:
             tool_calls += self._run_tool_calls(pending)
         schemas = [t.schema() for t in self.tools.values()]
+        self._schemas = schemas
+        partial: list[str] = []  # text of replies cut off at the output limit, continued in the next step
+        markup_retries = 0
         while iterations < max_iter:
             self._check_cancel()
             if self.is_root and self.budget.near_limit:
@@ -474,19 +615,42 @@ class Agent:
                 return iterations, tool_calls, self._wrap_up(usage, "The run budget is nearly exhausted."), "budget_exceeded"
             self._maybe_compact()
             iterations += 1
+            self._step = iterations
+            self._note_budget()
+            self._remind_stale_plan(iterations)
             if max_iter >= 8 and iterations == int(max_iter * 0.8):
-                # Budget checkpoint (after Hermes' kanban workers): a chance to verify and wrap up before the hard cap.
+                # Budget checkpoint: a chance to verify and wrap up before the hard cap.
                 left = max_iter - iterations + 1
                 self.sessions.append(self.session_id, {"role": "user", "content": (
-                    f"[system] Step budget checkpoint: {left} of {max_iter} steps left. Prioritise finishing and verifying "
-                    "the core deliverable; drop nice-to-have extras; then give your final answer.")}, meta={"checkpoint": True})
+                    f"[system] Step budget checkpoint: {left} of {max_iter} steps left. If your deliverable is a file that "
+                    "is not written yet, write it now with what you have (in parts if it is long), then refine it. "
+                    "Prioritise finishing and verifying the core deliverable; drop nice-to-have extras; then give your "
+                    "final answer.")}, meta={"checkpoint": True})
                 self.emit("budget.checkpoint", steps_left=left)
+                missing = self._missing_deliverables()
+                if (missing or (not self._deliverables and not self._wrote_file)) \
+                        and any(s["function"]["name"] in WRITE_TOOLS for s in schemas):
+                    # Advice alone did not work: workers kept reading or experimenting until the step limit and never
+                    # wrote their report. Until it exists, the next steps offer only the file tools: write, or answer.
+                    self._write_only_steps = 2
+                    what = (f"Your deliverable {', '.join(missing)} does not exist yet" if missing
+                            else "You have not written any file yet")
+                    self.sessions.append(self.session_id, {"role": "user", "content": (
+                        f"[system] {what}. For the next two steps only write_file and edit_file are available: write it "
+                        "now with what you have (in parts if it is long), or, if the task needs no file, give your "
+                        "final answer.")}, meta={"checkpoint": True})
             self.emit("llm.request", iteration=iterations)
             # Greedy decoding (temperature 0) can lock into repetition; loosen it while the guard sees no progress.
-            temp = 0.7 if self._stale_streak >= 2 else None
+            temp = 0.7 if (self._stale_streak >= 2 or self._hot_turns > 0) else None
+            self._hot_turns = max(0, self._hot_turns - 1)
             streamer = _DeltaStreamer(self, iterations) if self.settings.stream else None
-            resp = self.chat(self._llm_messages(), schemas or None, temperature=temp,
-                             on_delta=streamer.feed if streamer else None)
+            step_schemas = schemas
+            if self._write_only_steps > 0:
+                self._write_only_steps -= 1
+                step_schemas = [s for s in schemas if s["function"]["name"] in WRITE_TOOLS]
+            resp = self.chat(self._llm_messages(), step_schemas or None, temperature=temp,
+                             on_delta=streamer.feed if streamer else None,
+                             **self._turn_thinking())
             if streamer:
                 streamer.flush()
             usage.add(resp.usage)
@@ -494,21 +658,118 @@ class Agent:
             self.sessions.append(self.session_id, msg, meta={"usage": resp.usage.__dict__, "finish": resp.finish_reason})
             self.emit("assistant.message", content=resp.content[:4000], tool_calls=[
                 {"name": tc.name, "args": _preview_args(tc.arguments)} for tc in resp.tool_calls])
+            if resp.tool_calls and resp.finish_reason == "length":
+                # The reply hit the output limit inside a tool call: its arguments are cut off, so it is not run.
+                self._refuse_truncated(msg["tool_calls"], resp.usage.completion_tokens)
+                continue
             if not resp.tool_calls:
-                if not resp.content.strip() and resp.finish_reason == "length":
+                if TOOL_MARKUP.search(resp.content or "") and markup_retries < 2:
+                    markup_retries += 1  # a tool call written as text: ask for a real one (or plain prose)
+                    self.emit("tool_markup.leaked")
+                    self.sessions.append(self.session_id, {"role": "user", "content": (
+                        "[system] Your last reply contained tool-call markup as plain text instead of a real tool call. "
+                        "Call the tool properly, or give your answer as plain prose.")}, meta={"markup_note": True})
                     continue
-                return iterations, tool_calls, resp.content, "completed"
+                if resp.finish_reason == "length":
+                    partial.append(strip_tool_markup(resp.content))
+                    self.sessions.append(self.session_id, {"role": "user", "content": (
+                        "[system] Your reply was cut off at the output limit. Continue exactly where it stopped, without "
+                        "repeating it.")}, meta={"length_note": True})
+                    continue
+                return iterations, tool_calls, "".join(partial) + strip_tool_markup(resp.content), "completed"
             tool_calls += self._run_tool_calls(msg["tool_calls"])
+        tool_calls += self._salvage_deliverables(usage, schemas)
         return iterations, tool_calls, self._wrap_up(usage, "The iteration limit was reached."), "max_iterations"
 
-    def _wrap_up(self, usage: Usage, why: str) -> str:
-        """Ask for a final report without tools so the user still gets a summary."""
-        self.sessions.append(self.session_id, {"role": "user", "content": f"[system] {why} Stop using tools and report what "
-                                               "you completed, what is unfinished, and why."})
-        resp = self.chat(self._llm_messages(), None, purpose="wrapup")
+    def _note_budget(self) -> None:
+        """Tell the root agent once when most of the run budget is spent (delegates and subagents share it, and a
+        lead cannot otherwise see it: one started a third review round with 30 calls left, which then stopped)."""
+        if not self.is_root or self._budget_noted or self.budget.fraction < BUDGET_NOTE_AT:
+            return
+        self._budget_noted = True
+        self.sessions.append(self.session_id, {"role": "user", "content": (
+            f"[system] Run budget: {self.budget.describe()}; the run stops at 100% and teammates stop at 90%. Fit the "
+            "rest of the work into what is left: finish and verify the essential parts yourself, and start another "
+            "delegation or review round only if the result depends on it.")}, meta={"budget_note": True})
+        self.emit("budget.note", **self.budget.snapshot())
+
+    def _remind_stale_plan(self, step: int) -> None:
+        """One reminder when the plan has open items but has not been updated for PLAN_STALE_STEPS steps."""
+        if self._plan_nudged or step - self._plan_step <= PLAN_STALE_STEPS or "todo" not in self.tools:
+            return
+        todos = self.sessions.get(self.session_id).meta.get("todos") or []
+        if not any(t.get("status") in ("pending", "in_progress") for t in todos):
+            return
+        self._plan_nudged = True
+        done = sum(1 for t in todos if t.get("status") == "completed")
+        idle = step - self._plan_step - 1
+        self.sessions.append(self.session_id, {"role": "user", "content": (
+            f"[system] Your plan shows {done} of {len(todos)} items done and has not been updated for {idle} steps. "
+            "People follow your progress through it: update it now in one todo call (merge=true) — mark finished "
+            "items completed and the current one in_progress, cancel what you dropped — then continue.")},
+            meta={"plan_note": True})
+        self.emit("plan.stale", steps=idle, done=done, total=len(todos))
+
+    def _missing_deliverables(self) -> list[str]:
+        """Requested output files that do not exist (or are empty) yet; paths the policy cannot check are skipped."""
+        missing = []
+        for rel in self._deliverables:
+            try:
+                p = self.paths.resolve(rel)
+            except Exception:  # noqa: BLE001 - outside the roots or invalid: nothing to check
+                continue
+            if not p.is_file() or p.stat().st_size == 0:
+                missing.append(rel)
+        return missing
+
+    def _salvage_deliverables(self, usage: Usage, schemas: list[dict[str, Any]]) -> int:
+        """At the step limit, one extra step with only the file tools if a requested output file is still missing,
+        so the work done so far is saved instead of lost (a lead used to re-delegate "just write the file")."""
+        missing = self._missing_deliverables()
+        write = [s for s in schemas if s["function"]["name"] in WRITE_TOOLS]
+        if not missing or not write:
+            return 0
+        self.sessions.append(self.session_id, {"role": "user", "content": (
+            f"[system] The step limit is reached and {', '.join(missing)} does not exist yet. Write it now from what you "
+            "have (only the file tools are available for this one step; mark unfinished parts as such).")},
+            meta={"salvage": True})
+        self.emit("deliverable.salvage", files=missing)
+        resp = self.chat(self._llm_messages(), write, purpose="salvage")
         usage.add(resp.usage)
-        self.sessions.append(self.session_id, resp.to_message())
-        return resp.content
+        msg = resp.to_message()
+        self.sessions.append(self.session_id, msg, meta={"usage": resp.usage.__dict__, "finish": resp.finish_reason})
+        if not resp.tool_calls:
+            return 0
+        if resp.finish_reason == "length":
+            self._refuse_truncated(msg["tool_calls"], resp.usage.completion_tokens)
+            return 0
+        return self._run_tool_calls(msg["tool_calls"])
+
+    def _refuse_truncated(self, calls: list[dict[str, Any]], out_tokens: int) -> None:
+        """Answer every call of a reply that was cut off at the output limit (the transcript must stay valid)."""
+        self.emit("output.truncated", tokens=out_tokens, tools=[c["function"]["name"] for c in calls])
+        for c in calls:
+            self.sessions.append(self.session_id, {"role": "tool", "tool_call_id": c["id"], "content": (
+                f"ERROR: your reply hit the output limit ({out_tokens} tokens) and was cut off, so this call was not run. "
+                "Make it smaller: write a large file in parts (write_file with the first part, then write_file with "
+                "append=true for the rest, each well under 20,000 characters).")},
+                meta={"tool": c["function"]["name"], "truncated": True})
+
+    def _wrap_up(self, usage: Usage, why: str) -> str:
+        """Ask for a final report so the user still gets a summary. The tools stay visible but cannot be called
+        (tool_choice "none"): offered no tools at all, the model sometimes wrote its next tool call as text."""
+        self.sessions.append(self.session_id, {"role": "user", "content": f"[system] {why} Stop using tools and report what "
+                                               "you completed, what is unfinished, and why. Answer in plain prose."})
+        schemas = getattr(self, "_schemas", None)
+        resp = self.chat(self._llm_messages(), schemas or None, purpose="wrapup",
+                         **({"tool_choice": "none"} if schemas else {}))
+        usage.add(resp.usage)
+        text = strip_tool_markup(resp.content)
+        if not text:
+            text = (f"(No final report: {why} The agent stopped before it could summarise; see this session's log "
+                    "for what it did.)")
+        self.sessions.append(self.session_id, {"role": "assistant", "content": text})
+        return text
 
 
 class _DeltaStreamer:
@@ -523,6 +784,11 @@ class _DeltaStreamer:
         self.last = time.time()
 
     def feed(self, kind: str, text: str) -> None:
+        if kind == "reset":  # the stream broke and is being retried: drop what was shown so far
+            self.buf = {"content": [], "reasoning": []}
+            self.size = 0
+            self.agent.emit("assistant.delta", kind="reset", text="", iteration=self.iteration)
+            return
         self.buf.setdefault(kind, []).append(text)
         self.size += len(text)
         if self.size >= 400 or time.time() - self.last >= 0.12:

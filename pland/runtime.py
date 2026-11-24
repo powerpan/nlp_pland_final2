@@ -89,12 +89,15 @@ class Runtime:
         return found
 
     # ------------------------------------------------------------------ sandboxes
-    def backend_for(self, profile: Profile, settings: AgentSettings) -> Backend:
-        key = (profile.name, settings.sandbox.backend)
+    def backend_for(self, profile: Profile, settings: AgentSettings, workspace: Path | None = None) -> Backend:
+        """The sandbox for a bot working in `workspace` (default: its private workspace; see pland/workspace.py)."""
+        workspace = (workspace or profile.workspace).resolve()
+        key = (profile.name, settings.sandbox.backend, str(workspace))
         with self._locks_guard:
             backend = self._backends.get(key)
             if backend is None:
-                backend = make_backend(settings.sandbox, profile.name, profile.workspace, deny_roots=[self.root])
+                backend = make_backend(settings.sandbox, profile.name, workspace, deny_roots=[self.root],
+                                       home_dir=profile.workspace / ".home")
                 self._backends[key] = backend
             return backend
 

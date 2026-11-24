@@ -2,9 +2,10 @@
 
 A top-level run (a user task, a room turn, an evaluation task) owns one `Budget`; every delegate and
 subagent it spawns charges the same budget, so a whole collaboration tree is capped together.
-Defaults follow the project's DeepSeek guide: 120 model calls and 3M tokens per run, cache hits
-counted as 0.1 token. The last 10% is reserved for the root agent to write its summary: once 90% is
-used, non-root agents stop and new delegations are refused.
+The project's DeepSeek guide suggests 120 model calls and 3M tokens per run (cache hits counted as 0.1
+token); PlanD started there and raised the defaults (AgentSettings.max_run_calls / max_run_tokens: 300 calls,
+8M tokens) after real team tasks ran out — the caps still apply to every run. The last 10% is reserved for
+the root agent to write its summary: once 90% is used, non-root agents stop and new delegations are refused.
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import time
 from dataclasses import dataclass, field
 
 from .llm.base import Usage
+from .llm.pricing import cost
 from .store import DB, new_id
 
 
@@ -23,8 +25,8 @@ class BudgetExceeded(RuntimeError):
 
 @dataclass
 class Budget:
-    max_calls: int = 120
-    max_tokens: float = 3_000_000
+    max_calls: int = 300
+    max_tokens: float = 8_000_000
     calls: int = 0
     usage: Usage = field(default_factory=Usage)
     started: float = field(default_factory=time.time)
@@ -54,6 +56,11 @@ class Budget:
     def charge(self, usage: Usage) -> None:
         with self._lock:
             self.usage.add(usage)
+
+    def describe(self) -> str:
+        """One line for agents: what this run has used of its caps."""
+        return (f"{self.calls}/{self.max_calls} model calls and {int(self.usage.weighted_tokens):,}/"
+                f"{int(self.max_tokens):,} weighted tokens used ({round(self.fraction * 100)}%)")
 
     def snapshot(self) -> dict:
         return {"calls": self.calls, "prompt_tokens": self.usage.prompt_tokens, "cached_tokens": self.usage.cached_tokens,
@@ -88,6 +95,10 @@ class Ledger:
             params.append(since)
         row = self.db.one(sql, params) or {}
         u = Usage(int(row.get("prompt") or 0), int(row.get("completion") or 0), int(row.get("cached") or 0))
+        # cost per model (prices differ ~4-7x between flash and pro)
+        by_model = self.db.query(sql.replace("SELECT COUNT(*) calls,", "SELECT model, COUNT(*) calls,") + " GROUP BY model", params)
+        total_cost = sum(cost(int(r["prompt"] or 0), int(r["cached"] or 0), int(r["completion"] or 0), r["model"]) for r in by_model)
         return {"calls": int(row.get("calls") or 0), "prompt_tokens": u.prompt_tokens, "cached_tokens": u.cached_tokens,
                 "completion_tokens": u.completion_tokens, "cache_hit_rate": round(u.cached_tokens / u.prompt_tokens, 3) if u.prompt_tokens else 0.0,
-                "cost_usd": round(u.cost_usd, 5), "model_seconds": round(float(row.get("seconds") or 0), 1)}
+                "cost_usd": round(total_cost, 5), "model_seconds": round(float(row.get("seconds") or 0), 1),
+                "models": sorted({r["model"] for r in by_model if r["model"]})}
