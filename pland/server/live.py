@@ -21,6 +21,7 @@ import time
 from typing import TYPE_CHECKING, Any
 
 from ..sessions import SessionStore
+from .views import session_todos
 
 if TYPE_CHECKING:
     from ..runtime import Runtime
@@ -56,6 +57,7 @@ class LiveState:
                     "profile": key[0], "session_id": key[1], "room_id": ev.get("room_id"), "run_id": ev.get("run_id"),
                     "role": ev.get("role"), "depth": ev.get("depth"), "state": "thinking", "tool": None,
                     "since": ev.get("ts", time.time()), "todos": None,
+                    "plan_idle": 0,  # tool calls since the plan (todo) was last written: the UI flags a stale plan
                 }
             elif t == "run.finished":
                 self.runs.pop(key, None)  # type: ignore[arg-type]
@@ -67,12 +69,15 @@ class LiveState:
                     run.update(state="tool", tool=ev.get("tool"))
                 elif t == "tool.finished":
                     run.update(state="thinking", tool=None)
+                    if ev.get("tool") != "todo":
+                        run["plan_idle"] = run.get("plan_idle", 0) + 1
                 elif t == "hitl.requested":
                     run.update(state="waiting")
                 elif t == "hitl.resolved" and run.get("state") == "waiting":
                     run.update(state="tool")
                 elif t == "todo.updated":
                     run["todos"] = list(ev.get("todos") or [])
+                    run["plan_idle"] = 0
             if t == "room.drive" and ev.get("room_id"):
                 if ev.get("state") == "started":
                     self.drives[ev["room_id"]] = {"room_id": ev["room_id"], "lead": ev.get("lead"),
@@ -92,6 +97,15 @@ class LiveState:
             drives = [dict(d) for d in self.drives.values()]
         for r in runs:
             r["origin"] = self.origin(r["profile"], r["session_id"])
+            if r.get("todos") is None:
+                # No `todo.updated` seen during this run yet: show the plan the session already keeps,
+                # so a page opened mid-run sees it at once (read once, then cached on the run).
+                sess = self._session(r["profile"], r["session_id"])
+                r["todos"] = session_todos(sess) if sess else []
+                with self._lock:
+                    live = self.runs.get((r["profile"], r["session_id"]))
+                    if live is not None and live.get("run_id") == r.get("run_id") and live.get("todos") is None:
+                        live["todos"] = r["todos"]
         return {"runs": runs, "drives": drives}
 
     # ------------------------------------------------------------------ origins

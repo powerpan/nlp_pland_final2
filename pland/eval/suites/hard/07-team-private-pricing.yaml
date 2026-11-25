@@ -1,0 +1,229 @@
+# hard 07 — cross-agent knowledge: the Q4 price list + rules exist only in @catalog's private workspace; billing leads
+id: hard-team-private-pricing
+title: Quotes that need another bot's private price list and rules (explicit cross-agent communication)
+category: team
+mode: team
+team:
+  room: true
+  lead: billing
+  bots:
+  - name: billing
+    title: Billing
+    description: Prepares customer quotes and invoices
+  - name: catalog
+    title: Catalog
+    description: Maintains the product catalogue, price lists and pricing rules
+prompt: |
+  @billing — please prepare price quotes for the three customer orders in your workspace (`orders/*.json`). Write
+  `shared/quotes.csv` with the header `order_id,customer,subtotal,discount,shipping,total` — one row per order,
+  sorted by order_id, amounts in EUR with exactly two decimals — and a short summary `shared/quotes.md` for the
+  sales team. The quotes must use the current Q4 2026 price list and pricing rules; @catalog owns that information.
+setup:
+  files:
+    orders/ORD-3001.json: |
+      {
+        "order_id": "ORD-3001",
+        "customer": "Nordlicht GmbH",
+        "customer_tier": "gold",
+        "ship_to": "DE",
+        "lines": [
+          {
+            "sku": "CAB-USB3",
+            "qty": 12
+          },
+          {
+            "sku": "CAM-X200",
+            "qty": 1
+          },
+          {
+            "sku": "BAT-AA8",
+            "qty": 25
+          },
+          {
+            "sku": "FLT-UV58",
+            "qty": 3
+          }
+        ]
+      }
+    orders/ORD-3002.json: |
+      {
+        "order_id": "ORD-3002",
+        "customer": "Café Lumière SARL",
+        "customer_tier": "silver",
+        "ship_to": "FR",
+        "lines": [
+          {
+            "sku": "MIC-LAV",
+            "qty": 2
+          },
+          {
+            "sku": "LEN-M60",
+            "qty": 1
+          },
+          {
+            "sku": "MEM-064",
+            "qty": 10
+          },
+          {
+            "sku": "CLN-KIT",
+            "qty": 1
+          }
+        ]
+      }
+    orders/ORD-3003.json: |
+      {
+        "order_id": "ORD-3003",
+        "customer": "Polar Outfitters AS",
+        "customer_tier": "platinum",
+        "ship_to": "NO",
+        "lines": [
+          {
+            "sku": "STR-NECK",
+            "qty": 60
+          },
+          {
+            "sku": "DRY-BOX",
+            "qty": 4
+          },
+          {
+            "sku": "SCR-GLS",
+            "qty": 18
+          },
+          {
+            "sku": "GMB-3X",
+            "qty": 1
+          }
+        ]
+      }
+    '@catalog/pricing/price_list_2026Q4.csv': |
+      sku,name,unit_price_eur,status,replaced_by
+      CAM-X200,Action camera X200,249.00,discontinued,CAM-X210
+      CAM-X210,Action camera X210,279.90,active,
+      CAM-P50,Pocket camera P50,159.00,active,
+      LEN-W18,Wide lens 18mm,189.50,active,
+      LEN-T85,Tele lens 85mm,349.00,active,
+      LEN-M60,Macro lens 60mm,299.00,discontinued,LEN-M65
+      LEN-M65,Macro lens 65mm,319.00,active,
+      BAT-AA8,AA battery 8-pack,6.49,active,
+      BAT-LI2,Li-ion battery pack,39.90,active,
+      CHG-DUO,Dual charger,29.95,active,
+      CAB-USB3,USB-C cable 1m,7.80,active,
+      CAB-HDM2,HDMI cable 2m,12.40,active,
+      MEM-128,SD card 128GB,24.99,active,
+      MEM-256,SD card 256GB,41.50,active,
+      MEM-064,SD card 64GB,14.00,discontinued,MEM-128
+      TRI-CF1,Carbon tripod,129.00,active,
+      TRI-MINI,Mini tripod,19.90,active,
+      BAG-S,Camera bag S,34.00,active,
+      BAG-L,Camera bag L,59.00,active,
+      FLT-UV58,UV filter 58mm,17.25,active,
+      FLT-ND58,ND filter 58mm,36.75,active,
+      MIC-SHO,Shotgun microphone,89.00,active,
+      MIC-LAV,Lavalier microphone,24.50,active,
+      LGT-P60,LED panel 60,74.90,active,
+      LGT-RING,Ring light,49.00,active,
+      GMB-3X,3-axis gimbal,219.00,active,
+      STR-NECK,Neck strap,11.90,active,
+      CLN-KIT,Cleaning kit,9.95,active,
+      HUB-4P,USB hub 4-port,22.00,active,
+      RMT-BT,Bluetooth remote,15.60,active,
+      CAS-HARD,Hard case,99.00,active,
+      SCR-GLS,Screen protector,8.40,active,
+      ADP-M43,Lens adapter M43,64.00,active,
+      HDL-GRIP,Handle grip,27.30,active,
+      WLT-SD,SD card wallet,12.95,active,
+      DRY-BOX,Dry box,45.00,active,
+    '@catalog/pricing/price_list_2026Q3.csv': |
+      sku,name,unit_price_eur,status,replaced_by
+      CAM-X200,Action camera X200,231.57,active,
+      CAM-X210,Action camera X210,260.31,active,
+      CAM-P50,Pocket camera P50,147.87,active,
+      LEN-W18,Wide lens 18mm,176.24,active,
+      LEN-T85,Tele lens 85mm,324.57,active,
+      LEN-M60,Macro lens 60mm,278.07,active,
+      LEN-M65,Macro lens 65mm,296.67,active,
+      BAT-AA8,AA battery 8-pack,6.04,active,
+      BAT-LI2,Li-ion battery pack,37.11,active,
+      CHG-DUO,Dual charger,27.85,active,
+      CAB-USB3,USB-C cable 1m,7.25,active,
+      CAB-HDM2,HDMI cable 2m,11.53,active,
+      MEM-128,SD card 128GB,23.24,active,
+      MEM-256,SD card 256GB,38.60,active,
+      MEM-064,SD card 64GB,13.02,active,
+      TRI-CF1,Carbon tripod,119.97,active,
+      TRI-MINI,Mini tripod,18.51,active,
+      BAG-S,Camera bag S,31.62,active,
+      BAG-L,Camera bag L,54.87,active,
+      FLT-UV58,UV filter 58mm,16.04,active,
+      FLT-ND58,ND filter 58mm,34.18,active,
+      MIC-SHO,Shotgun microphone,82.77,active,
+      MIC-LAV,Lavalier microphone,22.79,active,
+      LGT-P60,LED panel 60,69.66,active,
+      LGT-RING,Ring light,45.57,active,
+      GMB-3X,3-axis gimbal,203.67,active,
+      STR-NECK,Neck strap,11.07,active,
+      CLN-KIT,Cleaning kit,9.25,active,
+      HUB-4P,USB hub 4-port,20.46,active,
+      RMT-BT,Bluetooth remote,14.51,active,
+      CAS-HARD,Hard case,92.07,active,
+      SCR-GLS,Screen protector,7.81,active,
+      ADP-M43,Lens adapter M43,59.52,active,
+      HDL-GRIP,Handle grip,25.39,active,
+      WLT-SD,SD card wallet,12.04,active,
+      DRY-BOX,Dry box,41.85,active,
+    '@catalog/pricing/rules_2026Q4.md': |
+      # Pricing rules — Q4 2026 (valid 2026-10-01 to 2026-12-31)
+
+      Use only `price_list_2026Q4.csv` for Q4 quotes (the Q3 list is kept for reference).
+
+      1. Discontinued SKUs (`status` = discontinued) are quoted as their `replaced_by` SKU, same quantity, at the
+         replacement's price.
+      2. Line amount = quantity × unit price. Volume discount per line, by the line's quantity:
+         10–19 → 3%, 20–49 → 6%, 50 or more → 10%. The discounted line amount is rounded half up to cents.
+      3. Merchandise value = sum of the discounted lines. Customer tier discount on the merchandise value:
+         bronze 0%, silver 2%, gold 4%, platinum 7%; the tier discount amount is rounded half up to cents.
+      4. Net merchandise value = merchandise value − tier discount.
+      5. Shipping by destination country: DE 5.90; AT, BE, FR, LU, NL 12.50; CH, GB, NO 24.00; everywhere else 39.00.
+         Shipping is free when the net merchandise value is 750.00 or more.
+      6. On a quote: subtotal = sum of the undiscounted line amounts (after rule 1); discount = subtotal − net
+         merchandise value; total = net merchandise value + shipping. All amounts in EUR with two decimals.
+timeout: 1800
+memory: fresh
+checks:
+- {id: quotes-exist, type: file_exists, path: shared/quotes.csv}
+- id: quotes-exact
+  type: python
+  code: |
+    import csv, io
+    def quote_rows(text):
+        rows = [r for r in csv.reader(io.StringIO(text)) if r]
+        assert rows and [h.strip() for h in rows[0]] == ["order_id", "customer", "subtotal", "discount", "shipping", "total"], f"header {rows[:1]}"
+        return [[c.strip() for c in r] for r in rows[1:]]
+    rows = quote_rows(path("shared/quotes.csv").read_text(encoding="utf-8"))
+    want = quote_rows('order_id,customer,subtotal,discount,shipping,total\nORD-3001,Nordlicht GmbH,587.50,35.54,5.90,557.86\nORD-3002,Café Lumière SARL,627.85,19.91,12.50,620.44\nORD-3003,Polar Outfitters AS,1264.20,159.12,0.00,1105.08\n')
+    assert [r[0] for r in rows] == [r[0] for r in want], f"orders {[r[0] for r in rows]} != {[r[0] for r in want]} (sorted by order_id)"
+    bad = [f"{g} != expected {w}" for g, w in zip(rows, want) if g != w]
+    assert not bad, "; ".join(bad)
+- id: owner-consulted
+  type: python
+  code: |
+    import json, sqlite3
+    shared = path("shared").resolve()
+    db = shared.parents[2] / "shared.db"
+    assert db.is_file(), f"event log not found at {db}"
+    con = sqlite3.connect(str(db), timeout=30)
+    try:
+        rows = con.execute("SELECT type, data FROM events WHERE room_id=? AND type IN ('delegation.finished', 'message.replied', 'room.member_turn')",
+                           (shared.parent.name,)).fetchall()
+    finally:
+        con.close()
+    asked = []
+    for typ, data in rows:
+        d = json.loads(data)
+        if typ in ("delegation.finished", "message.replied") and d.get("to") == "catalog" and d.get("status") == "completed":
+            asked.append(typ)
+        elif typ == "room.member_turn" and d.get("member") == "catalog" and d.get("role") == "mentioned" and d.get("state") == "done":
+            asked.append(typ)
+    assert asked, "@catalog was never asked: no completed delegation or message to catalog, and no @mention turn of catalog"
+- {id: summary-written, type: file_exists, path: shared/quotes.md}
+required: [quotes-exist, quotes-exact, owner-consulted]

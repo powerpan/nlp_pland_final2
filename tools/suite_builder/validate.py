@@ -4,6 +4,9 @@ For every task: build the workspace exactly like the runner's `_prepare` (setup 
 paths, setup commands with the same env), run all checks against the UNSOLVED state, then apply a scripted
 reference solution (and simulated run records: answer, HITL log, delegation events, board) and run the checks
 again. Expected: every check passes on the solution; required deliverable checks fail on the unsolved setup.
+Optional extras returned by a reference solution: `negatives` (wrong variants; each must fail the checks it lists in
+`expect_fail`, or at least one required check) and `alternatives` (other correct solution paths; each must pass every
+check).
 """
 
 from __future__ import annotations
@@ -183,6 +186,20 @@ def main(suites: list[str], only: set[str] | None = None) -> int:
                 print(f"       {'ok' if ok else '✗!'} negative '{name}': failing={failed}")
                 if not ok:
                     problems += 1
+            # optional alternative correct solutions (e.g. another valid collaboration path)
+            for name, alt in (rec.get("alternatives") or {}).items():
+                env4, room_id4 = build_env(task, SCRATCH / suite / task.id / f"alt-{name}")
+                arec = alt(Ctx(env4, room_id4)) or {}
+                env4.answer = arec.get("answer", "")
+                env4.hitl_log = arec.get("hitl", [])
+                env4.events = arec.get("events", [])
+                env4.runtime.board.tasks = [dict(t, room_id=env4.board_scope) for t in arec.get("board", [])]
+                failed = [c for c in run_checks(task, env4) if not c["passed"]]
+                print(f"       {'ok' if not failed else '✗!'} alternative '{name}': "
+                      f"{'all checks pass' if not failed else 'failing=' + str([c['id'] for c in failed])}")
+                for c in failed:
+                    problems += 1
+                    print(f"           ✗ {c['id']}: {c['message'][:600]}")
     print(f"\nproblems: {problems}")
     return 1 if problems else 0
 
@@ -194,4 +211,4 @@ if __name__ == "__main__":
         i = args.index("--only")
         only = set(args[i + 1].split(","))
         args = args[:i] + args[i + 2:]
-    sys.exit(main(args or ["dev", "midterm", "final", "memory_evolution"], only))
+    sys.exit(main(args or ["dev", "midterm", "final", "memory_evolution", "hard"], only))

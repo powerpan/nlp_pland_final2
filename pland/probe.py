@@ -1,7 +1,8 @@
 """Capability probe against the real model API (`pland doctor --probe`).
 
 A handful of small calls: plain chat, native tool call, tool call with thinking mode (including the
-reasoning_content replay on the follow-up turn), JSON mode, and the DeepSeek Search/Fetch tools.
+reasoning replay on the follow-up turn), thinking intensity, JSON mode, and the DeepSeek Search/Fetch tools
+(DeepSeek's even with HKGAI as the provider, which has none of its own).
 """
 
 from __future__ import annotations
@@ -58,6 +59,15 @@ def run_probe(console) -> bool:
         total.add(r2.usage)
         return f"reasoning={bool(r.reasoning_content)} final={r2.content.strip()[:80]!r}"
 
+    def intensity():
+        q = [{"role": "user", "content": "What is 17 * 23? Reply with the number only."}]
+        deep = plain.chat(q, thinking=True, effort="max", max_tokens=2000)
+        off = plain.chat(q, thinking=False, max_tokens=50)
+        total.add(deep.usage)
+        total.add(off.usage)
+        assert deep.reasoning_content and not off.reasoning_content, "thinking switch not honoured"
+        return f"max: {len(deep.reasoning_content)} reasoning chars · off: none · {off.content.strip()!r}"
+
     def json_mode():
         r = plain.chat([{"role": "user", "content": "Return a JSON object with keys a=1 and b='x'. Output JSON only."}], json_mode=True)
         total.add(r.usage)
@@ -80,6 +90,7 @@ def run_probe(console) -> bool:
         return f"title={title!r} chars={len(text)}"
 
     for name, fn in [("chat", chat), ("tool call", tools), ("tool call + thinking (reasoning replay)", tools_thinking),
+                     ("thinking intensity (max / off)", intensity),
                      ("JSON mode", json_mode), ("DeepSeek Search API", search), ("DeepSeek Fetch API", fetch)]:
         check(name, fn)
     for name, ok, detail, dt in results:

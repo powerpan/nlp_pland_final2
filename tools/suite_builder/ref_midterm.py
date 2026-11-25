@@ -1,7 +1,6 @@
 """Reference solutions for the midterm suite (scripted, no model)."""
 
 import csv
-import io
 import json
 import re
 import shutil

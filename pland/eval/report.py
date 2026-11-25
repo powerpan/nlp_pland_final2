@@ -22,7 +22,10 @@ def render_report(s: dict[str, Any], records: list[dict[str, Any]]) -> str:
         f"- 執行時間：{s.get('started')}　|　輸出目錄：`{s.get('run_dir')}`",
         f"- 程式版本：`{s.get('code_version', '?')}`　|　模型：`{s.get('model', '?')}`",
         f"- 設定：backend=`{opts.get('backend')}`、memory=`{opts.get('memory')}`、passes={opts.get('passes')}"
-        + (f"、model=`{opts.get('model')}`" if opts.get("model") else "") + (f"、label=`{opts.get('label')}`" if opts.get("label") else ""),
+        + (f"、model=`{opts.get('model')}`" if opts.get("model") else "")
+        + (f"、thinking=`{opts.get('thinking')}`" if opts.get("thinking") is not None else "")
+        + (f"、reasoning=`{opts.get('reasoning')}`" if opts.get("reasoning") else "")
+        + (f"、label=`{opts.get('label')}`" if opts.get("label") else ""),
     ]
     if s.get("description"):
         L += [f"- 測試集說明：{' '.join(str(s['description']).split())}"]
@@ -85,6 +88,12 @@ def render_report(s: dict[str, Any], records: list[dict[str, Any]]) -> str:
                 L.append(f"  - 錯誤：{' '.join(r['error'].split())[:220]}")
     else:
         L.append("無。")
+    recovered = [r for r in records if r.get("internal_errors")]
+    if recovered:
+        L += ["", "**團隊內部的錯誤**（某個成員或受託者的運行失敗，但由主導者接手處理，任務結果仍以檢查項判定）："]
+        for r in recovered:
+            L.append(f"- `{r['task_id']}`（{OUTCOME_ZH.get(r['outcome'], r['outcome'])}）：" + "；".join(
+                " ".join(e.split())[:160] for e in r["internal_errors"][:3]))
     L.append("")
     me = s.get("memory_effect") or {}
     L += ["## 記憶與經驗演化", "",
@@ -137,4 +146,39 @@ def render_comparison(runs: list[tuple[str, dict[str, Any]]]) -> str:
             t = next((t for t in d["tasks"] if f"{t['task_id']}" + (f" (p{t['pass']})" if t.get("pass", 1) > 1 else "") == key), None)
             cells.append("—" if t is None else f"{OUTCOME_ZH.get(t['outcome'], t['outcome'])} {t.get('checks_passed', 0)}/{t.get('checks_total', 0)} · {t.get('duration_s')}s · {(t.get('usage') or {}).get('calls', 0)} calls")
         L.append(f"| `{key}` | " + " | ".join(cells) + " |")
+    return "\n".join(L) + "\n"
+
+
+def render_aggregate(name: str, runs: list[tuple[str, dict[str, Any]]]) -> str:
+    """Mean ± sample std over repeated runs of the same suite, plus per-task success frequency."""
+    import statistics as st
+
+    def ms(values: list[float]) -> str:
+        vals = [v for v in values if v is not None]
+        if not vals:
+            return "—"
+        if len(vals) == 1:
+            return f"{vals[0]:.1f}"
+        return f"{st.mean(vals):.1f} ± {st.stdev(vals):.1f}"
+
+    sums = [d["summary"] for _, d in runs]
+    L = [f"# 重複執行統計：{name}（{len(runs)} 次）", "",
+         "| 指標 | 平均 ± 標準差 |", "|---|---|",
+         f"| 整體目標完成率（%） | {ms([s['goal_completion_rate'] for s in sums])} |",
+         f"| 子任務完成率（%） | {ms([s['subtask_completion_rate'] for s in sums])} |",
+         f"| 總執行時間（s） | {ms([s['time']['total_s'] for s in sums])} |",
+         f"| 每任務平均時間（s） | {ms([s['time']['mean_s'] for s in sums])} |",
+         f"| 模型調用 | {ms([s['usage']['calls'] for s in sums])} |",
+         f"| 估算花費（美分） | {ms([100 * s['usage']['cost_usd'] for s in sums])} |",
+         f"| 快取命中率（%） | {ms([100 * s['usage']['cache_hit_rate'] for s in sums])} |",
+         "", "使用的運行：" + "、".join(f"`{n}`（{d['summary'].get('code_version', '?')}）" for n, d in runs), "",
+         "## 逐任務成功次數", "", "| 任務 | 成功 | 平均時間 | 失敗模式 |", "|---|---|---|---|"]
+    tasks: dict[str, list[dict[str, Any]]] = {}
+    for _, d in runs:
+        for t in d["tasks"]:
+            tasks.setdefault(t["task_id"], []).append(t)
+    for tid, ts in tasks.items():
+        ok = sum(t["outcome"] == "success" for t in ts)
+        modes = sorted({t["failure_mode"] for t in ts if t.get("failure_mode")})
+        L.append(f"| `{tid}` | {ok}/{len(ts)} | {ms([t['duration_s'] for t in ts])}s | {'; '.join(modes) or '—'} |")
     return "\n".join(L) + "\n"

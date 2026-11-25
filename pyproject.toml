@@ -28,7 +28,15 @@ pland = "pland.cli:main"
 include = ["pland*"]
 
 [tool.setuptools.package-data]
-pland = ["server/static/*", "eval/suites/**/*"]
+pland = ["server/static/*", "eval/suites/**/*", "team_templates/*.yaml"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py310"
+
+[tool.ruff.lint]
+# pyflakes rules only (undefined names, unused imports/variables); style is not enforced
+select = ["F", "E9"]

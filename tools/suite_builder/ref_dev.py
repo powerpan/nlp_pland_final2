@@ -12,7 +12,7 @@ def deleg(to, status="completed"):
 
 
 def file_wordcount(c):
-    import collections, re
+    import collections
     text = c.path("notes/poem.txt").read_text()
     lines = [l for l in text.splitlines() if l.strip()]
     words = text.split()

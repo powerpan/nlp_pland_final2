@@ -5,45 +5,68 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="color-scheme" content="light dark">
   <title>PlanD</title>
-  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%235b5bd6'/%3E%3Ctext x='16' y='22' font-family='Arial' font-weight='700' font-size='17' text-anchor='middle' fill='white'%3EP%3C/text%3E%3C/svg%3E">
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect x='2' y='2' width='28' height='28' rx='3' fill='%23d4441c'/%3E%3Ctext x='16' y='23' font-family='Georgia,serif' font-weight='700' font-size='19' text-anchor='middle' fill='%23fffdf8'%3ED%3C/text%3E%3C/svg%3E">
+  <script>
+    // Apply the appearance settings before the first paint (no flash of the wrong theme or a sidebar that snaps shut).
+    (function () {
+      var ui = {};
+      try { ui = JSON.parse(localStorage.getItem('pland.ui') || '{}') || {}; } catch (e) { /* storage unavailable */ }
+      var r = document.documentElement;
+      if (ui.theme === 'light' || ui.theme === 'dark') r.dataset.theme = ui.theme;
+      if (ui.accent && ui.accent !== 'vermilion') r.dataset.accent = ui.accent;
+      if (ui.size && ui.size !== 'default') r.dataset.size = ui.size;
+      if (ui.density === 'compact') r.dataset.density = 'compact';
+      if (ui.reasoning === 'hide') r.dataset.reasoning = 'hide';
+      if (ui.sideWidth) r.style.setProperty('--side-w', ui.sideWidth + 'px');
+      if (ui.panelWidth) r.style.setProperty('--panel-w', ui.panelWidth + 'px');
+      if (ui.sideCollapsed) r.classList.add('side-collapsed');
+    })();
+  </script>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
 <div id="app" class="app">
   <aside id="sidebar" class="sidebar" aria-label="Conversations">
     <div class="brand">
-      <div class="brand-mark">P</div>
+      <div class="brand-mark" aria-hidden="true">D</div>
       <div class="brand-text">
         <div class="brand-name">PlanD</div>
         <div id="brand-sub" class="brand-sub">connecting…</div>
       </div>
       <button id="hitl-badge" class="hitl-badge hidden" type="button" title="Requests waiting for you"></button>
+      <button id="side-collapse" class="icon-btn" type="button" title="Hide sidebar (⌘B)" aria-label="Hide sidebar"></button>
     </div>
     <div class="tabs side-tabs" role="tablist">
       <button class="tab active" type="button" role="tab" data-tab="chats">Chats</button>
-      <button class="tab" type="button" role="tab" data-tab="bots">Bots</button>
+      <button class="tab" type="button" role="tab" data-tab="bots">Bots &amp; groups</button>
     </div>
     <div id="side-chats" class="side-pane">
       <div class="side-actions">
-        <button id="new-chat" class="btn btn-primary btn-block" type="button">New chat</button>
+        <button id="new-chat" class="new-btn" type="button" title="New chat (⇧⌘O)"><span class="plus" aria-hidden="true">+</span><span class="label">New chat</span><kbd>⇧⌘O</kbd></button>
       </div>
+      <div class="section-head"><span>Recent</span><span id="chat-count"></span></div>
       <div id="chat-list" class="list"></div>
     </div>
     <div id="side-bots" class="side-pane hidden">
-      <div class="section-head"><span>Bots</span><button id="new-bot" class="btn btn-ghost btn-sm" type="button">+ New bot</button></div>
+      <div class="section-head"><span>Bots</span><span class="head-actions"><button id="team-templates" class="btn btn-ghost btn-sm" type="button" title="Add a ready-made team of bots and groups">Templates</button><button id="new-bot" class="btn btn-ghost btn-sm" type="button">+ New bot</button></span></div>
       <div id="bot-list" class="list"></div>
       <div class="section-head"><span>Groups</span><button id="new-group" class="btn btn-ghost btn-sm" type="button">+ New group</button></div>
       <div id="group-list" class="list"></div>
     </div>
     <div class="side-foot">
+      <div class="foot-row">
+        <button id="open-settings" class="foot-btn" type="button" title="Settings (⌘,)"></button>
+        <div id="conn" class="conn"></div>
+      </div>
       <div id="usage" class="usage" title="Model usage recorded in the ledger"></div>
-      <div id="conn" class="conn"></div>
     </div>
+    <div id="side-resizer" class="resizer" role="separator" aria-orientation="vertical" aria-label="Resize sidebar (double-click to reset)" tabindex="0"></div>
   </aside>
 
   <main id="main" class="main">
     <header id="conv-head" class="conv-head"></header>
     <div id="banner" class="banner hidden"></div>
+    <div id="board" class="board hidden" aria-label="Task board"></div>
     <div id="scroller" class="scroller">
       <div id="messages" class="messages"></div>
       <div id="hitl-cards" class="hitl-cards"></div>
@@ -53,18 +76,30 @@
       <div id="live" class="live hidden" aria-live="polite"></div>
       <form id="composer" class="composer" autocomplete="off">
         <div id="mention-pop" class="mention-pop hidden" role="listbox"></div>
-        <textarea id="input" rows="1" placeholder="Message PlanD…" aria-label="Message"></textarea>
-        <div class="composer-row">
-          <span class="hint">Enter to send · Shift+Enter for a new line</span>
+        <div id="attachments" class="attachments hidden" aria-label="Attached files"></div>
+        <div class="composer-line">
+          <button type="button" id="attach" class="attach-btn" title="Add files (or drop / paste them here)" aria-label="Add files">+</button>
+          <input type="file" id="file-input" multiple hidden>
+          <textarea id="input" rows="1" placeholder="Message PlanD…" aria-label="Message"></textarea>
+          <div class="pick-wrap">
+            <button type="button" id="model-pick" class="pick hidden" aria-haspopup="menu" aria-expanded="false"></button>
+            <div id="model-menu" class="pick-menu hidden" role="menu"></div>
+          </div>
+          <div class="pick-wrap">
+            <button type="button" id="think" class="pick hidden" aria-haspopup="menu" aria-expanded="false"></button>
+            <div id="think-menu" class="pick-menu hidden" role="menu"></div>
+          </div>
           <button type="button" id="stop" class="btn btn-stop hidden">Stop</button>
-          <button type="submit" id="send" class="btn btn-primary">Send</button>
+          <button type="submit" id="send" class="send-btn" aria-label="Send" title="Send (Enter) · Shift+Enter for a new line">&#8593;</button>
         </div>
       </form>
+      <div class="composer-hint" aria-hidden="true"><span><kbd>↵</kbd> send</span><span><kbd>⇧↵</kbd> new line</span><span><kbd>@</kbd> mention a bot</span><span><kbd>⌘B</kbd> sidebar</span></div>
     </div>
   </main>
 
   <aside id="panel" class="panel hidden" aria-label="Details"></aside>
 </div>
+<div id="settings" class="settings hidden" role="dialog" aria-modal="true" aria-label="Settings"></div>
 <div id="tray" class="tray hidden" role="dialog" aria-label="Waiting for you"></div>
 <div id="toasts" class="toasts" aria-live="polite"></div>
 <script src="app.js"></script>

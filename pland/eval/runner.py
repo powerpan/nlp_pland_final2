@@ -44,7 +44,8 @@ class RunOptions:
     passes: int = 1  # run the whole suite N times in the same home (memory carries across passes)
     only: list[str] | None = None
     model: str | None = None
-    thinking: bool = False
+    thinking: bool | None = None  # None: profile/default setting
+    reasoning: str | None = None  # thinking intensity: off|default|low|medium|high|max (None: profile setting)
     label: str = ""
 
 
@@ -89,8 +90,12 @@ class SuiteRunner:
         model: dict[str, Any] = {}
         if self.opts.model:
             model["model"] = self.opts.model
-        if self.opts.thinking:
-            model["thinking"] = True
+        if self.opts.thinking is not None:
+            model["thinking"] = self.opts.thinking
+        if self.opts.reasoning:
+            from ..llm.reasoning import to_settings
+
+            model.update(to_settings(self.opts.reasoning))
         if model:
             patch["model"] = model
         if self.opts.memory == "off":
@@ -221,6 +226,7 @@ class SuiteRunner:
         # ---- final answer & run status
         answer, run_status, error = "", None, box.get("exception")
         sessions: list[tuple[str, str]] = []
+        internal_errors: list[str] = []
         res = box.get("result")
         if res is not None:
             answer, run_status, error = res.text, res.status, error or res.error
@@ -231,10 +237,11 @@ class SuiteRunner:
             bot_msgs = [m for m in msgs if m["id"] > first_user and m["kind"] == "message" and m["speaker"] not in ("user", "system")]
             answer = "\n\n".join(f"@{m['speaker']}: {m['content']}" for m in bot_msgs)
             finished = [e for e in events if e["type"] == "run.finished"]
-            statuses = [e.get("status") for e in finished]
-            run_status = "error" if "error" in statuses else ("completed" if finished else None)
-            errs = [e.get("error") for e in finished if e.get("error")]
-            error = error or (errs[0] if errs else None)
+            # A failed member/delegate run is a failure the team saw and could route around (the lead gets a failed
+            # delegation back); only a failure of the room drive itself is a crash. Internal errors are kept below.
+            run_status = "completed" if "drive" in box else ("error" if finished else None)
+            internal_errors = [f"@{e.get('profile')}: {(e.get('error') or e.get('status'))}"[:300]
+                               for e in finished if e.get("status") not in ("completed",)]
         for e in events:
             if e["type"] == "run.started" and e.get("profile") and e.get("session_id"):
                 pair = (e["profile"], e["session_id"])
@@ -294,7 +301,7 @@ class SuiteRunner:
             experiences_added=[{"profile": e.get("profile"), "id": e.get("id"), "self_outcome": e.get("outcome"),
                                 "lessons": e.get("lessons")} for e in events if e["type"] == "experience.added"],
             memory_before=mem_before, memory_after=mem_after, sessions=[list(s) for s in sessions],
-            room_id=room["id"] if room else None, failure_mode=None,
+            room_id=room["id"] if room else None, failure_mode=None, internal_errors=internal_errors,
         )
         rec["failure_mode"] = classify_failure(rec)
         self._save_task_artifacts(task, rec, events, involved, room, pass_no)

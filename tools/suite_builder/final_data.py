@@ -1,13 +1,11 @@
 """Setup data for the final suite (kept separate so builder and validator share it)."""
 
 import json
-import os
 import subprocess
 import sys
 import tempfile
 from decimal import Decimal
 from pathlib import Path
-from textwrap import dedent
 
 from common import lit
 from final_refs import CONVERT, PIPELINE

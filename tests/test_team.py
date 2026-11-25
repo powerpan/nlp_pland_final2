@@ -134,3 +134,20 @@ def test_room_shared_folder(rt, script):
     script({"coder": [{"tool_calls": [("write_file", {"path": "shared/spec.md", "content": "# spec"})]}, {"content": "wrote spec"}]})
     rt.rooms.send(room["id"], "write the spec", background=False)
     assert (rt.rooms.shared_dir(room["id"]) / "spec.md").read_text() == "# spec"
+
+
+def test_discussion_turns_run_concurrently(rt, script):
+    make_team(rt)
+    room = rt.rooms.create("par", ["lead", "coder", "writer"], lead="lead")
+    barrier = threading.Barrier(2, timeout=5)
+
+    def discuss(name):
+        def step(msgs, tools):
+            barrier.wait()  # both discussion turns must be in flight at the same time
+            return {"content": f"{name} can help"}
+        return step
+
+    script({"coder": [discuss("coder")], "writer": [discuss("writer")], "lead": [{"content": "plan"}]})
+    rt.rooms.send(room["id"], "do it", background=False)
+    speakers = [m["speaker"] for m in rt.rooms.messages(room["id"]) if m["kind"] == "message"]
+    assert speakers == ["user", "coder", "writer", "lead"]  # posted in roster order after running in parallel

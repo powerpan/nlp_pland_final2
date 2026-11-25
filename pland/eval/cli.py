@@ -16,13 +16,19 @@ def add_arguments(parser) -> None:
     r.add_argument("--passes", type=int, default=1, help="run the suite N times in a row with memory carried over")
     r.add_argument("--only", nargs="*", help="run only these task ids")
     r.add_argument("--model", help="override the model id (e.g. deepseek-v4-pro)")
-    r.add_argument("--thinking", action="store_true", help="enable DeepSeek thinking mode")
+    r.add_argument("--thinking", dest="thinking", action="store_true", default=None, help="force DeepSeek thinking mode on")
+    r.add_argument("--no-thinking", dest="thinking", action="store_false", help="force DeepSeek thinking mode off")
+    r.add_argument("--reasoning", metavar="LEVEL", help="thinking intensity: off|default|low|medium|high|max")
     r.add_argument("--label", default="", help="label appended to the run directory name")
     ls = sub.add_parser("list", help="list built-in suites and their tasks")
     ls.add_argument("suite", nargs="?")
     cmp_ = sub.add_parser("compare", help="compare finished runs side by side (Markdown)")
     cmp_.add_argument("run_dirs", nargs="+", help="NAME=DIR or DIR")
     cmp_.add_argument("--out", help="write the comparison to this file")
+    agg = sub.add_parser("aggregate", help="mean ± std over repeated runs of one suite (Markdown)")
+    agg.add_argument("run_dirs", nargs="+")
+    agg.add_argument("--name", default="")
+    agg.add_argument("--out")
     rep = sub.add_parser("report", help="re-render the Markdown report of a finished run")
     rep.add_argument("run_dir")
     rep.add_argument("--copy-to", help="also copy report.md here")
@@ -57,6 +63,18 @@ def main(args) -> int:
         else:
             console.print(text)
         return 0
+    if args.eval_cmd == "aggregate":
+        from .report import render_aggregate
+        from .runner import load_results
+
+        runs = [(Path(p).name, load_results(Path(p).expanduser())) for p in args.run_dirs]
+        text = render_aggregate(args.name or runs[0][1]["summary"].get("suite") or "suite", runs)
+        if args.out:
+            Path(args.out).write_text(text, encoding="utf-8")
+            console.print(f"wrote {args.out}")
+        else:
+            console.print(text)
+        return 0
     if args.eval_cmd == "report":
         from .report import render_report
         from .runner import load_results
@@ -72,7 +90,8 @@ def main(args) -> int:
     from .runner import RunOptions, run_suite
 
     opts = RunOptions(out_dir=Path(args.out).expanduser() if args.out else None, backend=args.backend, memory=args.memory,
-                      passes=args.passes, only=args.only, model=args.model, thinking=args.thinking, label=args.label)
+                      passes=args.passes, only=args.only, model=args.model, thinking=args.thinking, reasoning=args.reasoning,
+                      label=args.label)
     runner, summary = run_suite(args.suite, opts, progress=lambda m: console.print(m))
     console.print_json(json.dumps({k: summary[k] for k in ("goal_completion_rate", "subtask_completion_rate", "outcomes", "time", "usage")}))
     console.print(f"report: {runner.run_dir / 'report.md'}")

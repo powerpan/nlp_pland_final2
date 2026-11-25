@@ -1,0 +1,447 @@
+# hard 08 — git: merge with textual conflicts (code, tests, changelog, JSON) and a semantic one (new caller of a renamed function)
+id: hard-git-merge-conflict
+title: Merge a feature branch with textual and semantic conflicts, resolved by stated rules
+category: git
+prompt: |
+  `store/` is a git repository. Merge the branch `feature/tiered-discounts` into `main`. Both branches changed the
+  pricing code since they diverged, so the merge will conflict. Resolve it according to these rules:
+
+  1. Create a real merge commit on `main` whose first parent is the current tip of `main` and whose second parent
+     is the tip of `feature/tiered-discounts` (no rebase, squash or cherry-pick; leave the feature branch as it
+     is). Resolve everything inside that merge commit: afterwards `main` must point to the merge commit itself,
+     with no further commits on top.
+  2. `shop/pricing.py`: keep main's API and add the feature's tier discount. The function is
+     `compute_total(items, country="DE", *, tier=None, currency="EUR")`: net amount → minus the tier discount →
+     plus the VAT of `country` → converted to `currency` → rounded half up to cents once, at the end. Keep every
+     VAT rate, FX rate and tier from both branches. `calc_total` must no longer exist anywhere in the Python code
+     (no alias): update every caller — including code that only the feature branch added — and the tests.
+  3. Tests: keep all tests of both branches. The feature's tests may only change where they must call
+     `compute_total` instead of `calc_total` (expected values stay as they are). `python -m pytest` must pass in
+     `store/`.
+  4. `CHANGELOG.md`: under `## Unreleased` keep every entry of both branches — main's entries first, then the
+     feature branch's, each group in its original order. Nothing else in the file changes.
+  5. `config.json`: keep every key of both sides; `version` becomes `1.3.0`; for any other key that both sides
+     changed, main's value wins. It must stay valid JSON.
+
+  At the end the working tree must be clean.
+setup:
+  files:
+    store/.gitignore: |
+      __pycache__/
+      .pytest_cache/
+    store/conftest.py: |
+      # makes the project root importable for pytest
+    store/shop/__init__.py: |
+      """Tiny shop library."""
+    store/shop/pricing.py: |
+      """Price calculations."""
+      from decimal import ROUND_HALF_UP, Decimal
+
+      VAT = {"DE": Decimal("0.19"), "FR": Decimal("0.20"), "NL": Decimal("0.21")}
+
+
+      def calc_total(items, country="DE"):
+          """Gross total of `items` — (unit_price, qty) pairs, prices as strings — including the VAT of `country`,
+          rounded half up to cents."""
+          net = sum((Decimal(price) * qty for price, qty in items), Decimal(0))
+          gross = net * (1 + VAT[country])
+          return gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    store/tests/test_pricing.py: |
+      from decimal import Decimal
+
+      from shop.pricing import calc_total
+
+
+      def test_total_de():
+          assert calc_total([("10.00", 2), ("5.00", 1)]) == Decimal("29.75")
+
+
+      def test_total_fr():
+          assert calc_total([("10.00", 1)], "FR") == Decimal("12.00")
+    store/CHANGELOG.md: |
+      # Changelog
+
+      ## Unreleased
+
+      ## 1.2.0
+
+      - Pricing module with VAT for DE, FR and NL.
+    store/config.json: |
+      {
+        "name": "shop",
+        "version": "1.2.0",
+        "default_country": "DE",
+        "rounding": "half-up"
+      }
+    _stage/main1/shop/pricing.py: |
+      """Price calculations."""
+      from decimal import ROUND_HALF_UP, Decimal
+
+      VAT = {"DE": Decimal("0.19"), "FR": Decimal("0.20"), "NL": Decimal("0.21")}
+      FX = {"EUR": Decimal("1"), "USD": Decimal("1.08"), "GBP": Decimal("0.86")}
+
+
+      def compute_total(items, country="DE", *, currency="EUR"):
+          """Gross total of `items` — (unit_price, qty) pairs, prices in EUR as strings — including the VAT of
+          `country`, converted to `currency` (FX = units per EUR) and rounded half up to cents once, at the end."""
+          net = sum((Decimal(price) * qty for price, qty in items), Decimal(0))
+          gross = net * (1 + VAT[country]) * FX[currency]
+          return gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    _stage/main1/tests/test_pricing.py: |
+      from decimal import Decimal
+
+      from shop.pricing import compute_total
+
+
+      def test_total_de():
+          assert compute_total([("10.00", 2), ("5.00", 1)]) == Decimal("29.75")
+
+
+      def test_total_fr():
+          assert compute_total([("10.00", 1)], "FR") == Decimal("12.00")
+
+
+      def test_currency():
+          assert compute_total([("10.00", 1)], "DE", currency="USD") == Decimal("12.85")
+    _stage/main1/CHANGELOG.md: |
+      # Changelog
+
+      ## Unreleased
+
+      - Renamed `calc_total` to `compute_total`.
+      - New keyword-only `currency` argument (EUR, USD, GBP).
+
+      ## 1.2.0
+
+      - Pricing module with VAT for DE, FR and NL.
+    _stage/main1/config.json: |
+      {
+        "name": "shop",
+        "version": "1.2.1",
+        "default_country": "DE",
+        "rounding": "half-up",
+        "currencies": ["EUR", "USD", "GBP"]
+      }
+    _stage/main2/shop/pricing.py: |
+      """Price calculations."""
+      from decimal import ROUND_HALF_UP, Decimal
+
+      VAT = {"DE": Decimal("0.19"), "FR": Decimal("0.20"), "NL": Decimal("0.21"), "AT": Decimal("0.20")}
+      FX = {"EUR": Decimal("1"), "USD": Decimal("1.08"), "GBP": Decimal("0.86")}
+
+
+      def compute_total(items, country="DE", *, currency="EUR"):
+          """Gross total of `items` — (unit_price, qty) pairs, prices in EUR as strings — including the VAT of
+          `country`, converted to `currency` (FX = units per EUR) and rounded half up to cents once, at the end."""
+          net = sum((Decimal(price) * qty for price, qty in items), Decimal(0))
+          gross = net * (1 + VAT[country]) * FX[currency]
+          return gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    _stage/main2/tests/test_pricing.py: |
+      from decimal import Decimal
+
+      from shop.pricing import compute_total
+
+
+      def test_total_de():
+          assert compute_total([("10.00", 2), ("5.00", 1)]) == Decimal("29.75")
+
+
+      def test_total_fr():
+          assert compute_total([("10.00", 1)], "FR") == Decimal("12.00")
+
+
+      def test_currency():
+          assert compute_total([("10.00", 1)], "DE", currency="USD") == Decimal("12.85")
+
+
+      def test_total_at():
+          assert compute_total([("10.00", 3)], "AT") == Decimal("36.00")
+    _stage/main2/CHANGELOG.md: |
+      # Changelog
+
+      ## Unreleased
+
+      - Renamed `calc_total` to `compute_total`.
+      - New keyword-only `currency` argument (EUR, USD, GBP).
+      - VAT for Austria (AT).
+
+      ## 1.2.0
+
+      - Pricing module with VAT for DE, FR and NL.
+    _stage/main2/config.json: |
+      {
+        "name": "shop",
+        "version": "1.2.1",
+        "default_country": "DE",
+        "rounding": "half-up",
+        "currencies": ["EUR", "USD", "GBP"],
+        "countries": ["DE", "FR", "NL", "AT"]
+      }
+    _stage/feature1/shop/pricing.py: |
+      """Price calculations."""
+      from decimal import ROUND_HALF_UP, Decimal
+
+      VAT = {"DE": Decimal("0.19"), "FR": Decimal("0.20"), "NL": Decimal("0.21")}
+      TIERS = {"silver": Decimal("0.03"), "gold": Decimal("0.05"), "platinum": Decimal("0.08")}
+
+
+      def calc_total(items, country="DE", tier=None):
+          """Gross total of `items` — (unit_price, qty) pairs, prices as strings — including the VAT of `country`,
+          rounded half up to cents. A customer `tier` ("silver", "gold", "platinum") gets its discount on the net
+          amount, before VAT."""
+          net = sum((Decimal(price) * qty for price, qty in items), Decimal(0))
+          if tier is not None:
+              net = net * (1 - TIERS[tier])
+          gross = net * (1 + VAT[country])
+          return gross.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    _stage/feature1/tests/test_pricing.py: |
+      from decimal import Decimal
+
+      import pytest
+      from shop.pricing import calc_total
+
+
+      def test_total_de():
+          assert calc_total([("10.00", 2), ("5.00", 1)]) == Decimal("29.75")
+
+
+      def test_total_fr():
+          assert calc_total([("10.00", 1)], "FR") == Decimal("12.00")
+
+
+      def test_gold_tier():
+          assert calc_total([("100.00", 1)], "DE", tier="gold") == Decimal("113.05")
+
+
+      def test_unknown_tier():
+          with pytest.raises(KeyError):
+              calc_total([("1.00", 1)], tier="diamond")
+    _stage/feature1/CHANGELOG.md: |
+      # Changelog
+
+      ## Unreleased
+
+      - Customer tiers (silver, gold, platinum) with a discount before VAT.
+
+      ## 1.2.0
+
+      - Pricing module with VAT for DE, FR and NL.
+    _stage/feature1/config.json: |
+      {
+        "name": "shop",
+        "version": "1.3.0-dev",
+        "default_country": "DE",
+        "rounding": "half-up",
+        "tiers": {"silver": 3, "gold": 5, "platinum": 8}
+      }
+    _stage/feature2/shop/cart.py: |
+      """Shopping cart."""
+      from .pricing import calc_total
+
+
+      class Cart:
+          def __init__(self, country="DE", tier=None):
+              self.country = country
+              self.tier = tier
+              self.items = []
+
+          def add(self, price, qty=1):
+              if qty <= 0:
+                  raise ValueError("qty must be positive")
+              self.items.append((price, qty))
+              return self
+
+          def total(self):
+              return calc_total(self.items, self.country, tier=self.tier)
+    _stage/feature2/tests/test_cart.py: |
+      from decimal import Decimal
+
+      from shop.cart import Cart
+
+
+      def test_cart_total():
+          assert Cart("FR", tier="silver").add("20.00", 3).total() == Decimal("69.84")
+    _stage/feature2/CHANGELOG.md: |
+      # Changelog
+
+      ## Unreleased
+
+      - Customer tiers (silver, gold, platinum) with a discount before VAT.
+      - `Cart` helper (`shop.cart`).
+
+      ## 1.2.0
+
+      - Pricing module with VAT for DE, FR and NL.
+  commands:
+  - 'cd store && git init -q -b main && git add -A && git commit -qm ''chore: pricing module 1.2.0'''
+  - 'cd store && git checkout -q -b feature/tiered-discounts && cp -R ../_stage/feature1/. . && git add -A && git commit -qm ''feat: customer tiers with a discount before VAT'' && cp -R ../_stage/feature2/. . && git add -A && git commit -qm ''feat: Cart helper'''
+  - 'cd store && git checkout -q main && cp -R ../_stage/main1/. . && git add -A && git commit -qm ''refactor: rename calc_total to compute_total, add currency'' && cp -R ../_stage/main2/. . && git add -A && git commit -qm ''feat: VAT for Austria'''
+  - rm -rf _stage
+checks:
+- id: merge-commit
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import hashlib, io, subprocess, tarfile, tempfile
+    def norm(t):
+        return "\n".join(l.rstrip() for l in t.strip().splitlines())
+    def main_parents():
+        r = git("rev-list", "--parents", "-n", "1", "refs/heads/main", cwd=path("store"))
+        parts = r.stdout.split()
+        assert r.returncode == 0 and len(parts) == 3, f"main must point to a merge commit with exactly two parents (rev-list --parents: {parts})"
+        return parts
+    def extract(rev, d):
+        r = subprocess.run(["git", "archive", "--format=tar", rev], cwd=str(path("store")), capture_output=True, timeout=60)
+        assert r.returncode == 0, f"cannot read the tree of {rev}"
+        with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+            tf.extractall(d)
+        return Path(d)
+    head, p1, p2 = main_parents()
+    feat = git("rev-parse", "refs/heads/feature/tiered-discounts", cwd=path("store")).stdout.strip()
+    assert p2 == feat, "the second parent of main's merge commit must be the unchanged tip of feature/tiered-discounts"
+    for rev, files, what in ((p1, {'.gitignore': '7da60b4ba3747566134af2634336235460baf5e12bfb1750f17d420546745975', 'conftest.py': 'af1fdf40436037573f03b505e582abc0fc806dc66604adaa8165580f6585e4cb', 'shop/__init__.py': '0c39d21ec133c1cc53e56e59538b207e5bba490f485fad2fcfdbe1f037f19956', 'shop/pricing.py': '4cdd7828953d7866665ee807bf4f4301df8d9935280aa79112ff7d6fb86dcb8a', 'tests/test_pricing.py': '7cf85633488ea5c092ec60ccee98685619af176a8e92e800fc1de308f5c7dceb', 'CHANGELOG.md': '95c4150340910b37dd082810888923bf2ebcf1f3b4181e812114a60af57587e5', 'config.json': 'ef44493458b5d71077918765b5ccc151042e16176807de07cea3b15013502d72'}, "first parent / previous main tip"), (p2, {'.gitignore': '7da60b4ba3747566134af2634336235460baf5e12bfb1750f17d420546745975', 'conftest.py': 'af1fdf40436037573f03b505e582abc0fc806dc66604adaa8165580f6585e4cb', 'shop/__init__.py': '0c39d21ec133c1cc53e56e59538b207e5bba490f485fad2fcfdbe1f037f19956', 'shop/pricing.py': '95ff9dea7b8db7c91c4546a0d9307d71702b013b7136268606ee51b30d2dc258', 'tests/test_pricing.py': 'd599ee1aa076d12264b7705d0738b53b10e771e0714833c76a48ab0f2182e26d', 'CHANGELOG.md': 'aaba7954a68dec3a7096da8310bcb36513f167fc8792286b9ff94939b93171ad', 'config.json': '4d819b19393d198504b8ce1a96837702fa9a8caa6b46f2eee4f75a3dff8df8db', 'shop/cart.py': 'c6a4928923c3de6f8dffc0f923b6cb270fb53faed55a3729a6c16f57634a9faf', 'tests/test_cart.py': '3f79d85acf2e03d80f0af8125bc1fd3540fceb8eb328a740497b4b9cab00ddc4'}, "second parent / feature tip")):
+        for f, want in files.items():
+            got = git("show", f"{rev}:{f}", cwd=path("store"))
+            same = got.returncode == 0 and hashlib.sha256(norm(got.stdout).encode("utf-8")).hexdigest() == want
+            assert same, f"{what}: {f} differs from the original — wrong parents or rewritten history"
+- id: pricing-resolved
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    import hashlib, io, subprocess, tarfile, tempfile
+    def norm(t):
+        return "\n".join(l.rstrip() for l in t.strip().splitlines())
+    def main_parents():
+        r = git("rev-list", "--parents", "-n", "1", "refs/heads/main", cwd=path("store"))
+        parts = r.stdout.split()
+        assert r.returncode == 0 and len(parts) == 3, f"main must point to a merge commit with exactly two parents (rev-list --parents: {parts})"
+        return parts
+    def extract(rev, d):
+        r = subprocess.run(["git", "archive", "--format=tar", rev], cwd=str(path("store")), capture_output=True, timeout=60)
+        assert r.returncode == 0, f"cannot read the tree of {rev}"
+        with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+            tf.extractall(d)
+        return Path(d)
+    import inspect, re
+    main_parents()
+    with tempfile.TemporaryDirectory() as d:
+        root = extract("refs/heads/main", d)
+        bad = [str(p.relative_to(root)) for p in root.rglob("*") if p.is_file() and re.search(r"(?m)^(<{7}|={7}|>{7})( |$)", p.read_text(errors="replace"))]
+        assert not bad, f"conflict markers committed in {bad}"
+        left = [str(p.relative_to(root)) for p in root.rglob("*.py") if "calc_total" in p.read_text()]
+        assert not left, f"calc_total still appears in {left}"
+        pricing = load("pricing_at_head", root / "shop" / "pricing.py")
+        assert hasattr(pricing, "compute_total") and not hasattr(pricing, "calc_total"), "pricing.py must define compute_total and no calc_total"
+        params = inspect.signature(pricing.compute_total).parameters
+        kinds = {n: (p.kind.name, p.default) for n, p in params.items()}
+        assert list(params)[:2] == ["items", "country"] and kinds["country"] == ("POSITIONAL_OR_KEYWORD", "DE"), kinds
+        assert kinds.get("tier") == ("KEYWORD_ONLY", None) and kinds.get("currency") == ("KEYWORD_ONLY", "EUR"), f"tier and currency must be keyword-only with defaults None / 'EUR': {kinds}"
+        for (args, kw), want in zip([([[('19.99', 3), ('5.00', 2)], 'AT'], {'tier': 'platinum', 'currency': 'GBP'}), ([[('100.00', 1)], 'DE'], {'tier': 'gold'}), ([[('0.99', 7)], 'NL'], {'currency': 'USD'}), ([[('12.34', 5), ('0.01', 1)], 'FR'], {'tier': 'silver', 'currency': 'USD'}), ([[('250.00', 2)]], {}), ([[('3.33', 3)], 'DE'], {'tier': None, 'currency': 'EUR'})], ['66.43', '113.05', '9.06', '77.58', '595.00', '11.89']):
+            got = str(pricing.compute_total(*args, **kw))
+            assert got == want, f"compute_total{tuple(args)} {kw} = {got}, expected {want}"
+        sys.path.insert(0, str(root))
+        from shop.cart import Cart
+        assert str(Cart("AT", tier="gold").add("10.00", 2).add("2.50").total()) == "25.65", "Cart.total() must use compute_total with the tier"
+- id: tests-pass
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    import hashlib, io, subprocess, tarfile, tempfile
+    def norm(t):
+        return "\n".join(l.rstrip() for l in t.strip().splitlines())
+    def main_parents():
+        r = git("rev-list", "--parents", "-n", "1", "refs/heads/main", cwd=path("store"))
+        parts = r.stdout.split()
+        assert r.returncode == 0 and len(parts) == 3, f"main must point to a merge commit with exactly two parents (rev-list --parents: {parts})"
+        return parts
+    def extract(rev, d):
+        r = subprocess.run(["git", "archive", "--format=tar", rev], cwd=str(path("store")), capture_output=True, timeout=60)
+        assert r.returncode == 0, f"cannot read the tree of {rev}"
+        with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+            tf.extractall(d)
+        return Path(d)
+    import re
+    main_parents()
+    with tempfile.TemporaryDirectory() as d:
+        root = extract("refs/heads/main", d)
+        tests = "\n".join(p.read_text() for p in sorted((root / "tests").glob("test_*.py")))
+        for name in ("test_total_de", "test_total_fr", "test_currency", "test_total_at", "test_gold_tier", "test_unknown_tier", "test_cart_total"):
+            assert re.search(rf"def {name}\(", tests), f"test {name} was dropped"
+        for literal in ('"113.05"', '"69.84"', '"diamond"', '"12.85"', '"36.00"'):
+            assert literal in tests, f"expected value {literal} of a test changed or disappeared"
+        pytest_in(root, 7)
+- id: changelog
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import hashlib, io, subprocess, tarfile, tempfile
+    def norm(t):
+        return "\n".join(l.rstrip() for l in t.strip().splitlines())
+    def main_parents():
+        r = git("rev-list", "--parents", "-n", "1", "refs/heads/main", cwd=path("store"))
+        parts = r.stdout.split()
+        assert r.returncode == 0 and len(parts) == 3, f"main must point to a merge commit with exactly two parents (rev-list --parents: {parts})"
+        return parts
+    def extract(rev, d):
+        r = subprocess.run(["git", "archive", "--format=tar", rev], cwd=str(path("store")), capture_output=True, timeout=60)
+        assert r.returncode == 0, f"cannot read the tree of {rev}"
+        with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+            tf.extractall(d)
+        return Path(d)
+    main_parents()
+    text = git("show", "refs/heads/main:CHANGELOG.md", cwd=path("store")).stdout
+    got = [l.rstrip() for l in text.splitlines() if l.strip()]
+    assert got == ['# Changelog', '## Unreleased', '- Renamed `calc_total` to `compute_total`.', '- New keyword-only `currency` argument (EUR, USD, GBP).', '- VAT for Austria (AT).', '- Customer tiers (silver, gold, platinum) with a discount before VAT.', '- `Cart` helper (`shop.cart`).', '## 1.2.0', '- Pricing module with VAT for DE, FR and NL.'], "CHANGELOG.md should read (blank lines ignored): " + " | ".join(['# Changelog', '## Unreleased', '- Renamed `calc_total` to `compute_total`.', '- New keyword-only `currency` argument (EUR, USD, GBP).', '- VAT for Austria (AT).', '- Customer tiers (silver, gold, platinum) with a discount before VAT.', '- `Cart` helper (`shop.cart`).', '## 1.2.0', '- Pricing module with VAT for DE, FR and NL.']) + "  — got: " + " | ".join(got)
+- id: config
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import hashlib, io, subprocess, tarfile, tempfile
+    def norm(t):
+        return "\n".join(l.rstrip() for l in t.strip().splitlines())
+    def main_parents():
+        r = git("rev-list", "--parents", "-n", "1", "refs/heads/main", cwd=path("store"))
+        parts = r.stdout.split()
+        assert r.returncode == 0 and len(parts) == 3, f"main must point to a merge commit with exactly two parents (rev-list --parents: {parts})"
+        return parts
+    def extract(rev, d):
+        r = subprocess.run(["git", "archive", "--format=tar", rev], cwd=str(path("store")), capture_output=True, timeout=60)
+        assert r.returncode == 0, f"cannot read the tree of {rev}"
+        with tarfile.open(fileobj=io.BytesIO(r.stdout)) as tf:
+            tf.extractall(d)
+        return Path(d)
+    import json
+    main_parents()
+    r = git("show", "refs/heads/main:config.json", cwd=path("store"))
+    try:
+        cfg = json.loads(r.stdout)
+    except ValueError as exc:
+        raise AssertionError(f"config.json at main is not valid JSON: {exc}")
+    assert cfg == {'name': 'shop', 'version': '1.3.0', 'default_country': 'DE', 'rounding': 'half-up', 'currencies': ['EUR', 'USD', 'GBP'], 'countries': ['DE', 'FR', 'NL', 'AT'], 'tiers': {'silver': 3, 'gold': 5, 'platinum': 8}}, f"config.json = {cfg}, expected {{'name': 'shop', 'version': '1.3.0', 'default_country': 'DE', 'rounding': 'half-up', 'currencies': ['EUR', 'USD', 'GBP'], 'countries': ['DE', 'FR', 'NL', 'AT'], 'tiers': {'silver': 3, 'gold': 5, 'platinum': 8}}}"
+- {id: clean-tree, type: git_clean, repo: store}

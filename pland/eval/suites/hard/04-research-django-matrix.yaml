@@ -1,0 +1,284 @@
+# hard 04 — research: endoflife.date (Django + Python) combined with per-release PyPI requires_python; checked live with drift tolerance
+id: hard-research-django-matrix
+title: Django/Python compatibility matrix from endoflife.date + per-release PyPI metadata (verified live)
+category: web
+prompt: |
+  Build a Django / Python compatibility matrix from live data and write it to `django_matrix.md`:
+
+  1. From the endoflife.date API (`https://endoflife.date/api/django.json` and
+     `https://endoflife.date/api/python.json`) take every Django release cycle and every Python release cycle that
+     is still supported today (its `eol` date is after today's date).
+  2. For each supported Django cycle take its latest patch release (`latest` on endoflife.date) and look up the
+     `requires_python` metadata of exactly that release on PyPI (`https://pypi.org/pypi/Django/<version>/json`).
+  3. The Python cycles a Django release supports are the supported Python cycles `X.Y` whose version `X.Y`
+     satisfies that `requires_python` specifier (PEP 440; e.g. `3.13` satisfies `>=3.12`). Use only this rule — no
+     other compatibility information.
+
+  Write a Markdown table with one row per supported Django cycle, newest cycle first, with exactly the columns
+  `Django | LTS | Latest | Requires-Python | Python cycles | EOL | Days left` — LTS as `yes`/`no`, Python cycles as
+  a comma-separated list in ascending order, EOL as `YYYY-MM-DD`, Days left = number of days from today until the
+  EOL date. Below the table add the line `Recommended: Django <cycle> on Python <cycle>` naming the newest supported
+  LTS Django cycle and the newest Python cycle it supports. Use the live data, not what you remember: it changes
+  over time.
+checks:
+- {id: matrix-exists, type: file_exists, path: django_matrix.md}
+- id: django-rows
+  type: python
+  code: |
+    import html, json, re, urllib.request
+    from datetime import date, timedelta
+    def fetch(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "pland-eval"})
+        return json.load(urllib.request.urlopen(req, timeout=40))
+    def vt(v):
+        return tuple(int(x) for x in re.findall(r"\d+", v))
+    def admits(spec, ver):
+        try:
+            from packaging.specifiers import SpecifierSet
+            return SpecifierSet(spec or "").contains(ver, prereleases=True)
+        except ImportError:
+            pass
+        v = vt(ver)
+        for part in [p.strip() for p in (spec or "").split(",") if p.strip()]:
+            m = re.fullmatch(r"(~=|==|!=|<=|>=|<|>)\s*([0-9.]+?)(\.\*)?", part)
+            if not m:
+                continue
+            op, s, star = m.group(1), vt(m.group(2)), m.group(3)
+            if star:
+                if (op == "==") != (v[:len(s)] == s):
+                    return False
+                continue
+            n = max(len(v), len(s))
+            a, b = v + (0,) * (n - len(v)), s + (0,) * (n - len(s))
+            ok = {"==": a == b, "!=": a != b, "<=": a <= b, ">=": a >= b, "<": a < b, ">": a > b,
+                  "~=": a >= b and v[:len(s) - 1] == s[:-1]}[op]
+            if not ok:
+                return False
+        return True
+    def supported(cycles, today):
+        # -> (cycles that must be listed, cycles that may be listed): EOL after today; +-1 day and brand-new cycles are optional
+        req, opt = [], []
+        for c in cycles:
+            eol = c.get("eol")
+            d = date.fromisoformat(eol) if isinstance(eol, str) else None
+            if eol is False or (d and d > today + timedelta(days=1)):
+                rel = c.get("releaseDate")
+                (opt if rel and date.fromisoformat(rel) >= today - timedelta(days=2) else req).append(c)
+            elif d and abs((d - today).days) <= 1:
+                opt.append(c)
+        return req, opt
+    def ok_latest(c, today):
+        ok = {c["latest"]}
+        if c.get("latestReleaseDate") and date.fromisoformat(c["latestReleaseDate"]) >= today - timedelta(days=2):
+            parts = c["latest"].split(".")
+            if parts[-1].isdigit() and int(parts[-1]) > 0:
+                ok.add(".".join(parts[:-1] + [str(int(parts[-1]) - 1)]))
+        return ok
+    def table(doc):
+        out = []
+        for line in doc.splitlines():
+            s = line.strip()
+            if s.startswith("|"):
+                cells = [html.unescape(x).strip().strip("`*_ ") for x in s.strip("|").split("|")]
+                if cells and re.fullmatch(r"(?i)(django\s*)?\d+\.\d+", cells[0]):
+                    out.append((re.sub(r"(?i)django\s*", "", cells[0]), cells, s))
+        return out
+    _RP = {}
+    def requires_python(version):
+        if version not in _RP:
+            _RP[version] = fetch(f"https://pypi.org/pypi/Django/{version}/json")["info"].get("requires_python") or ""
+        return _RP[version]
+    def live():
+        today = date.today()
+        dj = fetch("https://endoflife.date/api/django.json")
+        py = fetch("https://endoflife.date/api/python.json")
+        return today, dj, supported(dj, today), supported(py, today)
+    today, dj, (dj_req, dj_opt), _ = live()
+    rows = table(path("django_matrix.md").read_text(encoding="utf-8"))
+    listed = [r[0] for r in rows]
+    assert len(listed) == len(set(listed)), f"duplicate rows: {listed}"
+    missing = [c["cycle"] for c in dj_req if c["cycle"] not in listed]
+    extra = [x for x in listed if x not in {c["cycle"] for c in dj_req + dj_opt}]
+    assert not missing and not extra, f"supported Django cycles today: {[c['cycle'] for c in dj_req]}; missing {missing}, not supported {extra}"
+    for cyc, cells, line in rows:
+        c = next(x for x in dj if x["cycle"] == cyc)
+        assert len(cells) >= 7, f"row for {cyc} needs 7 columns: {line}"
+        assert cells[1].lower() == ("yes" if c.get("lts") else "no"), f"{cyc}: LTS should be {'yes' if c.get('lts') else 'no'}: {line}"
+        assert cells[2] in ok_latest(c, today), f"{cyc}: latest patch is {c['latest']}, row says {cells[2]!r}"
+        assert c["eol"] in cells[5], f"{cyc}: EOL {c['eol']} missing: {line}"
+        days = re.search(r"-?\d+", cells[6])
+        want = (date.fromisoformat(c["eol"]) - today).days
+        assert days and abs(int(days.group()) - want) <= 1, f"{cyc}: days left should be {want}: {line}"
+    assert listed == sorted(listed, key=vt, reverse=True), f"rows must be newest cycle first: {listed}"
+- id: requires-python
+  type: python
+  code: |
+    import html, json, re, urllib.request
+    from datetime import date, timedelta
+    def fetch(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "pland-eval"})
+        return json.load(urllib.request.urlopen(req, timeout=40))
+    def vt(v):
+        return tuple(int(x) for x in re.findall(r"\d+", v))
+    def admits(spec, ver):
+        try:
+            from packaging.specifiers import SpecifierSet
+            return SpecifierSet(spec or "").contains(ver, prereleases=True)
+        except ImportError:
+            pass
+        v = vt(ver)
+        for part in [p.strip() for p in (spec or "").split(",") if p.strip()]:
+            m = re.fullmatch(r"(~=|==|!=|<=|>=|<|>)\s*([0-9.]+?)(\.\*)?", part)
+            if not m:
+                continue
+            op, s, star = m.group(1), vt(m.group(2)), m.group(3)
+            if star:
+                if (op == "==") != (v[:len(s)] == s):
+                    return False
+                continue
+            n = max(len(v), len(s))
+            a, b = v + (0,) * (n - len(v)), s + (0,) * (n - len(s))
+            ok = {"==": a == b, "!=": a != b, "<=": a <= b, ">=": a >= b, "<": a < b, ">": a > b,
+                  "~=": a >= b and v[:len(s) - 1] == s[:-1]}[op]
+            if not ok:
+                return False
+        return True
+    def supported(cycles, today):
+        # -> (cycles that must be listed, cycles that may be listed): EOL after today; +-1 day and brand-new cycles are optional
+        req, opt = [], []
+        for c in cycles:
+            eol = c.get("eol")
+            d = date.fromisoformat(eol) if isinstance(eol, str) else None
+            if eol is False or (d and d > today + timedelta(days=1)):
+                rel = c.get("releaseDate")
+                (opt if rel and date.fromisoformat(rel) >= today - timedelta(days=2) else req).append(c)
+            elif d and abs((d - today).days) <= 1:
+                opt.append(c)
+        return req, opt
+    def ok_latest(c, today):
+        ok = {c["latest"]}
+        if c.get("latestReleaseDate") and date.fromisoformat(c["latestReleaseDate"]) >= today - timedelta(days=2):
+            parts = c["latest"].split(".")
+            if parts[-1].isdigit() and int(parts[-1]) > 0:
+                ok.add(".".join(parts[:-1] + [str(int(parts[-1]) - 1)]))
+        return ok
+    def table(doc):
+        out = []
+        for line in doc.splitlines():
+            s = line.strip()
+            if s.startswith("|"):
+                cells = [html.unescape(x).strip().strip("`*_ ") for x in s.strip("|").split("|")]
+                if cells and re.fullmatch(r"(?i)(django\s*)?\d+\.\d+", cells[0]):
+                    out.append((re.sub(r"(?i)django\s*", "", cells[0]), cells, s))
+        return out
+    _RP = {}
+    def requires_python(version):
+        if version not in _RP:
+            _RP[version] = fetch(f"https://pypi.org/pypi/Django/{version}/json")["info"].get("requires_python") or ""
+        return _RP[version]
+    def live():
+        today = date.today()
+        dj = fetch("https://endoflife.date/api/django.json")
+        py = fetch("https://endoflife.date/api/python.json")
+        return today, dj, supported(dj, today), supported(py, today)
+    today, dj, (dj_req, dj_opt), (py_req, py_opt) = live()
+    rows = table(path("django_matrix.md").read_text(encoding="utf-8"))
+    assert rows, "no table rows"
+    norm = lambda s: re.sub(r"[\s`\\]", "", html.unescape(s))
+    for cyc, cells, line in rows:
+        c = next((x for x in dj if x["cycle"] == cyc), None)
+        assert c is not None and len(cells) >= 7, f"bad row: {line}"
+        version = cells[2] if cells[2] in ok_latest(c, today) else c["latest"]
+        rp = requires_python(version)
+        assert norm(cells[3]) == norm(rp), f"{cyc}: Requires-Python of Django {version} on PyPI is {rp!r}, row says {cells[3]!r}"
+        want = sorted((p["cycle"] for p in py_req if admits(rp, p["cycle"])), key=vt)
+        maybe = {p["cycle"] for p in py_opt if admits(rp, p["cycle"])}
+        got = re.findall(r"\d+\.\d+", cells[4])
+        assert [x for x in got if x not in maybe] == want, f"{cyc}: supported Python cycles admitted by {rp!r} are {want} (ascending); row says {cells[4]!r}"
+- id: recommended
+  type: python
+  code: |
+    import html, json, re, urllib.request
+    from datetime import date, timedelta
+    def fetch(url):
+        req = urllib.request.Request(url, headers={"User-Agent": "pland-eval"})
+        return json.load(urllib.request.urlopen(req, timeout=40))
+    def vt(v):
+        return tuple(int(x) for x in re.findall(r"\d+", v))
+    def admits(spec, ver):
+        try:
+            from packaging.specifiers import SpecifierSet
+            return SpecifierSet(spec or "").contains(ver, prereleases=True)
+        except ImportError:
+            pass
+        v = vt(ver)
+        for part in [p.strip() for p in (spec or "").split(",") if p.strip()]:
+            m = re.fullmatch(r"(~=|==|!=|<=|>=|<|>)\s*([0-9.]+?)(\.\*)?", part)
+            if not m:
+                continue
+            op, s, star = m.group(1), vt(m.group(2)), m.group(3)
+            if star:
+                if (op == "==") != (v[:len(s)] == s):
+                    return False
+                continue
+            n = max(len(v), len(s))
+            a, b = v + (0,) * (n - len(v)), s + (0,) * (n - len(s))
+            ok = {"==": a == b, "!=": a != b, "<=": a <= b, ">=": a >= b, "<": a < b, ">": a > b,
+                  "~=": a >= b and v[:len(s) - 1] == s[:-1]}[op]
+            if not ok:
+                return False
+        return True
+    def supported(cycles, today):
+        # -> (cycles that must be listed, cycles that may be listed): EOL after today; +-1 day and brand-new cycles are optional
+        req, opt = [], []
+        for c in cycles:
+            eol = c.get("eol")
+            d = date.fromisoformat(eol) if isinstance(eol, str) else None
+            if eol is False or (d and d > today + timedelta(days=1)):
+                rel = c.get("releaseDate")
+                (opt if rel and date.fromisoformat(rel) >= today - timedelta(days=2) else req).append(c)
+            elif d and abs((d - today).days) <= 1:
+                opt.append(c)
+        return req, opt
+    def ok_latest(c, today):
+        ok = {c["latest"]}
+        if c.get("latestReleaseDate") and date.fromisoformat(c["latestReleaseDate"]) >= today - timedelta(days=2):
+            parts = c["latest"].split(".")
+            if parts[-1].isdigit() and int(parts[-1]) > 0:
+                ok.add(".".join(parts[:-1] + [str(int(parts[-1]) - 1)]))
+        return ok
+    def table(doc):
+        out = []
+        for line in doc.splitlines():
+            s = line.strip()
+            if s.startswith("|"):
+                cells = [html.unescape(x).strip().strip("`*_ ") for x in s.strip("|").split("|")]
+                if cells and re.fullmatch(r"(?i)(django\s*)?\d+\.\d+", cells[0]):
+                    out.append((re.sub(r"(?i)django\s*", "", cells[0]), cells, s))
+        return out
+    _RP = {}
+    def requires_python(version):
+        if version not in _RP:
+            _RP[version] = fetch(f"https://pypi.org/pypi/Django/{version}/json")["info"].get("requires_python") or ""
+        return _RP[version]
+    def live():
+        today = date.today()
+        dj = fetch("https://endoflife.date/api/django.json")
+        py = fetch("https://endoflife.date/api/python.json")
+        return today, dj, supported(dj, today), supported(py, today)
+    today, dj, (dj_req, dj_opt), (py_req, py_opt) = live()
+    doc = path("django_matrix.md").read_text(encoding="utf-8")
+    m = re.search(r"(?im)^\W*recommended\W*:?\s*django\s+(\d+\.\d+)\W+on\s+python\s+(\d+\.\d+)", doc)
+    assert m, "no line 'Recommended: Django <cycle> on Python <cycle>'"
+    ok = set()
+    for pool in (dj_req, dj_req + dj_opt):
+        lts = [c for c in pool if c.get("lts")]
+        if not lts:
+            continue
+        best = max(lts, key=lambda c: vt(c["cycle"]))
+        rp = requires_python(best["latest"])
+        for pys in (py_req, py_req + py_opt):
+            cand = [p["cycle"] for p in pys if admits(rp, p["cycle"])]
+            if cand:
+                ok.add((best["cycle"], max(cand, key=vt)))
+    assert (m.group(1), m.group(2)) in ok, f"recommended pair should be {sorted(ok)}, got {(m.group(1), m.group(2))}"

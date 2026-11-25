@@ -87,3 +87,50 @@ def test_agent_publishes_deltas(rt, script):
     rt.agent("default").run("hi")
     assert "".join(e["text"] for e in events) == "final answer"
     assert isinstance(LLMResponse(), LLMResponse)
+
+
+def test_stream_broken_mid_response_is_retried(monkeypatch):
+    monkeypatch.setattr("time.sleep", lambda s: None)
+    attempts = {"n": 0}
+
+    class Broken(httpx.SyncByteStream):
+        def __iter__(self):
+            yield b'data: {"choices": [{"delta": {"content": "partial"}}]}\n\n'
+            raise httpx.RemoteProtocolError("peer closed connection without sending complete message body")
+
+    def handler(request):
+        attempts["n"] += 1
+        if attempts["n"] == 1:
+            return httpx.Response(200, stream=Broken())
+        return httpx.Response(200, content=sse([{"choices": [{"delta": {"content": "full answer"}, "finish_reason": "stop"}]}]))
+
+    seen = []
+    resp = client(handler).chat([{"role": "user", "content": "hi"}], on_delta=lambda k, t: seen.append(k))
+    assert resp.content == "full answer" and attempts["n"] == 2
+    assert seen == ["content", "reset", "content"]
+
+
+def test_per_call_thinking_override():
+    from pland.config import ModelConfig
+    from pland.llm.openai_compat import OpenAICompatClient
+
+    c = OpenAICompatClient(ModelConfig(provider="deepseek", api_key="k", thinking=True))
+    msgs = [{"role": "assistant", "content": "", "reasoning_content": "r"}, {"role": "user", "content": "x"}]
+    on = c._payload(msgs, [{"type": "function"}], False, None)
+    off = c._payload(msgs, [{"type": "function"}], False, 8, 0, thinking=False)
+    assert on["thinking"] == {"type": "enabled"} and "temperature" not in on and on["messages"][0].get("reasoning_content")
+    assert off["thinking"] == {"type": "disabled"} and off["temperature"] == 0 and "reasoning_content" not in off["messages"][0]
+
+
+def test_stream_reads_hkgai_reasoning_deltas():
+    """HKGAI streams its thinking as `reasoning`, not DeepSeek's `reasoning_content` (probed 2026-10-25)."""
+    chunks = [{"choices": [{"delta": {"role": "assistant", "reasoning": "9 stay, "}}]},
+              {"choices": [{"delta": {"reasoning": "buys 18"}}]},
+              {"choices": [{"delta": {"content": "27"}, "finish_reason": "stop"}],
+               "usage": {"prompt_tokens": 108, "completion_tokens": 152, "prompt_tokens_details": {"cached_tokens": 0}}}]
+    cfg = ModelConfig(provider="hkgai", api_key="test-key", base_url="https://api.hkgai.example.hk/v1", model="hk-1")
+    c = OpenAICompatClient(cfg, transport=httpx.MockTransport(lambda request: httpx.Response(200, content=sse(chunks))))
+    kinds = []
+    resp = c.chat([{"role": "user", "content": "sheep?"}], on_delta=lambda k, t: kinds.append(k))
+    assert resp.reasoning_content == "9 stay, buys 18" and resp.content == "27"
+    assert kinds == ["reasoning", "reasoning", "content"] and resp.usage.completion_tokens == 152

@@ -1,0 +1,18 @@
+# PlanD eval suite `hard` (format: pland/eval/SCHEMA.md)
+description: |-
+  Hard suite: 8 long, discriminating tasks, each fully specified by prompt + setup + simulated-user replies and
+  verified only by objective checks: a thread-safe TTL/LRU cache with eviction callbacks and per-key factories
+  (hidden tests, incl. concurrency), a debugging task with six interacting bugs in a 9-module package (one bug
+  only visible to a hidden spec test), a data-cleaning script with many edge cases (encodings, BOM, CRLF,
+  whitespace, time zones, units, half-up rounding, duplicates) re-run on unseen data, a research task combining
+  endoflife.date and per-release PyPI metadata verified live at check time, a three-bot implement/review loop on a
+  strict SemVer library with hidden tests, an under-specified payout run that needs two separate clarifications
+  and an approved push, a cross-agent task where the needed price list lives only in another bot's private
+  workspace, and a git merge with textual and semantic conflicts resolved by stated rules.
+defaults:
+  timeout: 1500
+  max_iterations: 60
+  memory: carry
+  hitl:
+    approvals: approve
+    default_reply: Use your best judgement and state any assumption you make.

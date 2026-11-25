@@ -31,6 +31,9 @@ ACTIVITY_FIELDS: dict[str, tuple[str, ...]] = {
     "loop.detected": ("reason",),
     "experience.added": ("outcome", "lessons"),
     "approval.auto": ("category", "grant", "summary"),
+    "approval.smart": ("category", "summary", "verdict"),
+    "memory.corrected": ("action", "old_text"),
+    "security.injection_flagged": ("source", "patterns"),
 }
 ACTIVITY_LIMIT = 500
 _EXP_BLOCK = re.compile(r"<relevant_past_experience\b[^>]*>(.*?)</relevant_past_experience>", re.DOTALL)
@@ -196,12 +199,15 @@ def memory_view(profile: "Profile", *, experiences: int = 100, events: int = 60)
         out_notes[target] = {"entries": notes.entries(target), "used": used, "limit": cap}
     skills = []
     store = SkillStore(profile)
+    usage = store.usage()
     for s in store.list():
+        # Read the file directly: `SkillStore.view()` counts a view, and looking at the panel is not one.
         try:
             content = (profile.skills_dir / f"{s['name']}.md").read_text(encoding="utf-8")
         except OSError:
             content = ""
-        skills.append({**s, "content": clip(content, 6000)})
+        u = usage.get(s["name"]) or {}
+        skills.append({**s, "last_view": u.get("last_view"), "last_save": u.get("last_save"), "content": clip(content, 6000)})
     exps = [e.to_dict() for e in ExperienceStore(profile).all()]
     exps.sort(key=lambda e: e["created"], reverse=True)
     rows = profile.db.query("SELECT * FROM memory_events ORDER BY id DESC LIMIT ?", (events,))

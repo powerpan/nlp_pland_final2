@@ -1,0 +1,532 @@
+# hard 01 — long-horizon coding: TTL + LRU + weighted size + callbacks outside the lock + single-flight get_or_set; hidden tests
+id: hard-ttl-lru-cache
+title: Thread-safe LRU cache with per-key TTL, size limit, eviction callbacks and single-flight factories
+category: coding
+prompt: |
+  Build a thread-safe in-memory cache as the Python package `ttlcache/` in the workspace root (standard library
+  only), plus pytest tests in `tests/` (at least 12 test cases, passing with `python -m pytest tests`).
+
+  API: `from ttlcache import TTLCache`
+
+  `TTLCache(maxsize, *, default_ttl=None, sizeof=None, on_evict=None, clock=time.monotonic)`
+  - `maxsize`: the capacity, a positive `int` (`bool` is not accepted). The sizes of the stored entries sum to at
+    most `maxsize`.
+  - `sizeof`: optional function `value -> size`; an entry's size is `sizeof(value)`, or 1 when `sizeof` is None.
+    A size must be a positive `int` (not `bool`).
+  - `default_ttl`: `None` (no expiry) or a positive number of seconds (`int`/`float`, not `bool`, not NaN).
+  - `on_evict`: optional callback `on_evict(key, value, reason)` with `reason` one of `"expired"`, `"capacity"`,
+    `"replaced"`.
+  - `clock`: function returning the current time in seconds (tests pass a fake clock).
+  - Invalid constructor arguments raise `ValueError`.
+
+  Expiry: an entry stored at time `t` with a TTL of `T` seconds is expired as soon as `clock() >= t + T`. An expired
+  entry is never returned or counted; whenever the cache removes one it reports it with reason `"expired"`.
+
+  Recency: entries are kept in least-recently-used (LRU) order. Only `set`, `get` (on a hit) and `get_or_set` (on a
+  hit or when it stores) make an entry the most recently used; `peek`, `in`, `keys` and `pop` never change the order.
+
+  Methods:
+  - `set(key, value, ttl=None)` — `ttl=None` means `default_ttl`; otherwise `ttl` must be a positive number. Steps:
+    1. If `ttl` is invalid, or the value's size is invalid or larger than `maxsize`: raise `ValueError` — the cache
+       is not changed at all (nothing removed, no callback).
+    2. Remove every expired entry (reason `"expired"`).
+    3. If `key` is still present, report its old value with reason `"replaced"`. Store the new value, size and
+       expiry (computed from `clock()` now); the entry becomes the most recently used.
+    4. While the total size exceeds `maxsize`, evict the least recently used *other* entry (reason `"capacity"`).
+  - `get(key, default=None)` — the value of a live entry (which becomes the most recently used), else `default`.
+  - `peek(key, default=None)` — like `get`, without changing the order.
+  - `key in cache` — whether `key` has a live entry.
+  - `pop(key, default=<none given>)` — remove a live entry and return its value; this is an explicit removal, so no
+    `on_evict` call. For a missing key return `default`, or raise `KeyError` when no default was given.
+  - `get`, `peek`, `in` and `pop` remove the requested key if it has expired (and report it). `len(cache)`,
+    `cache.keys()` (a list, least → most recently used), the property `cache.size` (total size of the live entries)
+    and `cache.expire()` (returns how many entries it removed) first remove every expired entry.
+  - `clear()` — remove everything, without `on_evict` calls.
+  - `get_or_set(key, factory, ttl=None)` — for a live entry behaves like `get`. Otherwise calls `factory()`, stores
+    the result with `set(key, result, ttl)` and returns it. While a factory runs for a key, other `get_or_set` calls
+    for the same key wait and then return the value it stored (the factory runs once). A running factory must not
+    block calls for other keys or any other method. If the factory raises, the exception propagates to its caller,
+    nothing is stored, and one of the waiting callers then runs its own factory.
+
+  Callbacks: `on_evict` is called after the operation has finished changing the cache and without holding any
+  internal lock, so a callback may use the cache itself. Removals are reported in the order they happened
+  (expired entries in LRU order). Exceptions raised by `on_evict` are ignored (the remaining callbacks still run).
+
+  Thread safety: every method may be called concurrently from many threads.
+checks:
+- {id: package-exists, type: file_exists, path: ttlcache/__init__.py}
+- id: hidden-basics
+  type: python
+  code: |
+    import threading
+    from ttlcache import TTLCache
+    class Clock:
+        def __init__(self, t=0.0):
+            self.t = t
+        def __call__(self):
+            return self.t
+    def recorder(full=False):
+        log = []
+        return log, (lambda k, v, r: log.append((k, v, r) if full else (k, r)))
+    def raises(exc, fn, what):
+        try:
+            fn()
+        except exc:
+            return
+        except Exception as e:
+            raise AssertionError(f"{what}: raised {type(e).__name__} instead of {exc.__name__}") from None
+        raise AssertionError(f"{what}: should raise {exc.__name__}")
+    def within(seconds, fn, what):
+        box = {}
+        def run():
+            try:
+                box["v"] = fn()
+            except BaseException as e:
+                box["e"] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(seconds)
+        assert not t.is_alive(), what
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+    for bad in (0, -3, True, 2.5, "3", None):
+        raises(ValueError, lambda: TTLCache(bad), f"TTLCache({bad!r})")
+    for bad in (0, -1, True, "5", float("nan")):
+        raises(ValueError, lambda: TTLCache(3, default_ttl=bad), f"TTLCache(3, default_ttl={bad!r})")
+    c = TTLCache(3)
+    for bad in (0, -1, False, "5", float("nan")):
+        raises(ValueError, lambda: c.set("k", 1, ttl=bad), f"set('k', 1, ttl={bad!r})")
+    assert c.keys() == [] and len(c) == 0, "a rejected set() must not store anything"
+    c.set("a", 1); c.set("b", 2); c.set("c", 3)
+    assert c.get("a") == 1 and c.get("zz") is None and c.get("zz", 5) == 5
+    assert c.keys() == ["b", "c", "a"], f"get() must make the entry the most recently used: {c.keys()}"
+    assert c.peek("b") == 2 and "c" in c and "zz" not in c and c.peek("zz", 9) == 9
+    assert c.keys() == ["b", "c", "a"], f"peek / in / keys must not change the LRU order: {c.keys()}"
+    c.set("d", 4)
+    assert c.keys() == ["c", "a", "d"], f"set() on a full cache must evict the least recently used entry: {c.keys()}"
+    c.set("c", 33)
+    assert c.keys() == ["a", "d", "c"] and c.get("c") == 33, f"updating a key makes it the most recently used: {c.keys()}"
+    assert c.pop("a") == 1 and c.keys() == ["d", "c"], c.keys()
+    assert c.pop("a", "dflt") == "dflt" and c.pop("a", None) is None
+    raises(KeyError, lambda: c.pop("a"), "pop() of a missing key without a default")
+    assert len(c) == 2 and c.size == 2, (len(c), c.size)
+    c.clear()
+    assert len(c) == 0 and c.keys() == [] and c.size == 0
+    c.set(("tuple", 1), "t")
+    assert c.get(("tuple", 1)) == "t"
+- id: hidden-expiry
+  type: python
+  code: |
+    import threading
+    from ttlcache import TTLCache
+    class Clock:
+        def __init__(self, t=0.0):
+            self.t = t
+        def __call__(self):
+            return self.t
+    def recorder(full=False):
+        log = []
+        return log, (lambda k, v, r: log.append((k, v, r) if full else (k, r)))
+    def raises(exc, fn, what):
+        try:
+            fn()
+        except exc:
+            return
+        except Exception as e:
+            raise AssertionError(f"{what}: raised {type(e).__name__} instead of {exc.__name__}") from None
+        raise AssertionError(f"{what}: should raise {exc.__name__}")
+    def within(seconds, fn, what):
+        box = {}
+        def run():
+            try:
+                box["v"] = fn()
+            except BaseException as e:
+                box["e"] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(seconds)
+        assert not t.is_alive(), what
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+    clk = Clock(100.0)
+    ev, cb = recorder(full=True)
+    c = TTLCache(10, default_ttl=10, clock=clk, on_evict=cb)
+    c.set("a", 1)
+    c.set("b", 2, ttl=5)
+    c.set("n", 3, ttl=1000)
+    clk.t = 104.999
+    assert c.get("b") == 2 and "a" in c, "per-key ttl: b must still be live just before 105"
+    clk.t = 105
+    assert c.peek("b") is None, "an entry is expired as soon as clock() >= stored_at + ttl"
+    assert ev == [("b", 2, "expired")], f"the expired entry found by peek must be reported once: {ev}"
+    assert "b" not in c and ev == [("b", 2, "expired")], ev
+    clk.t = 108
+    c.set("a", 11)
+    assert ev[-1] == ("a", 1, "replaced"), f"overwriting a live key reports the old value as replaced: {ev}"
+    clk.t = 115
+    assert c.get("a") == 11, "set() on an existing key must restart its TTL"
+    clk.t = 118
+    assert c.get("a") is None and ev[-1] == ("a", 11, "expired"), ev
+    # set() removes every expired entry first, in LRU order, before any capacity eviction
+    clk2 = Clock()
+    ev2, cb2 = recorder()
+    d = TTLCache(3, clock=clk2, on_evict=cb2)
+    d.set("x", 1, ttl=5); d.set("y", 2, ttl=50); d.set("z", 3, ttl=5)
+    d.get("x")
+    clk2.t = 10
+    d.set("w", 4)
+    assert ev2 == [("z", "expired"), ("x", "expired")], f"set() must first remove every expired entry (LRU order) instead of evicting live ones: {ev2}"
+    assert d.keys() == ["y", "w"], d.keys()
+    # an expired key that is set again is reported as expired, not replaced
+    clk2.t = 100
+    ev2.clear()
+    d.set("y", 5)
+    assert ev2 == [("y", "expired")] and d.keys() == ["w", "y"], f"an expired key that is set again is reported as expired, not replaced: {ev2}"
+    # len / keys / size / expire purge (with callbacks, LRU order)
+    clk3 = Clock()
+    ev3, cb3 = recorder()
+    e = TTLCache(5, clock=clk3, on_evict=cb3)
+    for i, ttl in enumerate([3, None, 1, 2]):
+        e.set(f"k{i}", i, ttl=ttl)
+    clk3.t = 2
+    assert len(e) == 2 and ev3 == [("k2", "expired"), ("k3", "expired")], f"len() must purge expired entries first (LRU order): {len(e)}, {ev3}"
+    clk3.t = 7
+    assert e.expire() == 1 and ev3[-1] == ("k0", "expired") and e.keys() == ["k1"], (ev3, e.keys())
+    assert e.expire() == 0 and e.size == 1
+    # pop of an expired key
+    clk4 = Clock()
+    ev4, cb4 = recorder()
+    f = TTLCache(5, clock=clk4, on_evict=cb4)
+    f.set("p", 1, ttl=1)
+    clk4.t = 1
+    assert f.pop("p", "gone") == "gone" and ev4 == [("p", "expired")], ev4
+    raises(KeyError, lambda: f.pop("p"), "pop() of an expired key without default")
+- id: hidden-capacity
+  type: python
+  code: |
+    import threading
+    from ttlcache import TTLCache
+    class Clock:
+        def __init__(self, t=0.0):
+            self.t = t
+        def __call__(self):
+            return self.t
+    def recorder(full=False):
+        log = []
+        return log, (lambda k, v, r: log.append((k, v, r) if full else (k, r)))
+    def raises(exc, fn, what):
+        try:
+            fn()
+        except exc:
+            return
+        except Exception as e:
+            raise AssertionError(f"{what}: raised {type(e).__name__} instead of {exc.__name__}") from None
+        raise AssertionError(f"{what}: should raise {exc.__name__}")
+    def within(seconds, fn, what):
+        box = {}
+        def run():
+            try:
+                box["v"] = fn()
+            except BaseException as e:
+                box["e"] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(seconds)
+        assert not t.is_alive(), what
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+    ev, cb = recorder(full=True)
+    c = TTLCache(10, sizeof=len, on_evict=cb)
+    c.set("a", "xxx"); c.set("b", "xxxx"); c.set("c", "xx")
+    assert c.size == 9, c.size
+    c.set("d", "xxxxx")
+    assert ev == [("a", "xxx", "capacity"), ("b", "xxxx", "capacity")], f"evict LRU entries until the new one fits: {ev}"
+    assert c.keys() == ["c", "d"] and c.size == 7, (c.keys(), c.size)
+    ev.clear()
+    c.set("c", "xxxxxxxx")
+    assert ev == [("c", "xx", "replaced"), ("d", "xxxxx", "capacity")], f"replace first, then evict other entries: {ev}"
+    assert c.keys() == ["c"] and c.size == 8, (c.keys(), c.size)
+    ev.clear()
+    raises(ValueError, lambda: c.set("big", "x" * 11), "a value larger than maxsize")
+    assert c.keys() == ["c"] and ev == [], "a rejected set() must not change the cache or call on_evict"
+    c.set("full", "x" * 10)
+    assert c.keys() == ["full"] and c.size == 10, "a value of exactly maxsize fits (evicting everything else)"
+    bad = TTLCache(10, sizeof=lambda v: v)
+    for v in (0, -1, True, 1.5, "3"):
+        raises(ValueError, lambda: bad.set("k", v), f"sizeof() returning {v!r}")
+    assert bad.keys() == []
+    # step 1 happens before anything else: a rejected set() does not even purge expired entries
+    clk = Clock()
+    ev5, cb5 = recorder()
+    g = TTLCache(4, sizeof=len, clock=clk, on_evict=cb5)
+    g.set("old", "x", ttl=1)
+    clk.t = 5
+    raises(ValueError, lambda: g.set("huge", "xxxxx"), "oversized value")
+    assert ev5 == [], f"a rejected set() must not remove/report anything: {ev5}"
+    assert g.keys() == [] and ev5 == [("old", "expired")], ev5
+- id: hidden-callbacks
+  type: python
+  code: |
+    import threading
+    from ttlcache import TTLCache
+    class Clock:
+        def __init__(self, t=0.0):
+            self.t = t
+        def __call__(self):
+            return self.t
+    def recorder(full=False):
+        log = []
+        return log, (lambda k, v, r: log.append((k, v, r) if full else (k, r)))
+    def raises(exc, fn, what):
+        try:
+            fn()
+        except exc:
+            return
+        except Exception as e:
+            raise AssertionError(f"{what}: raised {type(e).__name__} instead of {exc.__name__}") from None
+        raise AssertionError(f"{what}: should raise {exc.__name__}")
+    def within(seconds, fn, what):
+        box = {}
+        def run():
+            try:
+                box["v"] = fn()
+            except BaseException as e:
+                box["e"] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(seconds)
+        assert not t.is_alive(), what
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+    seen = []
+    c = TTLCache(3, sizeof=len, on_evict=lambda k, v, r: seen.append((k, r, c.size, c.keys())))
+    def scenario():
+        c.set("a", "x"); c.set("b", "x"); c.set("c", "x")
+        c.set("d", "xx")
+    within(5, scenario, "deadlock: an on_evict callback that calls the cache never returned (callbacks must run outside the lock)")
+    assert seen == [("a", "capacity", 3, ["c", "d"]), ("b", "capacity", 3, ["c", "d"])], f"callbacks must run after the operation has finished: {seen}"
+    log = []
+    def writer(k, v, r):
+        log.append((k, r))
+        if k == "a":
+            c2.set("from-callback", 1)
+    c2 = TTLCache(2, on_evict=writer)
+    within(5, lambda: (c2.set("a", 1), c2.set("b", 2), c2.set("c", 3)), "deadlock: a callback that calls set() never returned")
+    assert log[:2] == [("a", "capacity"), ("b", "capacity")] and c2.keys() == ["c", "from-callback"], (log, c2.keys())
+    calls = []
+    def boom(k, v, r):
+        calls.append(k)
+        raise RuntimeError("callback failure")
+    c3 = TTLCache(3, sizeof=len, on_evict=boom)
+    c3.set("a", "x"); c3.set("b", "x"); c3.set("c", "x")
+    c3.set("d", "xxx")
+    assert calls == ["a", "b", "c"] and c3.keys() == ["d"], f"callback exceptions must be ignored and all removals reported: {calls}, {c3.keys()}"
+    gate, entered = threading.Event(), threading.Event()
+    def slow(k, v, r):
+        entered.set()
+        gate.wait(10)
+    c4 = TTLCache(1, on_evict=slow)
+    c4.set("a", 1)
+    t = threading.Thread(target=lambda: c4.set("b", 2), daemon=True)
+    t.start()
+    assert entered.wait(5), "on_evict was not called"
+    try:
+        other = within(3, lambda: (c4.get("b"), len(c4), "b" in c4), "the cache is locked while an on_evict callback runs")
+    finally:
+        gate.set()
+    t.join(5)
+    assert other == (2, 1, True), other
+- id: hidden-get-or-set
+  type: python
+  code: |
+    import threading
+    from ttlcache import TTLCache
+    class Clock:
+        def __init__(self, t=0.0):
+            self.t = t
+        def __call__(self):
+            return self.t
+    def recorder(full=False):
+        log = []
+        return log, (lambda k, v, r: log.append((k, v, r) if full else (k, r)))
+    def raises(exc, fn, what):
+        try:
+            fn()
+        except exc:
+            return
+        except Exception as e:
+            raise AssertionError(f"{what}: raised {type(e).__name__} instead of {exc.__name__}") from None
+        raise AssertionError(f"{what}: should raise {exc.__name__}")
+    def within(seconds, fn, what):
+        box = {}
+        def run():
+            try:
+                box["v"] = fn()
+            except BaseException as e:
+                box["e"] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(seconds)
+        assert not t.is_alive(), what
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+    import time
+    calls = []
+    def factory():
+        calls.append(1)
+        time.sleep(0.3)
+        return "v"
+    c = TTLCache(10)
+    out = []
+    ts = [threading.Thread(target=lambda: out.append(c.get_or_set("k", factory)), daemon=True) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join(10) for t in ts]
+    assert out == ["v"] * 8 and len(calls) == 1, f"8 concurrent get_or_set() calls ran the factory {len(calls)} times (results {out})"
+    assert c.get_or_set("k", lambda: "other") == "v" and c.keys() == ["k"]
+    gate, started = threading.Event(), threading.Event()
+    def slow():
+        started.set()
+        gate.wait(10)
+        return "slow"
+    t = threading.Thread(target=lambda: c.get_or_set("s", slow), daemon=True)
+    t.start()
+    assert started.wait(5)
+    box = {}
+    def other():
+        c.set("x", 1)
+        box["x"] = c.get("x")
+        box["len"] = len(c)
+        box["y"] = c.get_or_set("y", lambda: 2)
+    try:
+        within(3, other, "set/get/len/get_or_set of other keys were blocked while a factory was running")
+    finally:
+        gate.set()
+    t.join(5)
+    assert box == {"x": 1, "len": 2, "y": 2} and c.get("s") == "slow", (box, c.keys())
+    # a failing factory: the error reaches its caller, a waiting caller then runs its own factory
+    c5, attempts, res = TTLCache(10), [], {}
+    fail_gate, fail_started = threading.Event(), threading.Event()
+    def failing():
+        attempts.append("fail")
+        fail_started.set()
+        fail_gate.wait(10)
+        raise RuntimeError("factory failed")
+    def good():
+        attempts.append("good")
+        return 7
+    def first():
+        try:
+            c5.get_or_set("f", failing)
+        except RuntimeError as exc:
+            res["first"] = str(exc)
+    t1 = threading.Thread(target=first, daemon=True)
+    t1.start()
+    assert fail_started.wait(5)
+    t2 = threading.Thread(target=lambda: res.__setitem__("second", c5.get_or_set("f", good)), daemon=True)
+    t2.start()
+    time.sleep(0.3)
+    early = dict(res)
+    fail_gate.set()
+    t1.join(5)
+    t2.join(5)
+    assert early == {}, f"a second caller for the same key must wait for the running factory: {early}"
+    assert res == {"first": "factory failed", "second": 7} and attempts == ["fail", "good"], (res, attempts)
+    assert c5.get("f") == 7
+- id: hidden-thread-safety
+  type: python
+  timeout: 180
+  code: |
+    import threading
+    from ttlcache import TTLCache
+    class Clock:
+        def __init__(self, t=0.0):
+            self.t = t
+        def __call__(self):
+            return self.t
+    def recorder(full=False):
+        log = []
+        return log, (lambda k, v, r: log.append((k, v, r) if full else (k, r)))
+    def raises(exc, fn, what):
+        try:
+            fn()
+        except exc:
+            return
+        except Exception as e:
+            raise AssertionError(f"{what}: raised {type(e).__name__} instead of {exc.__name__}") from None
+        raise AssertionError(f"{what}: should raise {exc.__name__}")
+    def within(seconds, fn, what):
+        box = {}
+        def run():
+            try:
+                box["v"] = fn()
+            except BaseException as e:
+                box["e"] = e
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(seconds)
+        assert not t.is_alive(), what
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+    import random, sys
+    sys.setswitchinterval(1e-6)
+    stats = {"replaced": 0, "capacity": 0, "expired": 0}
+    lock = threading.Lock()
+    def cb(k, v, r):
+        with lock:
+            stats[r] += 1
+    c = TTLCache(40, sizeof=len, on_evict=cb)
+    counts = [{"sets": 0, "pops": 0, "factory": 0} for _ in range(8)]
+    errors = []
+    def worker(i):
+        rnd = random.Random(i)
+        mine = counts[i]
+        def fac():
+            mine["factory"] += 1
+            return "y"
+        try:
+            for _ in range(2500):
+                k, op = rnd.randrange(30), rnd.random()
+                if op < 0.5:
+                    c.set(k, "x" * rnd.randint(1, 5))
+                    mine["sets"] += 1
+                elif op < 0.72:
+                    c.get(k)
+                elif op < 0.84:
+                    if c.pop(k, None) is not None:
+                        mine["pops"] += 1
+                elif op < 0.95:
+                    c.get_or_set(k, fac)
+                else:
+                    len(c)
+                    c.keys()
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(8)]
+    [t.start() for t in threads]
+    [t.join(120) for t in threads]
+    assert not any(t.is_alive() for t in threads), "worker threads hung (deadlock?)"
+    assert not errors, f"exceptions under concurrent use: {errors[:3]}"
+    keys = c.keys()
+    total = sum(len(c.peek(k)) for k in keys)
+    assert total == c.size <= 40, f"size bookkeeping broken under concurrency: size={c.size}, sum of entries={total}"
+    stored = sum(x["sets"] + x["factory"] for x in counts)
+    gone = stats["replaced"] + stats["capacity"] + sum(x["pops"] for x in counts)
+    assert stored - gone == len(keys), f"lost or duplicated entries: {stored} stored - {gone} removed != {len(keys)} live"
+- id: agent-tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    pytest_in(ws, 12, "tests")

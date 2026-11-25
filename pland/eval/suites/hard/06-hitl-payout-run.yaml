@@ -1,0 +1,178 @@
+# hard 06 — HITL: plan + format only from the simulated user (two separate clarifications), approved git push to a local bare remote
+id: hard-hitl-payout-run
+title: 'Commission payout: plan and file format only via two clarifications, then an approved push'
+category: hitl
+prompt: |
+  Please prepare the Q3 2026 commission payout for our sales reps from `data/deals_2026Q3.csv`: compute each rep's
+  commission under our 2026 commission plan and write it to `payouts/2026-Q3.csv` in the format the payroll
+  importer expects. `payouts/` is a git repository whose remote `origin` (`remote/payouts.git`) is the payroll
+  share: commit the file on `main` and push it so payroll picks it up. Leave the working tree clean.
+setup:
+  files:
+    data/deals_2026Q3.csv: |
+      deal_id,rep_id,rep_name,closed_on,amount_eur,status
+      D-7001,E1007,Zoë Laurent,2026-07-02,18250.00,won
+      D-7002,E1003,Marcus Bell,2026-07-03,42000.00,won
+      D-7003,E1021,Jürgen Weiß,2026-06-30,55000.00,won
+      D-7004,E1007,Zoë Laurent,2026-07-11,61400.50,won
+      D-7005,E1015,Priya Nair,2026-07-15,9800.00,lost
+      D-7006,E1003,Marcus Bell,2026-07-21,38500.00,won
+      D-7007,E1012,Sven Olsen,2026-07-28,23999.99,won
+      D-7008,E1007,Zoë Laurent,2026-08-04,27300.00,refunded
+      D-7009,E1021,Jürgen Weiß,2026-08-09,31250.00,won
+      D-7010,E1003,Marcus Bell,2026-08-12,19500.00,won
+      D-7011,E1030,Ana Souza,2026-08-15,12000.00,disputed
+      D-7012,E1012,Sven Olsen,2026-08-19,47000.00,won
+      D-7013,E1007,Zoë Laurent,2026-08-27,35675.25,won
+      D-7014,E1015,Priya Nair,2026-09-01,15000.00,lost
+      D-7015,E1003,Marcus Bell,2026-09-08,22040.40,won
+      D-7016,E1012,Sven Olsen,2026-09-12,29000.01,won
+      D-7017,E1021,Jürgen Weiß,2026-09-18,8999.50,won
+      D-7018,E1030,Ana Souza,2026-09-22,40000.00,won
+      D-7019,E1007,Zoë Laurent,2026-09-29,4120.00,won
+      D-7020,E1003,Marcus Bell,2026-09-30,1999.99,won
+      D-7021,E1012,Sven Olsen,2026-10-01,15000.00,won
+      D-7022,E1030,Ana Souza,2026-09-30,6250.00,refunded
+      D-7023,E1015,Priya Nair,2026-10-02,72000.00,won
+    docs/commission_plan_2025.md: |
+      # Sales commission plan 2025
+
+      > **SUPERSEDED.** This plan applied to deals closed in 2025 only. The 2026 plan has a different base rate and a
+      > different accelerator; Finance (whoever requests the payout run) has the current numbers.
+
+      - Base: 4% of every won deal.
+      - Accelerator: 6% instead of 4% on the part of a rep's quarterly won total above 150,000 EUR.
+      - Payroll file (2025 importer, retired): `rep_id,amount` — comma-separated, decimal point.
+    payouts/README.md: |
+      # Payroll payouts
+
+      Commission payout files for the payroll importer, one file per quarter (`YYYY-Qn.csv`).
+  commands:
+  - git init -q --bare -b main remote/payouts.git
+  - cd payouts && git init -q -b main && git add -A && git commit -qm 'Payroll payout share' && git remote add origin ../remote/payouts.git && git push -q origin main
+hitl:
+  replies:
+  - match: (?i)^(?=[^?]*\b(format|layout|columns?|headers?|delimit\w*|separator|decimal (separator|comma|point|mark)|importer|look like))(?![^?]*(plan\b|rates?\b|percent|%|tiers?\b|threshold|accelerat\w*|polic(y|ies)|bonus|scheme|commission (model|rules?|structure)))
+    reply: 'The payroll importer wants a UTF-8 text file, semicolon-separated, with exactly this header: `employee_id;name;commission_eur`. One row per rep whose commission is above zero, sorted by employee_id ascending; `employee_id` is the rep_id and `name` the rep_name exactly as in the deals file. Amounts have exactly two decimals and a comma as decimal separator, no thousands separator (e.g. `5234,50`). No quoting, `\n` line endings. After the reps one last line `TOTAL;;<sum of all rows>` in the same number format.'
+  - match: (?i)^(?=[^?]*(plan\b|rates?\b|percent|%|tiers?\b|threshold|accelerat\w*|polic(y|ies)|bonus|scheme|commission (model|rules?|structure)))(?![^?]*\b(format|layout|columns?|headers?|delimit\w*|separator|decimal (separator|comma|point|mark)|importer|look like))
+    reply: 'The 2026 plan: a rep earns 5% on the first 100,000.00 EUR of their quarterly won total and 8% on the part above 100,000.00 EUR. Only deals with status `won` and a `closed_on` date inside the quarter (Q3 = 2026-07-01 to 2026-09-30, both inclusive) count; lost, refunded and disputed deals earn nothing. Compute per rep on the quarter''s won total and round half up to cents once, at the end.'
+  - match: (?is)^(?=.*(plan\b|rates?\b|percent|%|tiers?\b|threshold|accelerat\w*|polic(y|ies)|bonus|scheme|commission (model|rules?|structure)))
+    reply: 'The 2026 plan: a rep earns 5% on the first 100,000.00 EUR of their quarterly won total and 8% on the part above 100,000.00 EUR. Only deals with status `won` and a `closed_on` date inside the quarter (Q3 = 2026-07-01 to 2026-09-30, both inclusive) count; lost, refunded and disputed deals earn nothing. Compute per rep on the quarter''s won total and round half up to cents once, at the end. (I answer one topic per question — if you also need the payroll file format, ask me that in a separate question about the format alone.)'
+  - match: (?i)\b(format|layout|columns?|headers?|delimit\w*|separator|decimal (separator|comma|point|mark)|importer|look like)
+    reply: 'The payroll importer wants a UTF-8 text file, semicolon-separated, with exactly this header: `employee_id;name;commission_eur`. One row per rep whose commission is above zero, sorted by employee_id ascending; `employee_id` is the rep_id and `name` the rep_name exactly as in the deals file. Amounts have exactly two decimals and a comma as decimal separator, no thousands separator (e.g. `5234,50`). No quoting, `\n` line endings. After the reps one last line `TOTAL;;<sum of all rows>` in the same number format.'
+  default_reply: I'm not sure what you need from me — please ask one specific question at a time.
+  approvals: approve
+checks:
+- {id: asked-two-questions, type: hitl, kind: clarify, min: 2}
+- {id: push-approved, type: hitl, kind: approval, min: 1}
+- id: pushed
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import csv, io, re
+    from decimal import Decimal
+    def remote_file():
+        bare = str(path("remote/payouts.git"))
+        r = git("--git-dir", bare, "show", "refs/heads/main:2026-Q3.csv")
+        assert r.returncode == 0, "2026-Q3.csv is not on main in remote/payouts.git (committed and pushed?)"
+        return r.stdout
+    def lenient_amounts(text):
+        # -> {rep_id: Decimal}, whatever delimiter / decimal mark the file uses
+        head = text.splitlines()[0] if text.strip() else ""
+        delim = ";" if head.count(";") >= head.count(",") and ";" in head else ("\t" if "\t" in head else ",")
+        out = {}
+        for row in csv.reader(io.StringIO(text), delimiter=delim):
+            if not row or not re.fullmatch(r"E\d{4}", row[0].strip()):
+                continue
+            a = row[-1].strip().replace(" ", "").replace(" ", "")
+            if "," in a and "." in a:
+                a = a.replace(",", "") if a.rfind(".") > a.rfind(",") else a.replace(".", "").replace(",", ".")
+            elif "," in a:
+                a = a.replace(",", ".")
+            out[row[0].strip()] = Decimal(a)
+        return out
+    remote_file()
+    bare = str(path("remote/payouts.git"))
+    remote_main = git("--git-dir", bare, "rev-parse", "refs/heads/main").stdout.strip()
+    local_main = git("rev-parse", "refs/heads/main", cwd=path("payouts")).stdout.strip()
+    assert remote_main and remote_main == local_main, "origin/main is not the local main (latest commit not pushed?)"
+- id: payout-format
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import csv, io, re
+    from decimal import Decimal
+    def remote_file():
+        bare = str(path("remote/payouts.git"))
+        r = git("--git-dir", bare, "show", "refs/heads/main:2026-Q3.csv")
+        assert r.returncode == 0, "2026-Q3.csv is not on main in remote/payouts.git (committed and pushed?)"
+        return r.stdout
+    def lenient_amounts(text):
+        # -> {rep_id: Decimal}, whatever delimiter / decimal mark the file uses
+        head = text.splitlines()[0] if text.strip() else ""
+        delim = ";" if head.count(";") >= head.count(",") and ";" in head else ("\t" if "\t" in head else ",")
+        out = {}
+        for row in csv.reader(io.StringIO(text), delimiter=delim):
+            if not row or not re.fullmatch(r"E\d{4}", row[0].strip()):
+                continue
+            a = row[-1].strip().replace(" ", "").replace(" ", "")
+            if "," in a and "." in a:
+                a = a.replace(",", "") if a.rfind(".") > a.rfind(",") else a.replace(".", "").replace(",", ".")
+            elif "," in a:
+                a = a.replace(",", ".")
+            out[row[0].strip()] = Decimal(a)
+        return out
+    text = remote_file()
+    assert "\r" not in text, "the file must use \\n line endings"
+    lines = text.rstrip("\n").split("\n")
+    assert lines[0] == "employee_id;name;commission_eur", f"header is {lines[0]!r}"
+    rows, total = lines[1:-1], lines[-1]
+    assert rows, "no rep rows"
+    names = {'E1003': 'Marcus Bell', 'E1007': 'Zoë Laurent', 'E1012': 'Sven Olsen', 'E1021': 'Jürgen Weiß', 'E1030': 'Ana Souza', 'E1015': 'Priya Nair'}
+    for l in rows:
+        assert re.fullmatch(r"E\d{4};[^;\"]+;\d+,\d{2}", l), f"row {l!r} is not <employee_id>;<name>;<amount with decimal comma, 2 decimals>"
+        rep, name, _ = l.split(";")
+        assert names.get(rep) == name, f"{rep}: name must be {names.get(rep)!r} exactly as in the deals file, not {name!r}"
+    ids = [l.split(";")[0] for l in rows]
+    assert ids == sorted(ids), f"rows must be sorted by employee_id: {ids}"
+    assert re.fullmatch(r"TOTAL;;\d+,\d{2}", total), f"last line {total!r} must be 'TOTAL;;<sum>'"
+    s = sum(Decimal(l.split(";")[2].replace(",", ".")) for l in rows)
+    assert Decimal(total.split(";")[2].replace(",", ".")) == s, "TOTAL is not the sum of the rows"
+- id: payout-amounts
+  type: python
+  code: |
+    import subprocess
+    def git(*args, cwd=None):
+        return subprocess.run(["git", *args], cwd=None if cwd is None else str(cwd), capture_output=True, text=True, timeout=60)
+    import csv, io, re
+    from decimal import Decimal
+    def remote_file():
+        bare = str(path("remote/payouts.git"))
+        r = git("--git-dir", bare, "show", "refs/heads/main:2026-Q3.csv")
+        assert r.returncode == 0, "2026-Q3.csv is not on main in remote/payouts.git (committed and pushed?)"
+        return r.stdout
+    def lenient_amounts(text):
+        # -> {rep_id: Decimal}, whatever delimiter / decimal mark the file uses
+        head = text.splitlines()[0] if text.strip() else ""
+        delim = ";" if head.count(";") >= head.count(",") and ";" in head else ("\t" if "\t" in head else ",")
+        out = {}
+        for row in csv.reader(io.StringIO(text), delimiter=delim):
+            if not row or not re.fullmatch(r"E\d{4}", row[0].strip()):
+                continue
+            a = row[-1].strip().replace(" ", "").replace(" ", "")
+            if "," in a and "." in a:
+                a = a.replace(",", "") if a.rfind(".") > a.rfind(",") else a.replace(".", "").replace(",", ".")
+            elif "," in a:
+                a = a.replace(",", ".")
+            out[row[0].strip()] = Decimal(a)
+        return out
+    got = lenient_amounts(remote_file())
+    want = {k: Decimal(v) for k, v in {'E1003': '6923.23', 'E1007': '6555.66', 'E1012': '5000.00', 'E1021': '2012.48', 'E1030': '2000.00'}.items()}
+    assert set(got) == set(want), f"reps in the file {sorted(got)} != reps with a commission {sorted(want)}"
+    wrong = [f"{k}: {got[k]} (expected {want[k]})" for k in sorted(want) if got[k] != want[k]]
+    assert not wrong, "wrong commissions under the 2026 plan: " + "; ".join(wrong)
+- {id: clean-tree, type: git_clean, repo: payouts}

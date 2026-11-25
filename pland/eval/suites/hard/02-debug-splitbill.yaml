@@ -1,0 +1,477 @@
+# hard 02 — debugging: 6 bugs in 5 modules (a compensating sign-bug pair, one bug only a hidden spec test sees); tests must stay unchanged
+id: hard-debug-splitbill
+title: Fix six interacting bugs across a 9-module expense-sharing package
+category: coding
+prompt: |
+  `splitbill/` is a small expense-sharing package (see `README.md`); `python -m pytest tests` fails. Several bugs are
+  spread over its modules, and some of them interact. Fix the package so that every function behaves exactly as
+  its docstring says — the docstrings are the specification, and hidden tests check them beyond what `tests/`
+  covers (including the command line on other data). Do not modify anything under `tests/` or `conftest.py` (the
+  tests are correct) and keep the public API (modules, functions, argument names) unchanged. At the end all tests
+  must pass.
+setup:
+  files:
+    splitbill/__init__.py: |
+      """splitbill — share group expenses and settle up."""
+      from .csvio import read_expenses
+      from .ledger import balances
+      from .settle import settle
+
+      __all__ = ["read_expenses", "balances", "settle"]
+    splitbill/money.py: |
+      """Money helpers. All amounts are integers in cents."""
+      import re
+
+      _AMOUNT = re.compile(r"\d{1,3}(,\d{3})+(\.\d{1,2})?|\d+(\.\d{1,2})?")
+
+
+      def parse_amount(text):
+          """Parse a non-negative decimal amount such as "12", "12.5", "12.50" or "1,234.56" into cents
+          (1250 for "12.5"). Surrounding whitespace is ignored; thousands separators must group digits by three.
+          Anything else (negative numbers, more than two decimals, empty text) raises ValueError."""
+          s = text.strip()
+          if not _AMOUNT.fullmatch(s):
+              raise ValueError(f"invalid amount: {text!r}")
+          whole, _, frac = s.replace(",", "").partition(".")
+          return int(whole) * 100 + int(frac or 0)
+
+
+      def format_cents(cents):
+          """Format cents with two decimals: 1250 -> "12.50", 5 -> "0.05", -1205 -> "-12.05"."""
+          sign = "-" if cents < 0 else ""
+          cents = abs(cents)
+          return f"{sign}{cents // 100}.{cents % 100:02d}"
+
+
+      def allocate(total, weights):
+          """Split `total` cents (>= 0) proportionally to the non-negative integer `weights` (largest-remainder
+          method): part i first gets floor(total * w_i / sum(weights)); the cents left over are then handed out one
+          each to the parts with the largest remainders, ties going to the EARLIER part. The parts always sum to
+          `total`. Raises ValueError if the weights are empty, negative or all zero."""
+          if not weights or any(w < 0 for w in weights) or sum(weights) == 0:
+              raise ValueError("weights must be non-negative and not all zero")
+          s = sum(weights)
+          parts = [total * w // s for w in weights]
+          rema = [total * w % s for w in weights]
+          order = sorted(range(len(weights)), key=lambda i: (-rema[i], -i))
+          for i in order[:total - sum(parts)]:
+              parts[i] += 1
+          return parts
+    splitbill/fx.py: |
+      """Currency conversion."""
+      from decimal import ROUND_HALF_UP, Decimal
+
+
+      def convert(cents, from_cur, to_cur, rates):
+          """Convert an amount of `cents` in `from_cur` into cents of `to_cur`. `rates` maps a currency code to the
+          number of units of that currency per 1 EUR (strings or numbers, e.g. {"EUR": "1", "USD": "1.08"}).
+          The result is computed with exact decimal arithmetic and rounded half up to whole cents
+          (e.g. 1000 USD-cents at 1.08 -> 925.925... -> 926 EUR-cents). Unknown currencies raise KeyError."""
+          if from_cur == to_cur:
+              return cents
+          return int(cents * float(rates[to_cur]) / float(rates[from_cur]))
+    splitbill/models.py: |
+      """Data model."""
+      from dataclasses import dataclass, field
+
+
+      @dataclass
+      class Expense:
+          id: str
+          date: str                      # YYYY-MM-DD
+          payer: str
+          amount: int                    # cents, in `currency`
+          currency: str
+          participants: list = field(default_factory=list)
+          weights: list = None           # None = equal shares
+    splitbill/split.py: |
+      """How an expense is shared among its participants."""
+      from .money import allocate
+
+
+      def shares(expense, amount=None):
+          """Return {participant: cents}: how much of the expense each participant consumed. `amount` (cents)
+          replaces expense.amount, e.g. after currency conversion. Without weights everybody gets an equal share.
+          The parts come from money.allocate in the order of expense.participants. A participant listed twice or
+          a weights list of the wrong length raises ValueError."""
+          total = expense.amount if amount is None else amount
+          names = list(expense.participants)
+          if not names or len(set(names)) != len(names):
+              raise ValueError(f"{expense.id}: participants must be non-empty and unique")
+          weights = list(expense.weights) if expense.weights else [1] * len(names)
+          if len(weights) != len(names):
+              raise ValueError(f"{expense.id}: {len(weights)} weights for {len(names)} participants")
+          return dict(zip(names, allocate(total, weights)))
+    splitbill/ledger.py: |
+      """Net balances."""
+      from .fx import convert
+      from .split import shares
+
+
+      def balances(expenses, base="EUR", rates=None):
+          """Net balance per person in cents of `base`: POSITIVE means the person is owed money (paid more than
+          they consumed), NEGATIVE means the person owes money. Each expense amount is first converted to `base`
+          with fx.convert and then split with split.shares; the payer is credited the converted amount and every
+          participant is debited its share. Everybody who appears as payer or participant is included (also with
+          a zero balance). The balances always sum to zero."""
+          rates = rates or {base: "1"}
+          bal = {}
+          for e in expenses:
+              amount = convert(e.amount, e.currency, base, rates)
+              bal[e.payer] = bal.get(e.payer, 0) - amount
+              for name, part in shares(e, amount).items():
+                  bal[name] = bal.get(name, 0) + part
+          return bal
+    splitbill/settle.py: |
+      """Settle balances with as few, simple transfers as the greedy rule gives."""
+
+
+      def settle(balances):
+          """Turn balances (positive = is owed money, negative = owes money; see ledger.balances) into a list of
+          transfers (debtor, creditor, cents). Greedy rule: repeatedly the person who owes the most pays the
+          person who is owed the most (ties: alphabetically first name), transferring the smaller of the two
+          open amounts. Zero balances are ignored. Transfers are returned in the order they are made."""
+          debts = {n: b for n, b in balances.items() if b > 0}
+          credits = {n: -b for n, b in balances.items() if b < 0}
+          out = []
+          while debts and credits:
+              d = min(debts, key=lambda n: (-debts[n], n))
+              c = min(credits, key=lambda n: (-credits[n], n))
+              amount = min(debts[d], credits[c])
+              out.append((d, c, amount))
+              debts[d] -= amount
+              credits[c] -= amount
+              if not debts[d]:
+                  del debts[d]
+              if not credits[c]:
+                  del credits[c]
+          return out
+    splitbill/csvio.py: |
+      """Reading expenses from CSV."""
+      import csv
+      import io
+
+      from .models import Expense
+      from .money import parse_amount
+
+      HEADER = ["id", "date", "payer", "amount", "currency", "participants", "weights"]
+
+
+      class _Rows:
+          """Iterate over the CSV rows of `text`, tracking the current line number."""
+
+          def __init__(self, text):
+              self._lines = iter(text.splitlines())
+              self.line_num = 0
+
+          def __iter__(self):
+              return self
+
+          def __next__(self):
+              line = next(self._lines)
+              self.line_num += 1
+              return [f.strip('"') for f in line.split(",")] if line.strip() else []
+
+
+      def read_expenses(text):
+          """Parse CSV text whose first row is the header id,date,payer,amount,currency,participants,weights.
+          Fields follow normal CSV quoting rules (an amount with a thousands separator, like "1,234.56", is
+          quoted). `participants` and `weights` are ';'-separated lists; names are stripped of surrounding
+          whitespace; an empty `weights` field means equal shares. The currency is upper-cased. Blank lines are
+          skipped. A row with the wrong number of fields or a bad amount/weight raises ValueError mentioning its
+          line number (the header is line 1)."""
+          rows = _Rows(text)
+          header = next(rows, None)
+          if [h.strip() for h in header or []] != HEADER:
+              raise ValueError(f"bad header: {header}")
+          out = []
+          for row in rows:
+              line = rows.line_num
+              if not row or all(not c.strip() for c in row):
+                  continue
+              if len(row) != len(HEADER):
+                  raise ValueError(f"line {line}: expected {len(HEADER)} fields, got {len(row)}")
+              rec = dict(zip(HEADER, row))
+              try:
+                  amount = parse_amount(rec["amount"])
+                  weights = [int(w) for w in rec["weights"].split(";")] if rec["weights"].strip() else None
+              except ValueError as exc:
+                  raise ValueError(f"line {line}: {exc}") from None
+              names = [n.strip() for n in rec["participants"].split(";") if n.strip()]
+              out.append(Expense(rec["id"].strip(), rec["date"].strip(), rec["payer"].strip(), amount,
+                                 rec["currency"].strip().upper(), names, weights))
+          return out
+    splitbill/report.py: |
+      """Plain-text report."""
+      from .money import format_cents
+
+
+      def render(balances, transfers, base="EUR"):
+          """The report text: a line 'Balances (<base>):', then one line '  <name>: <amount>' per person sorted by
+          name (format_cents, positive amounts with a leading '+', zero as '0.00'), a blank line, the line
+          'Transfers:', then one line '  <debtor> -> <creditor>: <amount>' per transfer in order, or the single line
+          '  nothing to settle'."""
+          lines = [f"Balances ({base}):"]
+          for name in sorted(balances):
+              cents = balances[name]
+              lines.append(f"  {name}: {'+' if cents > 0 else ''}{format_cents(cents)}")
+          lines += ["", "Transfers:"]
+          lines += [f"  {d} -> {c}: {format_cents(a)}" for d, c, a in transfers] or ["  nothing to settle"]
+          return "\n".join(lines)
+    splitbill/cli.py: |
+      """Command line: python -m splitbill EXPENSES.csv [--base CUR] [--rates RATES.csv]"""
+      import argparse
+      import csv
+      import sys
+      from pathlib import Path
+
+      from .csvio import read_expenses
+      from .ledger import balances
+      from .report import render
+      from .settle import settle
+
+
+      def read_rates(text):
+          """RATES.csv has the header currency,per_eur (units of the currency per 1 EUR)."""
+          return {r["currency"].strip().upper(): r["per_eur"].strip() for r in csv.DictReader(text.splitlines())}
+
+
+      def main(argv=None):
+          p = argparse.ArgumentParser(prog="splitbill")
+          p.add_argument("expenses")
+          p.add_argument("--base", default="EUR")
+          p.add_argument("--rates")
+          a = p.parse_args(argv)
+          try:
+              text = Path(a.expenses).read_text(encoding="utf-8")
+              rates = read_rates(Path(a.rates).read_text(encoding="utf-8")) if a.rates else None
+          except OSError as exc:
+              print(f"error: {exc}", file=sys.stderr)
+              return 2
+          try:
+              bal = balances(read_expenses(text), a.base.upper(), rates)
+          except (ValueError, KeyError) as exc:
+              print(f"error: {exc}", file=sys.stderr)
+              return 1
+          print(render(bal, settle(bal), a.base.upper()))
+          return 0
+    splitbill/__main__.py: |
+      import sys
+
+      from .cli import main
+
+      sys.exit(main())
+    tests/test_money.py: |
+      import pytest
+      from splitbill.money import allocate, format_cents, parse_amount
+
+
+      @pytest.mark.parametrize("text,cents", [("12", 1200), ("12.5", 1250), ("12.50", 1250), (" 7.05 ", 705),
+                                              ("1,234.56", 123456), ("0.99", 99)])
+      def test_parse_amount(text, cents):
+          assert parse_amount(text) == cents
+
+
+      @pytest.mark.parametrize("bad", ["", "-1", "1.234", "1,23", "abc", "12,5"])
+      def test_parse_amount_invalid(bad):
+          with pytest.raises(ValueError):
+              parse_amount(bad)
+
+
+      def test_format_cents():
+          assert [format_cents(c) for c in (1250, 5, 0, 123456)] == ["12.50", "0.05", "0.00", "1234.56"]
+
+
+      def test_allocate_equal_three_ways():
+          assert allocate(1000, [1, 1, 1]) == [334, 333, 333]
+
+
+      def test_allocate_weighted():
+          assert allocate(100, [1, 2]) == [33, 67]
+          assert sum(allocate(9999, [3, 5, 7, 1])) == 9999
+    tests/test_fx.py: |
+      from splitbill.fx import convert
+
+      RATES = {"EUR": "1", "USD": "1.08", "GBP": "0.5"}
+
+
+      def test_same_currency():
+          assert convert(1234, "USD", "USD", RATES) == 1234
+
+
+      def test_eur_to_usd():
+          assert convert(1000, "EUR", "USD", RATES) == 1080
+
+
+      def test_gbp_to_eur():
+          assert convert(500, "GBP", "EUR", RATES) == 1000
+    tests/test_split.py: |
+      import pytest
+      from splitbill.models import Expense
+      from splitbill.split import shares
+
+
+      def test_equal_shares():
+          e = Expense("e1", "2026-10-01", "ann", 1000, "EUR", ["ann", "bob", "cy"])
+          assert shares(e) == {"ann": 334, "bob": 333, "cy": 333}
+
+
+      def test_weighted_shares():
+          e = Expense("e2", "2026-10-01", "bob", 9000, "EUR", ["ann", "bob"], [1, 2])
+          assert shares(e) == {"ann": 3000, "bob": 6000}
+
+
+      def test_duplicate_participant():
+          with pytest.raises(ValueError):
+              shares(Expense("e3", "2026-10-01", "ann", 100, "EUR", ["ann", "ann"]))
+    tests/test_ledger.py: |
+      from splitbill.ledger import balances
+      from splitbill.models import Expense
+
+
+      def test_payer_is_owed():
+          e = Expense("e1", "2026-10-01", "ann", 3000, "EUR", ["ann", "bob", "cy"])
+          assert balances([e]) == {"ann": 2000, "bob": -1000, "cy": -1000}
+
+
+      def test_balances_sum_to_zero():
+          es = [Expense("e1", "2026-10-01", "ann", 1000, "EUR", ["ann", "bob", "cy"]),
+                Expense("e2", "2026-10-02", "bob", 4500, "EUR", ["ann", "bob"], [1, 2])]
+          b = balances(es)
+          assert sum(b.values()) == 0 and set(b) == {"ann", "bob", "cy"}
+    tests/test_settle.py: |
+      from splitbill.settle import settle
+
+
+      def test_single_creditor():
+          assert settle({"ann": 500, "bob": -300, "cy": -200}) == [("bob", "ann", 300), ("cy", "ann", 200)]
+
+
+      def test_nothing_to_settle():
+          assert settle({"ann": 0, "bob": 0}) == []
+    tests/test_csvio.py: |
+      from splitbill.csvio import read_expenses
+
+      CSV = (
+          "id,date,payer,amount,currency,participants,weights\n"
+          "e1,2026-10-01,ann,\"1,234.56\",eur,ann; bob ;cy,\n"
+          "\n"
+          "e2,2026-10-02,bob,30.00,EUR,ann;bob,1;2\n"
+      )
+
+
+      def test_read_expenses():
+          es = read_expenses(CSV)
+          assert [(e.id, e.payer, e.amount, e.currency, e.participants, e.weights) for e in es] == [
+              ("e1", "ann", 123456, "EUR", ["ann", "bob", "cy"], None),
+              ("e2", "bob", 3000, "EUR", ["ann", "bob"], [1, 2]),
+          ]
+    tests/test_cli.py: |
+      import subprocess
+      import sys
+      from pathlib import Path
+
+      ROOT = Path(__file__).resolve().parents[1]
+      CSV = (
+          "id,date,payer,amount,currency,participants,weights\n"
+          "e1,2026-10-01,ann,60.00,EUR,ann;bob;cy,\n"
+          "e2,2026-10-02,bob,30.00,EUR,bob;cy,\n"
+      )
+
+
+      def run(*args):
+          return subprocess.run([sys.executable, "-m", "splitbill", *args], cwd=ROOT, capture_output=True, text=True)
+
+
+      def test_cli_report(tmp_path):
+          f = tmp_path / "trip.csv"
+          f.write_text(CSV)
+          r = run(str(f))
+          assert r.returncode == 0, r.stderr
+          assert "  cy -> ann: 35.00" in r.stdout
+
+
+      def test_cli_missing_file(tmp_path):
+          r = run(str(tmp_path / "nope.csv"))
+          assert r.returncode == 2 and "error" in r.stderr
+    conftest.py: |
+      # makes the project root importable for pytest
+    README.md: |
+      # splitbill
+
+      Share group expenses and settle up. Amounts are integer cents everywhere; every function documents its
+      exact behaviour in its docstring (that is the specification).
+
+      ```
+      python -m splitbill EXPENSES.csv [--base EUR] [--rates RATES.csv]
+      ```
+checks:
+- id: tests-unchanged
+  type: python
+  code: |
+    import hashlib
+    def norm_hash(p):
+        t = "\n".join(l.rstrip() for l in Path(p).read_text(encoding="utf-8").strip().splitlines())
+        return hashlib.sha256(t.encode("utf-8")).hexdigest()
+    for rel, h in {'tests/test_money.py': '724765075370242fc0ca747c591832176344fe45925e7b13ae632a0da972452b', 'tests/test_fx.py': 'e295222bdd83b19e03de3cfee49e499ee5b75e0449058de9cd724562b2491547', 'tests/test_split.py': 'd4fd7e9a42eb758365129ab0521114009cac150d563fe65a453157f82d80c08a', 'tests/test_ledger.py': '7e8f4cf89ae90b22573cef3501bd7cb5cb990e62005488a9284b8c5b07883910', 'tests/test_settle.py': '7e33e63ad169af2eb2dbbfd53aa8c526a5fd4861d058995264fce6f22e419f55', 'tests/test_csvio.py': 'b400908cdf722b6bc569d121d96340751dede217219304e91384d3a1419fdb09', 'tests/test_cli.py': '8c8a430f55cbe81ef9abc6b3c272ad1b6467f4345677c769dc2bedb06c8d34c1', 'conftest.py': 'af1fdf40436037573f03b505e582abc0fc806dc66604adaa8165580f6585e4cb'}.items():
+        assert path(rel).is_file() and norm_hash(path(rel)) == h, f"{rel} was modified or deleted"
+    extra = [p.name for p in path("tests").rglob("*") if p.is_file() and p.suffix == ".py" and str(p.relative_to(ws)) not in {'tests/test_money.py': '724765075370242fc0ca747c591832176344fe45925e7b13ae632a0da972452b', 'tests/test_fx.py': 'e295222bdd83b19e03de3cfee49e499ee5b75e0449058de9cd724562b2491547', 'tests/test_split.py': 'd4fd7e9a42eb758365129ab0521114009cac150d563fe65a453157f82d80c08a', 'tests/test_ledger.py': '7e8f4cf89ae90b22573cef3501bd7cb5cb990e62005488a9284b8c5b07883910', 'tests/test_settle.py': '7e33e63ad169af2eb2dbbfd53aa8c526a5fd4861d058995264fce6f22e419f55', 'tests/test_csvio.py': 'b400908cdf722b6bc569d121d96340751dede217219304e91384d3a1419fdb09', 'tests/test_cli.py': '8c8a430f55cbe81ef9abc6b3c272ad1b6467f4345677c769dc2bedb06c8d34c1', 'conftest.py': 'af1fdf40436037573f03b505e582abc0fc806dc66604adaa8165580f6585e4cb'}]
+    assert not extra, f"new files under tests/: {extra}"
+- id: tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    pytest_in(ws, 28, "tests")
+- id: hidden-spec
+  type: python
+  code: |
+    from splitbill.fx import convert
+    from splitbill.money import allocate, format_cents, parse_amount
+    from splitbill.ledger import balances
+    from splitbill.models import Expense
+    from splitbill.settle import settle
+    calls, want = {'convert': [(1000, 'USD', 'EUR'), (1, 'EUR', 'X'), (5, 'X', 'EUR'), (3, 'X', 'EUR'), (100000, 'SEK', 'EUR'), (4550, 'CHF', 'EUR'), (1080, 'USD', 'EUR'), (999, 'EUR', 'USD'), (12345, 'USD', 'SEK'), (7, 'EUR', 'EUR')], 'allocate': [(10, [1, 1, 1, 1]), (7, [0, 1, 1]), (100, [1, 1, 1]), (5, [2, 1, 2]), (1, [1, 1]), (2, [1, 3, 1, 3]), (1001, [5, 3, 2]), (0, [1, 2])], 'parse': ['0.5', '1,000', '10.05', '1,234,567.8', ' 3 '], 'parse_bad': ['1,0000', '1 000', '12.345', '-0.10', '1,23.45', ''], 'format': [-5, -1205, 7, 100, 0]}, {'convert': [926, 2, 3, 2, 8795, 4840, 1000, 1079, 129965, 7], 'allocate': [[3, 3, 2, 2], [0, 4, 3], [34, 33, 33], [2, 1, 2], [1, 0], [0, 1, 0, 1], [501, 300, 200], [0, 0]], 'parse': [50, 100000, 1005, 123456780, 300], 'format': ['-0.05', '-12.05', '0.07', '1.00', '0.00'], 'balances': {'dora': 2444, 'emil': 1454, 'finn': -3898}, 'settle': [['finn', 'dora', 2444], ['finn', 'emil', 1454]]}
+    R = {"EUR": "1", "USD": "1.08", "SEK": "11.37", "CHF": "0.94", "X": "2"}
+    got = [convert(c, f, t, R) for c, f, t in calls["convert"]]
+    bad = [f"convert{tuple(a)} = {g}, expected {w}" for a, g, w in zip(calls["convert"], got, want["convert"]) if g != w]
+    assert not bad, "fx.convert must use exact decimal arithmetic rounded half up: " + "; ".join(bad)
+    for (t, w), exp in zip(calls["allocate"], want["allocate"]):
+        assert allocate(t, w) == exp, f"allocate({t}, {w}) = {allocate(t, w)}, expected {exp}"
+    for s, exp in zip(calls["parse"], want["parse"]):
+        assert parse_amount(s) == exp, f"parse_amount({s!r}) = {parse_amount(s)}, expected {exp}"
+    for s in calls["parse_bad"]:
+        try:
+            v = parse_amount(s)
+        except ValueError:
+            continue
+        raise AssertionError(f"parse_amount({s!r}) should raise ValueError, returned {v}")
+    for c, exp in zip(calls["format"], want["format"]):
+        assert format_cents(c) == exp, f"format_cents({c}) = {format_cents(c)!r}, expected {exp!r}"
+    es = [Expense("h1", "2026-10-01", "dora", 10000, "USD", ["dora", "emil", "finn"]),
+          Expense("h2", "2026-10-02", "emil", 4550, "CHF", ["dora", "finn"], [2, 1]),
+          Expense("h3", "2026-10-03", "finn", 1001, "EUR", ["dora", "emil", "finn"], [5, 3, 2])]
+    b = balances(es, "EUR", R)
+    assert b == want["balances"], f"balances = {b}, expected {want['balances']}"
+    s = [list(x) for x in settle(b)]
+    assert s == want["settle"], f"settle = {s}, expected {want['settle']}"
+    assert [list(x) for x in settle({"a": 300, "b": 300, "c": -300, "d": -300})] == [["c", "a", 300], ["d", "b", 300]], "settle ties: alphabetical"
+- id: hidden-cli
+  type: python
+  code: |
+    import subprocess, sys, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        (Path(d) / "trip.csv").write_text('id,date,payer,amount,currency,participants,weights\nh1,2026-10-01,dora,100.05,USD,dora;emil;finn,\nh2,2026-10-02,emil,"1,000.00",SEK,dora;emil;finn;gus,1;1;1;2\nh3,2026-10-03,finn,10.5,EUR,emil;gus,\nh4,2026-10-04,gus,45.55,CHF,dora;finn,2;1\n', encoding="utf-8")
+        (Path(d) / "rates.csv").write_text('currency,per_eur\nEUR,1\nUSD,1.08\nSEK,11.37\nCHF,0.94\n', encoding="utf-8")
+        r = subprocess.run([sys.executable, "-m", "splitbill", str(Path(d) / "trip.csv"), "--rates", str(Path(d) / "rates.csv")],
+                           cwd=ws, capture_output=True, text=True, timeout=60)
+        assert r.returncode == 0, "python -m splitbill failed: " + (r.stdout + r.stderr)[-600:]
+        got = [l.rstrip() for l in r.stdout.strip().splitlines()]
+        want = [l.rstrip() for l in 'Balances (EUR):\n  dora: +11.86\n  emil: +34.23\n  finn: -54.12\n  gus: +8.03\n\nTransfers:\n  finn -> emil: 34.23\n  finn -> dora: 11.86\n  finn -> gus: 8.03\n'.strip().splitlines()]
+        assert got == want, "CLI report differs. expected: " + " | ".join(want) + "  got: " + " | ".join(got)

@@ -1,0 +1,194 @@
+# hard 03 — data cleaning: BOM / Windows-1252 / CRLF / NBSP / NFC / time zones / units / half-up / duplicates; hidden re-run
+id: hard-data-cleaning-shipments
+title: Clean three messy shipment exports (encodings, BOM, CRLF, time zones, units, duplicates) — re-run on unseen data
+category: files
+prompt: |
+  Write `clean.py` (one file, standard library only) in the workspace root and run it. `python clean.py`, started
+  from the workspace root, reads the shipment exports in `raw/` and writes the results to `out/`. It will be re-run
+  on future exports (same formats, different rows), so everything must be computed from the files.
+
+  Inputs (processing order: EU file, then US file, then web file; rows in file order):
+  1. `raw/eu_shipments.csv` — UTF-8 with a byte-order mark, `;`-separated with standard CSV quoting, header
+     `Shipment ID;Date;Customer;Country;Weight (kg)`. Dates are `D.M.YYYY` (day first; day and month have 1 or 2
+     digits). Weights are kilograms with a decimal comma and optional `.` thousands separators (`1.250,5`).
+  2. `raw/us_shipments.csv` — Windows-1252 encoded, CRLF line endings, `,`-separated with standard CSV quoting,
+     header `shipment_id,ship_date,customer_name,country,weight_lb`. Dates are `M/D/YYYY` (month first). Weights
+     are pounds with a decimal point and optional `,` thousands separators.
+  3. `raw/web_shipments.jsonl` — UTF-8, one JSON object per line with the keys `id`, `created_at`, `customer`,
+     `country`, `weight`. `created_at` is `YYYY-MM-DDTHH:MM:SS` followed by `Z` or a `±HH:MM` offset. `weight` is
+     either a JSON number (kilograms) or a string `<number><unit>` with an optional single space before the unit;
+     the number uses a decimal point and the unit is `kg`, `g` or `lb` in any letter case.
+  4. `raw/countries.csv` — `alias,code`: country names and codes mapped to ISO codes.
+
+  Cleaning rules:
+  - Text values are Unicode-NFC-normalized, stripped, and every inner run of whitespace (including tabs and
+    non-breaking spaces) becomes one space. After that, an empty value or one of `n/a`, `na`, `null`, `none`, `-`
+    (any letter case) is missing; a JSON `null` or absent key is missing too.
+  - `shipment_id`: upper-case it and remove all spaces and `-`; the result must match `[A-Z]{2}[0-9]{5}`.
+  - `customer`: the normalized text, letter case unchanged.
+  - `date`: `YYYY-MM-DD`; for web records the calendar date of `created_at` converted to UTC.
+  - `country`: the ISO code of the normalized value, looked up case-insensitively among the (equally normalized)
+    aliases of `countries.csv`.
+  - `weight_kg`: the weight in kilograms (1 lb = 0.45359237 kg, 1 g = 0.001 kg), which must be greater than 0,
+    rounded half up to 3 decimals (exact decimal rounding of the value as written: `2,0625` kg → `2.063`).
+  - Blank rows — empty lines, whitespace-only lines and CSV rows whose fields are all empty — are skipped
+    silently. Every other row is either valid or rejected with the first failing reason in this order:
+    `bad_row` (CSV row with a wrong number of fields) / `bad_json` (web line that is not a JSON object),
+    `bad_id`, `missing_customer`, `bad_date` (missing, wrong format or impossible date), `bad_weight` (missing,
+    unparseable — a JSON boolean is not a number — or not > 0), `unknown_country` (missing or unknown).
+  - Duplicates: of valid rows with the same `shipment_id`, keep only the LAST one in processing order; each
+    dropped row counts as a duplicate (rejected rows never count as duplicates).
+
+  Outputs (UTF-8 without BOM, `\n` line endings):
+  - `out/shipments.csv` — header `shipment_id,date,customer,country,weight_kg`; the kept rows sorted by date,
+    then shipment_id; weight_kg with exactly 3 decimals; standard CSV quoting (Python's csv module defaults).
+  - `out/rejects.csv` — header `source,line,reason`; `source` is the input file name (e.g. `eu_shipments.csv`),
+    `line` the 1-based physical line number in that file (a CSV header is line 1); ordered by processing order,
+    then line.
+  - `out/summary.json` — exactly the keys `valid` (rows in shipments.csv), `rejected` (rows in rejects.csv),
+    `duplicates`, `total_weight_kg` (sum of the weight_kg column, a number rounded to 3 decimals) and
+    `by_country` (object: ISO code → number of rows in shipments.csv).
+setup:
+  files:
+    raw/eu_shipments.csv: "Shipment ID;Date;Customer;Country;Weight (kg)\nEU-10001;3.9.2026;Anna Schmidt;Germany;12,5\neu 10002;15.09.2026;  Jan\tde  Vries ;the netherlands;1.250\nEU-10003;31.09.2026;Pierre Martin;France;3,2\nEU-10004;20.09.2026;N/A;Germany;4\nEU-1005;21.09.2026;Lena Weber;Deutschland;2,0\nEU-10006;22.09.2026;Lena Weber;DEU;2,0625\nEU-10007;23.09.2026;Marco Rossi;Italy;7,75\nEU-10008;24.09.2026;Sofie Jansen;NL;0\n\nEU-10009;25.9.2026;\"Müller; Sons\";Österreich;5,5\n;;;;\nEU-10010;26.09.2026;Eva Novak;AT;12.5\nEU-10011;27.09.2026;Tom Baker;UK;1.000,25\nEU-10012;2026-09-28;Ida Berg;Germany;3,3\nEU-10013;29.09.2026;Ole Lund;-;6,1\nEU-10014;30.09.2026;Kai Brandt;Germany;4,4;extra\nEU-10015;1.10.2026;Ruth  Klein;deutschland;0,4\n"
+    raw/us_shipments.csv: |
+      shipment_id,ship_date,customer_name,country,weight_lb
+      US-20001,9/3/2026,Zoë Müller,USA,10
+      US-20002,09/15/2026,"O’Brien, Pat",United States,"1,250.5"
+      US-20003,13/01/2026,José Núñez,US,3
+      US-20004,9/20/2026,François Dubois,Canada,0.5
+      us20005,9/21/2026,  Ærø Hansen ,U.S.A.,2.25
+      US-20006,9/22/2026,null,USA,4
+      US-20007,9/23/2026,Bob Stone,USA,-3
+      US-20008,9/24/2026,Li Wei,Mexico,8
+      EU-10001,9/25/2026,Anna Schmidt,Germany,22
+      US-20002,9/26/2026,"O’Brien, Pat",USA,abc
+      US-20009,2/29/2026,Ann Lee,USA,5
+
+      US-20010,9/30/2026,Ann Lee,usa,0.1
+    raw/web_shipments.jsonl: "{\"id\": \"WB-30001\", \"created_at\": \"2026-09-30T23:30:00-05:00\", \"customer\": \"Zoë Adams\", \"country\": \"Canada\", \"weight\": \"500 g\"}\n{\"id\": \"WB-30002\", \"created_at\": \"2026-10-01T01:15:00+02:00\", \"customer\": \"Max Mustermann\", \"country\": \"DE\", \"weight\": 2.5}\n{\"id\": \"WB-30003\", \"created_at\": \"2026-10-02T10:00:00Z\", \"customer\": \"Ivy Chen\", \"country\": \"US\", \"weight\": \"3lb\"}\nnot json at all\n{\"id\": \"WB-30004\", \"created_at\": \"2026-10-02 10:00:00\", \"customer\": \"Omar Haddad\", \"country\": \"FR\", \"weight\": \"1 kg\"}\n{\"id\": \"WB-30005\", \"created_at\": \"2026-10-03T08:00:00Z\", \"customer\": \"  \", \"country\": \"FR\", \"weight\": \"1kg\"}\n{\"id\": \"WB-30006\", \"created_at\": \"2026-10-03T09:00:00Z\", \"customer\": \"Noah Kim\", \"country\": \"France\", \"weight\": \"2.5\"}\n[\"WB-30007\"]\n{\"id\": \"eu-10015\", \"created_at\": \"2026-10-04T12:00:00+01:00\", \"customer\": \"Ruth Klein\", \"country\": \"Austria\", \"weight\": \"2.1 KG\"}\n   \n{\"id\": \"WB-30008\", \"created_at\": \"2026-10-05T00:30:00+03:00\", \"customer\": \"Emma\\tStone\", \"country\": \"GB\", \"weight\": 1.0005}\n{\"id\": 30009, \"created_at\": \"2026-10-05T10:00:00Z\", \"customer\": \"Ben Ali\", \"country\": \"FR\", \"weight\": \"1 kg\"}\n{\"id\": \"WB-30010\", \"created_at\": \"2026-10-06T10:00:00Z\", \"customer\": \"Liam O'Neil\", \"country\": \"uk\", \"weight\": \"0 kg\"}\n{\"id\": \"WB-30011\", \"created_at\": \"2026-10-06T11:00:00Z\", \"customer\": \"Mia Wong\", \"country\": null, \"weight\": \"750g\"}\n"
+    raw/countries.csv: |
+      alias,code
+      Germany,DE
+      Deutschland,DE
+      DE,DE
+      DEU,DE
+      France,FR
+      FR,FR
+      FRA,FR
+      United States,US
+      USA,US
+      US,US
+      U.S.A.,US
+      United Kingdom,GB
+      Great Britain,GB
+      UK,GB
+      GB,GB
+      Netherlands,NL
+      The Netherlands,NL
+      NL,NL
+      Austria,AT
+      Österreich,AT
+      AT,AT
+      Canada,CA
+      CA,CA
+  commands:
+  - python3 -c "import pathlib; eu = pathlib.Path('raw/eu_shipments.csv'); eu.write_bytes(b'\xef\xbb\xbf' + eu.read_bytes()); us = pathlib.Path('raw/us_shipments.csv'); us.write_bytes(us.read_text(encoding='utf-8').replace('\n', '\r\n').encode('cp1252'))"
+checks:
+- id: outputs-exist
+  type: python
+  code: |
+    for f in ("clean.py", "out/shipments.csv", "out/rejects.csv", "out/summary.json"):
+        assert path(f).is_file(), f"{f} is missing"
+- id: shipments-exact
+  type: python
+  code: |
+    import csv, io, json
+    def cmp_csv(name, data, want):
+        assert not data.startswith(b"\xef\xbb\xbf"), f"{name} must not start with a byte-order mark"
+        assert b"\r" not in data, f"{name} must use \\n line endings"
+        text = data.decode("utf-8")
+        got = [r for r in csv.reader(io.StringIO(text)) if r]
+        exp = [r for r in csv.reader(io.StringIO(want)) if r]
+        assert got and got[0] == exp[0], f"{name}: header {got[:1]} != {exp[0]}"
+        bad = [f"{g} != expected {e}" for g, e in zip(got[1:], exp[1:]) if g != e]
+        assert len(got) == len(exp) and not bad, f"{name}: {len(got) - 1} data rows (expected {len(exp) - 1}); " + "; ".join(bad[:4])
+    def cmp_summary(data, want):
+        s, e = json.loads(data.decode("utf-8")), json.loads(want)
+        assert set(s) == set(e), f"summary.json keys {sorted(s)} != {sorted(e)}"
+        for k in ("valid", "rejected", "duplicates", "by_country"):
+            assert s[k] == e[k], f"summary.json {k} = {s[k]!r}, expected {e[k]!r}"
+        assert abs(float(s["total_weight_kg"]) - e["total_weight_kg"]) < 0.0005, f"total_weight_kg = {s['total_weight_kg']}, expected {e['total_weight_kg']}"
+    cmp_csv("shipments.csv", path("out/shipments.csv").read_bytes(), 'shipment_id,date,customer,country,weight_kg\nUS20001,2026-09-03,Zoë Müller,US,4.536\nEU10002,2026-09-15,Jan de Vries,NL,1250.000\nUS20002,2026-09-15,"O’Brien, Pat",US,567.217\nUS20004,2026-09-20,François Dubois,CA,0.227\nUS20005,2026-09-21,Ærø Hansen,US,1.021\nEU10006,2026-09-22,Lena Weber,DE,2.063\nEU10001,2026-09-25,Anna Schmidt,DE,9.979\nEU10009,2026-09-25,Müller; Sons,AT,5.500\nEU10011,2026-09-27,Tom Baker,GB,1000.250\nUS20010,2026-09-30,Ann Lee,US,0.045\nWB30002,2026-09-30,Max Mustermann,DE,2.500\nWB30001,2026-10-01,Zoë Adams,CA,0.500\nWB30003,2026-10-02,Ivy Chen,US,1.361\nEU10015,2026-10-04,Ruth Klein,AT,2.100\nWB30008,2026-10-04,Emma Stone,GB,1.001\n')
+- id: rejects-exact
+  type: python
+  code: |
+    import csv, io, json
+    def cmp_csv(name, data, want):
+        assert not data.startswith(b"\xef\xbb\xbf"), f"{name} must not start with a byte-order mark"
+        assert b"\r" not in data, f"{name} must use \\n line endings"
+        text = data.decode("utf-8")
+        got = [r for r in csv.reader(io.StringIO(text)) if r]
+        exp = [r for r in csv.reader(io.StringIO(want)) if r]
+        assert got and got[0] == exp[0], f"{name}: header {got[:1]} != {exp[0]}"
+        bad = [f"{g} != expected {e}" for g, e in zip(got[1:], exp[1:]) if g != e]
+        assert len(got) == len(exp) and not bad, f"{name}: {len(got) - 1} data rows (expected {len(exp) - 1}); " + "; ".join(bad[:4])
+    def cmp_summary(data, want):
+        s, e = json.loads(data.decode("utf-8")), json.loads(want)
+        assert set(s) == set(e), f"summary.json keys {sorted(s)} != {sorted(e)}"
+        for k in ("valid", "rejected", "duplicates", "by_country"):
+            assert s[k] == e[k], f"summary.json {k} = {s[k]!r}, expected {e[k]!r}"
+        assert abs(float(s["total_weight_kg"]) - e["total_weight_kg"]) < 0.0005, f"total_weight_kg = {s['total_weight_kg']}, expected {e['total_weight_kg']}"
+    cmp_csv("rejects.csv", path("out/rejects.csv").read_bytes(), 'source,line,reason\neu_shipments.csv,4,bad_date\neu_shipments.csv,5,missing_customer\neu_shipments.csv,6,bad_id\neu_shipments.csv,8,unknown_country\neu_shipments.csv,9,bad_weight\neu_shipments.csv,13,bad_weight\neu_shipments.csv,15,bad_date\neu_shipments.csv,16,unknown_country\neu_shipments.csv,17,bad_row\nus_shipments.csv,4,bad_date\nus_shipments.csv,7,missing_customer\nus_shipments.csv,8,bad_weight\nus_shipments.csv,9,unknown_country\nus_shipments.csv,11,bad_weight\nus_shipments.csv,12,bad_date\nweb_shipments.jsonl,4,bad_json\nweb_shipments.jsonl,5,bad_date\nweb_shipments.jsonl,6,missing_customer\nweb_shipments.jsonl,7,bad_weight\nweb_shipments.jsonl,8,bad_json\nweb_shipments.jsonl,12,bad_id\nweb_shipments.jsonl,13,bad_weight\nweb_shipments.jsonl,14,unknown_country\n')
+- id: summary-exact
+  type: python
+  code: |
+    import csv, io, json
+    def cmp_csv(name, data, want):
+        assert not data.startswith(b"\xef\xbb\xbf"), f"{name} must not start with a byte-order mark"
+        assert b"\r" not in data, f"{name} must use \\n line endings"
+        text = data.decode("utf-8")
+        got = [r for r in csv.reader(io.StringIO(text)) if r]
+        exp = [r for r in csv.reader(io.StringIO(want)) if r]
+        assert got and got[0] == exp[0], f"{name}: header {got[:1]} != {exp[0]}"
+        bad = [f"{g} != expected {e}" for g, e in zip(got[1:], exp[1:]) if g != e]
+        assert len(got) == len(exp) and not bad, f"{name}: {len(got) - 1} data rows (expected {len(exp) - 1}); " + "; ".join(bad[:4])
+    def cmp_summary(data, want):
+        s, e = json.loads(data.decode("utf-8")), json.loads(want)
+        assert set(s) == set(e), f"summary.json keys {sorted(s)} != {sorted(e)}"
+        for k in ("valid", "rejected", "duplicates", "by_country"):
+            assert s[k] == e[k], f"summary.json {k} = {s[k]!r}, expected {e[k]!r}"
+        assert abs(float(s["total_weight_kg"]) - e["total_weight_kg"]) < 0.0005, f"total_weight_kg = {s['total_weight_kg']}, expected {e['total_weight_kg']}"
+    cmp_summary(path("out/summary.json").read_bytes(), '{\n  "valid": 15,\n  "rejected": 23,\n  "duplicates": 2,\n  "total_weight_kg": 2848.3,\n  "by_country": {\n    "AT": 2,\n    "CA": 2,\n    "DE": 3,\n    "GB": 2,\n    "NL": 1,\n    "US": 5\n  }\n}\n')
+- id: rerun-unseen-data
+  type: python
+  timeout: 180
+  code: |
+    import csv, io, json
+    def cmp_csv(name, data, want):
+        assert not data.startswith(b"\xef\xbb\xbf"), f"{name} must not start with a byte-order mark"
+        assert b"\r" not in data, f"{name} must use \\n line endings"
+        text = data.decode("utf-8")
+        got = [r for r in csv.reader(io.StringIO(text)) if r]
+        exp = [r for r in csv.reader(io.StringIO(want)) if r]
+        assert got and got[0] == exp[0], f"{name}: header {got[:1]} != {exp[0]}"
+        bad = [f"{g} != expected {e}" for g, e in zip(got[1:], exp[1:]) if g != e]
+        assert len(got) == len(exp) and not bad, f"{name}: {len(got) - 1} data rows (expected {len(exp) - 1}); " + "; ".join(bad[:4])
+    def cmp_summary(data, want):
+        s, e = json.loads(data.decode("utf-8")), json.loads(want)
+        assert set(s) == set(e), f"summary.json keys {sorted(s)} != {sorted(e)}"
+        for k in ("valid", "rejected", "duplicates", "by_country"):
+            assert s[k] == e[k], f"summary.json {k} = {s[k]!r}, expected {e[k]!r}"
+        assert abs(float(s["total_weight_kg"]) - e["total_weight_kg"]) < 0.0005, f"total_weight_kg = {s['total_weight_kg']}, expected {e['total_weight_kg']}"
+    import shutil, subprocess, sys, tempfile
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        shutil.copy(path("clean.py"), d / "clean.py")
+        (d / "raw").mkdir()
+        for name, data in {'eu_shipments.csv': b'\xef\xbb\xbfShipment ID;Date;Customer;Country;Weight (kg)\nEU-40001;1.10.2026;Hanna Vogel;Germany;1.500,75\nEU-40002;2.10.2026;Felix\xc2\xa0\xc2\xa0Wolf;France;0,0005\nEU-40003;29.2.2028;Greta Lang;AT;3\nEU-40004;30.02.2026;Paul Roth;AT;3\nEU-40005;4.10.2026;none;Germany;1\nEU-40006;5.10.2026;"Bauer; Kinder";great britain;2,25\neu-4 0007;6.10.2026;Mila Horn;NL;7,000\nEU-40008;7.10.2026;Nina Kraft;Belgium;1\nEU-40009;8.10.2026;Otto Fink;Germany;\nEU-40010;9.10.2026;Pia Graf;Germany;12,5;\n   \nEU-40011;10.10.2026;Rosa Brand;FRA;9,9995\nEU-40012;11.10.2026;Ben Ott;Germany;1\n', 'us_shipments.csv': b'shipment_id,ship_date,customer_name,country,weight_lb\r\nUS-50001,10/1/2026,Chlo\xe9 Martin,USA,1\r\nUS-50002,10/02/2026,"Smith \x96 Jones, Sam",United States,"2,000"\r\nUS-50003,10/3/2026,Dana Scully,Canada,0\r\nEU-40012,10/4/2026,Ben Ott,France,3.5\r\nUS-50004,10/32/2026,Fox Mulder,USA,2\r\nUS-50005,10/5/2026,N/A,USA,2\r\nUS-50006,10/6/2026,Walter Skinner,US,12.25.1\r\nUS-50001,10/7/2026,Chlo\xe9  Martin,usa,1.5\r\nUS-5007,10/8/2026,Monica Reyes,USA,4\r\n', 'web_shipments.jsonl': b'{"id": "WB-60001", "created_at": "2026-10-09T20:00:00-04:00", "customer": "Ama Owusu", "country": "Canada", "weight": "1,5 kg"}\n{"id": "WB-60002", "created_at": "2026-10-10T03:00:00+05:30", "customer": "Ravi Shah", "country": "GB", "weight": "1500 G"}\n{"id": "WB-60003", "created_at": "2026-10-11T12:00:00Z", "customer": "Cafe\\u0301 Ole\\u0301", "country": "FR", "weight": 0.25}\n{"id": "WB-60004", "created_at": \n{"id": "US-50003", "created_at": "2026-10-12T09:00:00Z", "customer": "Dana Scully", "country": "CA", "weight": "2 lb"}\n{"id": "WB-60005", "created_at": "2026-10-12T25:00:00Z", "customer": "Late Night", "country": "US", "weight": "1 kg"}\n{"id": "WB-60006", "created_at": "2026-10-13T08:00:00Z", "customer": null, "country": "US", "weight": "1 kg"}\n{"id": "WB-60007", "created_at": "2026-10-13T09:00:00Z", "customer": "Yuki Sato", "country": "Japan", "weight": "1 kg"}\n{"id": "WB-60008", "created_at": "2026-10-14T23:59:59-00:30", "customer": "Edge Case", "country": "NL", "weight": true}\n{"id": "WB-60009", "created_at": "2026-10-14T23:59:59-00:30", "customer": "Edge Case", "country": "NL", "weight": 10}\n{}\n', 'countries.csv': b'alias,code\nGermany,DE\nDeutschland,DE\nDE,DE\nDEU,DE\nFrance,FR\nFR,FR\nFRA,FR\nUnited States,US\nUSA,US\nUS,US\nU.S.A.,US\nUnited Kingdom,GB\nGreat Britain,GB\nUK,GB\nGB,GB\nNetherlands,NL\nThe Netherlands,NL\nNL,NL\nAustria,AT\n\xc3\x96sterreich,AT\nAT,AT\nCanada,CA\nCA,CA\n'}.items():
+            (d / "raw" / name).write_bytes(data)
+        r = subprocess.run([sys.executable, "clean.py"], cwd=d, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, "clean.py failed on next month's exports: " + (r.stdout + r.stderr)[-800:]
+        cmp_csv("shipments.csv", (d / "out/shipments.csv").read_bytes(), 'shipment_id,date,customer,country,weight_kg\nEU40001,2026-10-01,Hanna Vogel,DE,1500.750\nEU40002,2026-10-02,Felix Wolf,FR,0.001\nUS50002,2026-10-02,"Smith – Jones, Sam",US,907.185\nEU40012,2026-10-04,Ben Ott,FR,1.588\nEU40006,2026-10-05,Bauer; Kinder,GB,2.250\nEU40007,2026-10-06,Mila Horn,NL,7.000\nUS50001,2026-10-07,Chloé Martin,US,0.680\nWB60002,2026-10-09,Ravi Shah,GB,1.500\nEU40011,2026-10-10,Rosa Brand,FR,10.000\nWB60003,2026-10-11,Café Olé,FR,0.250\nUS50003,2026-10-12,Dana Scully,CA,0.907\nWB60009,2026-10-15,Edge Case,NL,10.000\nEU40003,2028-02-29,Greta Lang,AT,3.000\n')
+        cmp_csv("rejects.csv", (d / "out/rejects.csv").read_bytes(), 'source,line,reason\neu_shipments.csv,5,bad_date\neu_shipments.csv,6,missing_customer\neu_shipments.csv,9,unknown_country\neu_shipments.csv,10,bad_weight\neu_shipments.csv,11,bad_row\nus_shipments.csv,4,bad_weight\nus_shipments.csv,6,bad_date\nus_shipments.csv,7,missing_customer\nus_shipments.csv,8,bad_weight\nus_shipments.csv,10,bad_id\nweb_shipments.jsonl,1,bad_weight\nweb_shipments.jsonl,4,bad_json\nweb_shipments.jsonl,6,bad_date\nweb_shipments.jsonl,7,missing_customer\nweb_shipments.jsonl,8,unknown_country\nweb_shipments.jsonl,9,bad_weight\nweb_shipments.jsonl,11,bad_id\n')
+        cmp_summary((d / "out/summary.json").read_bytes(), '{\n  "valid": 13,\n  "rejected": 17,\n  "duplicates": 2,\n  "total_weight_kg": 2445.111,\n  "by_country": {\n    "AT": 1,\n    "CA": 1,\n    "DE": 1,\n    "FR": 4,\n    "GB": 2,\n    "NL": 2,\n    "US": 2\n  }\n}\n')

@@ -131,7 +131,7 @@ def test_progress_guard_stops_near_identical_loop(rt, script):
     counter = iter(range(100))
 
     def step(msgs, tools):
-        if tools is None:  # wrap-up call is made without tools
+        if "Stop using tools" in str(msgs[-1].get("content")):  # the wrap-up (tools shown, tool_choice "none")
             return {"content": "final summary"}
         return {"tool_calls": [("run_shell", {"command": f"echo same  # variant {next(counter)}"})]}
 
@@ -231,3 +231,17 @@ def test_smart_approvals(rt, script):
     assert tools[0].startswith("exit_code: 0")           # guard approved a workspace-local rm -r
     assert "smart-approval guard" in tools[1]            # guard denied
     assert [h["category"] for h in hitl.log] == ["git:push"]  # pushing always asks the human
+
+
+def test_repetition_raises_temperature(rt, script):
+    temps = []
+    llm = script([{"tool_calls": [("list_dir", {"path": "."})]}] * 3 + [{"content": "done"}])
+    orig = llm.chat
+
+    def chat(messages, tools=None, temperature=None, **kw):
+        temps.append(temperature)
+        return orig(messages, tools, **kw)
+
+    llm.chat = chat
+    rt.agent("default").run("look around")
+    assert temps[:3] == [None, None, None] and temps[3] == 0.7  # third identical call warned → next turn sampled hotter

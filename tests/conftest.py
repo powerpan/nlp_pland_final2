@@ -1,16 +1,30 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 
 import pytest
 
+from pland import config
 from pland.hitl import ScriptedHITL
 from pland.llm.base import LLMResponse
 from pland.llm.factory import set_client_override
 from pland.llm.scripted import ScriptedLLM, _coerce
 from pland.runtime import Runtime
 from pland.store import DB
+
+# Unit tests never see the developer's real setup: no .env file is read (keys, PLAND_PROVIDER) and provider variables
+# exported by the shell are dropped, so the suite behaves the same whichever provider the developer uses.
+for _var in ("PLAND_PROVIDER", "DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "HKGAI_API_KEY", "HKGAI_BASE_URL",
+             "HKGAI_MODEL"):
+    os.environ.pop(_var, None)
+
+
+@pytest.fixture(autouse=True)
+def _no_real_dotenv(monkeypatch):
+    monkeypatch.setattr(config, "env_files", lambda: [])
+
 
 REFLECTION = json.dumps({"outcome": "success", "summary": "did it", "lessons": ["check files exist"],
                          "procedure": "1. write 2. verify", "tags": ["test"], "memory_notes": []})
@@ -24,12 +38,16 @@ class RoutingLLM:
         self.scripts = {k: list(v) for k, v in scripts.items()}
         self.reflection = reflection
         self.calls: list[tuple[str, list[dict]]] = []
+        self.turns: list[dict] = []  # per agent call: name, thinking and effort overrides
+        self.configs: list = []  # ModelConfig of every client the agents asked for
         self.provider, self.model = "scripted", "scripted"
 
     def __call__(self, cfg):
+        self.configs.append(cfg)
         return self
 
-    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None, temperature=None, on_delta=None) -> LLMResponse:
+    def chat(self, messages, tools=None, *, json_mode=False, max_tokens=None, temperature=None, on_delta=None, thinking=None,
+             effort=None, tool_choice=None) -> LLMResponse:
         system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
         last = messages[-1].get("content") or "" if messages else ""
         if "extract reusable experience" in system or str(last).startswith("[reflection request"):
@@ -40,6 +58,7 @@ class RoutingLLM:
         m = re.search(r"\(@([a-z0-9_-]+)\)", system)
         name = m.group(1) if m else "?"
         self.calls.append((name, messages))
+        self.turns.append({"name": name, "thinking": thinking, "effort": effort})
         script = self.scripts.get(name) or []
         if not script:
             return LLMResponse(content=f"[{name}] done")

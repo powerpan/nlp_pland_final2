@@ -14,7 +14,7 @@ with warnings.catch_warnings():  # starlette's TestClient warns about its httpx 
     warnings.simplefilter("ignore")
     from fastapi.testclient import TestClient
 
-from pland.memory import ExperienceStore
+from pland.memory import ExperienceStore, SkillStore
 from pland.server import app as server_app
 from pland.server.app import create_app
 from pland.sessions import SessionStore
@@ -416,16 +416,25 @@ def test_activity_events_come_with_the_transcript(client, rt, script):
                    grant="session", summary="rm -r build")
     rt.bus.publish("context.compacted", profile="default", session_id=sid, folded=12, size=900)
     rt.bus.publish("loop.detected", profile="default", session_id=sid, reason="same call 5 times")
+    rt.bus.publish("approval.smart", profile="default", session_id=sid, category="git:push", summary="git push origin main",
+                   verdict="escalate")
+    rt.bus.publish("memory.corrected", profile="default", session_id=sid, action="replace", old_text="user prefers tabs")
+    rt.bus.publish("security.injection_flagged", profile="default", session_id=sid, source="https://evil.example/page",
+                   patterns=["asks to ignore prior instructions"])
     rt.bus.publish("memory.session_search", profile="default", session_id=other, query="elsewhere", hits=1)
     rt.bus.publish("tool.started", profile="default", session_id=sid, tool="read_file")
     cursor = client.get(f"/api/profiles/default/sessions/{sid}/messages").json()["last_event_id"]
     data = client.get(f"/api/profiles/default/sessions/{sid}/messages?after={data['last_id']}").json()
     types = [a["type"] for a in data["activity"]]
-    assert types[-3:] == ["approval.auto", "context.compacted", "loop.detected"]
+    assert types[-6:] == ["approval.auto", "context.compacted", "loop.detected", "approval.smart", "memory.corrected",
+                          "security.injection_flagged"]
     assert "tool.started" not in types and all(a.get("query") != "elsewhere" for a in data["activity"])
-    auto = data["activity"][-3]
+    auto, compacted, loop, smart, corrected, flagged = data["activity"][-6:]
     assert (auto["category"], auto["grant"], auto["summary"]) == ("shell:recursive delete", "session", "rm -r build")
-    assert data["activity"][-2]["folded"] == 12 and data["activity"][-1]["reason"] == "same call 5 times"
+    assert compacted["folded"] == 12 and loop["reason"] == "same call 5 times"
+    assert (smart["category"], smart["summary"], smart["verdict"]) == ("git:push", "git push origin main", "escalate")
+    assert (corrected["action"], corrected["old_text"]) == ("replace", "user prefers tabs")
+    assert flagged["source"] == "https://evil.example/page" and flagged["patterns"] == ["asks to ignore prior instructions"]
     # incremental: only events after the cursor, and the cursor advances past unrelated events too
     tail = client.get(f"/api/profiles/default/sessions/{sid}/messages?after={data['last_id']}&events_after={cursor}").json()
     assert tail["activity"] == [] and tail["last_event_id"] == cursor
@@ -440,12 +449,25 @@ def test_activity_events_are_forwarded_to_websocket(client, rt):
         for t, data in (("memory.session_search", {"query": "q", "hits": 2}), ("budget.checkpoint", {"steps_left": 8}),
                         ("context.pruned", {"size": 10}), ("context.compacted", {"folded": 3}),
                         ("loop.detected", {"reason": "r"}), ("experience.retrieved", {"ids": ["x_1"], "scores": [1.0]}),
-                        ("experience.added", {"outcome": "success"}), ("approval.auto", {"category": "git:push", "grant": "always"})):
+                        ("experience.added", {"outcome": "success"}), ("approval.auto", {"category": "git:push", "grant": "always"}),
+                        ("approval.smart", {"category": "git:push", "verdict": "deny"}),
+                        ("memory.corrected", {"action": "remove", "old_text": "x"}),
+                        ("security.injection_flagged", {"source": "q", "patterns": ["p"]})):
             rt.bus.publish(t, profile="default", session_id="s_x", **data)
             ev = ws.receive_json()
             assert ev["type"] == t and all(ev[k] == v for k, v in data.items())
 
 
+def test_memory_view_reports_skill_usage_without_counting_a_view(client, rt):
+    store = SkillStore(rt.profiles.get("default"))
+    store.save("deploy-docs", "Publish the docs site", "## Procedure\n1. build\n2. upload")
+    store.view("deploy-docs")
+    store.view("deploy-docs")
+    for _ in range(2):  # opening the memory panel must not bump the counter
+        skill = client.get("/api/profiles/default/memory").json()["skills"][0]
+        assert (skill["name"], skill["views"], skill["saves"]) == ("deploy-docs", 2, 1)
+    assert skill["last_view"] and skill["last_save"] and "1. build" in skill["content"]
+    assert store.usage()["deploy-docs"]["views"] == 2
 
 
 def test_backend_labels(client, rt, monkeypatch):
@@ -500,3 +522,109 @@ def test_streamed_deltas_are_forwarded_with_origin(client, rt, script):
     assert order.index("assistant.delta") < order.index("assistant.message")  # the bubble is replaced afterwards
     data = wait_for(lambda: idle(client, "default", sid))
     assert data["items"][-1]["content"] == "Hello world"
+
+
+# --------------------------------------------------------------------------- file browser
+
+def test_workspace_file_browser(client, rt, tmp_path):
+    ws = rt.profiles.get("default").workspace
+    (ws / "notes.md").write_text("# Notes\n\nhello\n", encoding="utf-8")
+    (ws / "sub").mkdir()
+    (ws / "sub" / "a.py").write_text("print('hi')\n", encoding="utf-8")
+    (ws / ".env").write_text("DEEPSEEK_API_KEY=sk-nope\n", encoding="utf-8")
+    for skipped in (".git", "node_modules", "__pycache__", ".venv", ".home"):
+        (ws / skipped).mkdir()
+        (ws / skipped / "x.txt").write_text("x", encoding="utf-8")
+    (ws / "blob.bin").write_bytes(b"\x89PNG\r\n\x1a\n\x00\x00\x00")
+    (ws / "big.txt").write_text("a" + "é" * 150_000, encoding="utf-8")  # 300 KB; the 200 KB cut splits a character
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("outside the workspace", encoding="utf-8")
+    (ws / "link-out").symlink_to(outside / "secret.txt")
+    (ws / "dir-out").symlink_to(outside)
+
+    listing = client.get("/api/profiles/default/files").json()
+    assert listing["path"] == "" and listing["parent"] is None and listing["truncated"] is False
+    assert [e["name"] for e in listing["entries"]] == ["sub", "big.txt", "blob.bin", "notes.md"]  # folders first
+    note = [e for e in listing["entries"] if e["name"] == "notes.md"][0]
+    assert note == {"name": "notes.md", "path": "notes.md", "is_dir": False, "size": 15, "mtime": note["mtime"]}
+    sub = client.get("/api/profiles/default/files", params={"path": "sub"}).json()
+    assert sub["path"] == "sub" and sub["parent"] == "" and [e["path"] for e in sub["entries"]] == ["sub/a.py"]
+
+    f = client.get("/api/profiles/default/files/content", params={"path": "notes.md"}).json()
+    assert f["content"] == "# Notes\n\nhello\n" and f["name"] == "notes.md" and f["size"] == 15
+    assert f["truncated"] is False and f["mtime"]
+    assert client.get("/api/profiles/default/files/content", params={"path": "./sub/a.py"}).json()["path"] == "sub/a.py"
+    big = client.get("/api/profiles/default/files/content", params={"path": "big.txt"}).json()
+    assert big["truncated"] is True and big["size"] == 300_001 and big["content"] == "a" + "é" * 99_999
+
+    def status(url, path):
+        return client.get(url, params={"path": path}).status_code
+
+    content, files_url = "/api/profiles/default/files/content", "/api/profiles/default/files"
+    for bad in ("../state.db", "../../shared.db", "sub/../../profile.yaml", "/etc/passwd", str(outside / "secret.txt"),
+                "~/.ssh/id_rsa", "link-out", "dir-out/secret.txt", ".env"):
+        assert status(content, bad) == 403, bad
+    for bad in ("..", "/", "/etc", "dir-out", "../.."):
+        assert status(files_url, bad) == 403, bad
+    assert status(content, "blob.bin") == 415
+    assert status(content, "missing.txt") == 404 and status(files_url, "missing") == 404
+    assert status(content, "sub") == 400 and status(files_url, "notes.md") == 400 and status(content, "") == 400
+    assert client.get("/api/profiles/ghost/files").status_code == 404
+    # nothing secret leaks through a refused request
+    r = client.get(content, params={"path": "link-out"})
+    assert "outside the workspace" not in r.text and str(outside) not in r.text
+
+
+def test_room_shared_folder_browser(client, rt):
+    client.post("/api/profiles", json={"name": "lead", "title": "Lead"})
+    rid = client.post("/api/rooms", json={"name": "Team", "members": ["lead"]}).json()["id"]
+    assert client.get(f"/api/rooms/{rid}/files").json()["entries"] == []
+    shared = rt.rooms.shared_dir(rid)
+    (shared / "docs").mkdir()
+    (shared / "docs" / "plan.md").write_text("## Plan\n- step\n", encoding="utf-8")
+    listing = client.get(f"/api/rooms/{rid}/files").json()
+    assert [(e["name"], e["is_dir"]) for e in listing["entries"]] == [("docs", True)]
+    assert client.get(f"/api/rooms/{rid}/files", params={"path": "docs"}).json()["entries"][0]["path"] == "docs/plan.md"
+    f = client.get(f"/api/rooms/{rid}/files/content", params={"path": "docs/plan.md"}).json()
+    assert f["content"] == "## Plan\n- step\n"
+    for bad in ("..", "../..", "../../shared.db", "/etc/hosts"):
+        assert client.get(f"/api/rooms/{rid}/files/content", params={"path": bad}).status_code == 403, bad
+        assert client.get(f"/api/rooms/{rid}/files", params={"path": bad}).status_code == 403, bad
+    assert client.get("/api/rooms/nope/files").status_code == 404
+    assert client.get("/api/rooms/nope/files/content", params={"path": "x"}).status_code == 404
+
+
+def test_files_written_by_the_agent_are_browsable(client, rt, script):
+    script([{"tool_calls": [("write_file", {"path": "out/report.md", "content": "# Report\n"})]}, {"content": "wrote it"}])
+    sid = client.post("/api/profiles/default/sessions", json={}).json()["id"]
+    with client.websocket_connect("/api/events") as ws:
+        assert ws.receive_json()["type"] == "hello"
+        client.post(f"/api/profiles/default/sessions/{sid}/messages", json={"text": "write a report"})
+        while True:
+            ev = ws.receive_json()
+            if ev["type"] == "file.changed":
+                break
+        assert ev["profile"] == "default" and ev["path"] == "out/report.md" and ev["op"] == "create"
+    wait_for(lambda: idle(client, "default", sid))
+    assert [e["path"] for e in client.get("/api/profiles/default/files", params={"path": "out"}).json()["entries"]] == ["out/report.md"]
+    assert client.get("/api/profiles/default/files/content", params={"path": "out/report.md"}).json()["content"] == "# Report\n"
+
+
+def test_activity_shows_the_plan_of_a_run_already_in_progress(client, rt):
+    """A page opened mid-run gets the plan the session keeps, before any new todo.updated arrives."""
+    store = SessionStore(rt.profiles.get("default"))
+    sid = store.create(title="busy").id
+    plan = [{"id": "1", "content": "Step one", "status": "in_progress"}]
+    store.patch_meta(sid, {"todos": plan})
+    rt.bus.publish("run.started", profile="default", session_id=sid, run_id="r_1", role="main", depth=0)
+    try:
+        run = [r for r in client.get("/api/activity").json()["runs"] if r["session_id"] == sid][0]
+        assert run["todos"] == plan
+        newer = [{"id": "1", "content": "Step one", "status": "completed"}]
+        rt.bus.publish("todo.updated", profile="default", session_id=sid, run_id="r_1", todos=newer)
+        run = [r for r in client.get("/api/activity").json()["runs"] if r["session_id"] == sid][0]
+        assert run["todos"] == newer  # live updates win over the snapshot read
+    finally:
+        rt.bus.publish("run.finished", profile="default", session_id=sid, run_id="r_1", status="completed")
+    assert client.get("/api/activity").json()["runs"] == []

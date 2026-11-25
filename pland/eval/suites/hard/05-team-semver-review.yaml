@@ -1,0 +1,196 @@
+# hard 05 — team review loop (lead/implementer/reviewer): subtle spec (SemVer precedence, ^0.x, prerelease rule); hidden tests
+id: hard-team-semver-review
+title: 'Lead + implementer + reviewer: strict SemVer library through a review loop (hidden tests)'
+category: team
+mode: team
+team:
+  room: true
+  lead: lead
+  bots:
+  - name: lead
+    title: Tech Lead
+    description: Plans the work, delegates to the implementer and the reviewer, runs the review loop and integrates
+  - name: implementer
+    title: Implementer
+    description: Writes Python code and tests carefully from a specification and fixes review findings
+  - name: reviewer
+    title: Reviewer
+    description: Reviews code strictly against the specification, probes edge cases by running code, and writes precise findings
+prompt: |
+  Team task — we need a strict Semantic Versioning library in the room's shared folder: `shared/semver/semver.py`
+  (standard library only) with pytest tests in `shared/semver/tests/` (at least 15 test cases, passing with
+  `python -m pytest tests` run from `shared/semver/`). Specification:
+  1. `parse(text) -> Version` — strict SemVer 2.0.0 `MAJOR.MINOR.PATCH[-PRERELEASE][+BUILD]`:
+     - MAJOR, MINOR, PATCH are non-negative decimal integers without leading zeros (`0` is fine, `01` is not);
+     - PRERELEASE is one or more dot-separated identifiers of `[0-9A-Za-z-]` (none empty); an identifier made only
+       of digits is numeric and must not have a leading zero (`0` ok, `01` invalid, `0a` ok);
+     - BUILD is one or more dot-separated non-empty identifiers of `[0-9A-Za-z-]` (leading zeros allowed);
+     - no surrounding whitespace, no `v` prefix. Anything else (also a non-string) raises `ValueError`.
+     A `Version` has `major`, `minor`, `patch` (ints), `prerelease` (tuple; numeric identifiers as `int`, others as
+     `str`), `build` (tuple of `str`), and `str(version)` returns the original text.
+  2. `compare(a, b) -> int` (-1, 0 or 1) for two version strings, by SemVer precedence: MAJOR, MINOR, PATCH compared
+     numerically; a version with a prerelease has lower precedence than the same version without one; prerelease
+     identifiers are compared left to right — numeric ones numerically, alphanumeric ones lexically in ASCII order,
+     numeric identifiers always lower than alphanumeric ones, and if all shared identifiers are equal the version
+     with fewer identifiers is lower. Build metadata is ignored (`1.0.0+a` equals `1.0.0+b`).
+  3. `satisfies(version, range) -> bool`. A range is one or more comparator sets separated by `||` (satisfied if any
+     set is); a comparator set is one or more comparators separated by whitespace (all must hold). A comparator is
+     `<V`, `<=V`, `>V`, `>=V`, `=V`, `V` (same as `=V`), `^V` or `~V`, where V is a full version as in (1) and
+     whitespace between the operator and V is allowed (`>= 1.2.3`).
+     - `~1.2.3` means `>=1.2.3 <1.3.0`.
+     - `^V` means `>=V` and below the next increment of V's left-most non-zero part: `^1.2.3` → `<2.0.0`,
+       `^0.2.3` → `<0.3.0`, `^0.0.3` → `<0.0.4`, `^0.0.0` → `<0.0.1`.
+     - Prerelease rule: a version with a prerelease satisfies a comparator set only if, in addition, some comparator
+       of that set was written with a version that has a prerelease and the same MAJOR.MINOR.PATCH
+       (`1.2.3-alpha.7` satisfies `>1.2.3-alpha.3`; `3.4.5-alpha.9` does not; `1.2.4-beta` does not satisfy
+       `^1.2.3`). For `^`/`~` the version written after the operator is the one that counts.
+     - An invalid version or range (empty set, unknown operator, partial version such as `^1.2`, `*`, `1.x`,
+       hyphen ranges ...) raises `ValueError`.
+  4. `max_satisfying(versions, range) -> str | None` — the highest-precedence string of `versions` that satisfies
+     the range; invalid version strings in the list are ignored; among equal precedence (differing only in build
+     metadata) the first one wins; `None` if none satisfies. An invalid range raises `ValueError`.
+
+  Process: the implementer writes the module and the tests. The reviewer then reviews the code against this
+  specification — point by point, running edge cases — and records the findings in `shared/review/findings.md`:
+  one section per review round (`## Round 1`, `## Round 2`, ...) listing every problem found (or `No issues
+  found`), and as the last line of the file the current verdict, `Verdict: APPROVED` or
+  `Verdict: CHANGES REQUESTED`. The implementer fixes every finding, and the review repeats until the reviewer
+  approves; the final file must end with `Verdict: APPROVED`.
+timeout: 1800
+checks:
+- {id: module-exists, type: file_exists, path: shared/semver/semver.py}
+- id: hidden-parse
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    sv = load("semver_under_test", path("shared/semver/semver.py"))
+    bad = []
+    for v in ['0.0.0', '1.2.3', '10.20.30', '1.1.2-prerelease+meta', '1.0.0-alpha.beta.1', '1.0.0-alpha0.valid', '1.0.0-rc.1+build.1', '2.0.0-rc.1+build.123', '10.2.3-DEV-SNAPSHOT', '1.2.3-SNAPSHOT-123', '1.0.0+0.build.1-rc.10000aaa-kk-0.1', '99999999999999999999999.999999999999999999.99999999999999999', '1.0.0-0A.is.legal', '1.0.0+001', '1.0.0-x-y-z.--', '1.0.0-0', '1.0.0-0a']:
+        try:
+            sv.parse(v)
+        except Exception as exc:
+            bad.append(f"parse({v!r}) raised {type(exc).__name__}")
+    for v in ['1', '1.2', '1.2.3-0123', '1.2.3-0123.0123', '1.1.2+.123', '+invalid', '-invalid', 'alpha', '1.2.3.DEV', '1.2-SNAPSHOT', '01.1.1', '1.01.1', '1.1.01', '1.2.3+', '1.2.3-', ' 1.2.3', '1.2.3 ', 'v1.2.3', '1.2.3-a_b', '1.0.0-alpha..1', '9.8.7+meta+meta', '1.2.3-é', '1.2.3-beta.01', '', '1.2.3\n']:
+        try:
+            sv.parse(v)
+            bad.append(f"parse({v!r}) accepted an invalid version")
+        except ValueError:
+            pass
+        except Exception as exc:
+            bad.append(f"parse({v!r}) raised {type(exc).__name__} instead of ValueError")
+    assert not bad, f"{len(bad)} problem(s): " + "; ".join(bad[:8])
+    v = sv.parse("1.0.0-alpha.1.x-y+001.b")
+    got = (v.major, v.minor, v.patch, tuple(v.prerelease), tuple(v.build), str(v))
+    assert got == (1, 0, 0, ("alpha", 1, "x-y"), ("001", "b"), "1.0.0-alpha.1.x-y+001.b"), got
+    v = sv.parse("0.10.200")
+    assert (v.major, v.minor, v.patch, tuple(v.prerelease), tuple(v.build)) == (0, 10, 200, (), ()), v
+- id: hidden-compare
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    sv = load("semver_under_test", path("shared/semver/semver.py"))
+    order = ['1.0.0-alpha', '1.0.0-alpha.1', '1.0.0-alpha.-1', '1.0.0-alpha.beta', '1.0.0-beta', '1.0.0-beta.2', '1.0.0-beta.11', '1.0.0-rc.1', '1.0.0', '1.0.1-0', '1.0.1', '1.2.0', '1.10.0', '2.0.0', '10.0.0']
+    bad = []
+    for i, a in enumerate(order):
+        for j, b in enumerate(order):
+            want = (i > j) - (i < j)
+            if sv.compare(a, b) != want:
+                bad.append(f"compare({a!r}, {b!r}) = {sv.compare(a, b)}, expected {want}")
+    for (a, b), want in zip([('1.0.0-Alpha', '1.0.0-alpha'), ('1.0.0-2', '1.0.0-10'), ('1.0.0-rc.1+b', '1.0.0-rc.1'), ('1.0.0-alpha.1.2', '1.0.0-alpha.1'), ('1.0.0-a.b.c', '1.0.0-a.b.c.0'), ('1.0.0+x.1', '1.0.0+y'), ('2.0.0-1', '2.0.0-a'), ('1.0.0-z', '1.0.0-Z')], [-1, -1, 0, 1, -1, 0, -1, 1]):
+        if sv.compare(a, b) != want:
+            bad.append(f"compare({a!r}, {b!r}) = {sv.compare(a, b)}, expected {want}")
+    assert not bad, f"{len(bad)} wrong comparison(s): " + "; ".join(bad[:8])
+- id: hidden-satisfies
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    sv = load("semver_under_test", path("shared/semver/semver.py"))
+    bad = []
+    for (v, r), want in zip([('1.2.3', '^1.2.3'), ('1.9.9', '^1.2.3'), ('2.0.0', '^1.2.3'), ('1.2.2', '^1.2.3'), ('0.2.5', '^0.2.3'), ('0.3.0', '^0.2.3'), ('0.0.3', '^0.0.3'), ('0.0.4', '^0.0.3'), ('0.0.0', '^0.0.0'), ('0.0.1', '^0.0.0'), ('1.2.9', '~1.2.3'), ('1.3.0', '~1.2.3'), ('0.2.9', '~0.2.3'), ('1.2.3-alpha.7', '>1.2.3-alpha.3'), ('3.4.5-alpha.9', '>1.2.3-alpha.3'), ('3.4.5', '>1.2.3-alpha.3'), ('1.2.3-beta.4', '^1.2.3-beta.2'), ('1.2.4-beta.1', '^1.2.3-beta.2'), ('1.2.3-alpha', '^1.2.3-beta.2'), ('2.0.0-rc.1', '^1.2.3'), ('2.0.0-rc.1', '>=2.0.0-rc.0 <2.0.0'), ('1.5.0', '<1.0.0 || >=1.4.0 <1.6.0'), ('1.2.0', '<1.0.0 || >=1.4.0 <1.6.0'), ('1.2.3', '>= 1.2.3'), ('1.2.3', '1.2.3'), ('1.2.3+build.9', '=1.2.3'), ('1.2.3-beta.1', '>=1.0.0 || >=1.2.3-alpha'), ('1.2.3-beta.1', '>=1.0.0'), ('1.2.4-beta', '^1.2.3'), ('1.2.3', '<=1.2.3 >1.2.2'), ('1.2.3', '<1.2.3 || >1.2.3'), ('0.1.0', '~0.1.0-rc.1'), ('0.1.0-rc.2', '~0.1.0-rc.1'), ('10.0.0', '^9.1.0 || ^10.0.0'), ('2.0.0', '>1.2.3 <=2.0.0  <3.0.0')], [True, True, False, False, True, False, True, False, True, False, True, False, True, True, False, True, True, False, False, False, True, True, False, True, True, True, True, False, False, True, False, True, True, True, True]):
+        try:
+            got = sv.satisfies(v, r)
+        except Exception as exc:
+            got = f"{type(exc).__name__}"
+        if got is not want:
+            bad.append(f"satisfies({v!r}, {r!r}) = {got}, expected {want}")
+    for r in ['', '   ', '^1.2', '>=', '1.2.3 ||', '|| 1.2.3', '~>1.2.3', '1.2.3 - 2.0.0', '>=v1.2.3', '*', '1.x', '>= 1.2.3 <', '^01.2.3', '>=1.2.3 || || <2.0.0']:
+        try:
+            sv.satisfies("1.2.3", r)
+            bad.append(f"range {r!r} should raise ValueError")
+        except ValueError:
+            pass
+        except Exception as exc:
+            bad.append(f"range {r!r} raised {type(exc).__name__} instead of ValueError")
+    try:
+        sv.satisfies("1.2", "^1.0.0")
+        bad.append("an invalid version must raise ValueError")
+    except ValueError:
+        pass
+    assert not bad, f"{len(bad)} problem(s): " + "; ".join(bad[:8])
+- id: hidden-max-satisfying
+  type: python
+  code: |
+    import importlib.util, sys
+    def load(name, file):
+        assert Path(file).is_file(), f"{file} is missing"
+        spec = importlib.util.spec_from_file_location(name, str(file))
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules[name] = mod
+        spec.loader.exec_module(mod)
+        return mod
+    sv = load("semver_under_test", path("shared/semver/semver.py"))
+    bad = []
+    for (vs, r), want in zip([(['1.2.3', '1.2.4', '1.3.0', '2.0.0'], '~1.2.0'), (['1.2.3', '1.2.4-beta', '1.2.4'], '^1.2.3'), (['2.0.0-rc.1', '1.9.0'], '^1.0.0'), (['1.0.0+b1', '1.0.0+a2', '0.9.0'], '^0.9.0 || 1.0.0'), (['1.0.0', 'garbage', '1.0.01', '1.1.0', '', 'v2.0.0'], '>=1.0.0'), ([], '>=1.0.0'), (['0.1.0'], '>=1.0.0'), (['1.2.3-beta.1', '1.2.3-beta.11', '1.2.3-beta.2'], '>=1.2.3-beta.0'), (['0.0.2', '0.0.1'], '^0.0.1')], ['1.2.4', '1.2.4', '1.9.0', '1.0.0+b1', '1.1.0', None, None, '1.2.3-beta.11', '0.0.1']):
+        got = sv.max_satisfying(list(vs), r)
+        if got != want:
+            bad.append(f"max_satisfying({vs}, {r!r}) = {got!r}, expected {want!r}")
+    try:
+        sv.max_satisfying(["1.0.0"], "^1.2")
+        bad.append("max_satisfying with an invalid range must raise ValueError")
+    except ValueError:
+        pass
+    assert not bad, "; ".join(bad)
+- id: team-tests-pass
+  type: python
+  code: |
+    import re, subprocess, sys
+    def pytest_in(cwd, min_passed, *args):
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args], cwd=str(cwd),
+                           capture_output=True, text=True, timeout=240)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0, f"pytest failed in {cwd}: " + out[-1500:]
+        m = re.search(r"(\d+) passed", out)
+        assert m and int(m.group(1)) >= min_passed, f"expected at least {min_passed} passing tests: " + out[-800:]
+    pytest_in(path("shared/semver"), 15, "tests")
+- id: review-findings
+  type: python
+  code: |
+    import re
+    text = path("shared/review/findings.md").read_text(encoding="utf-8")
+    rounds = re.findall(r"(?im)^#{2,3}\s*round\s+(\d+)\b", text)
+    assert rounds, "findings.md has no '## Round <n>' section"
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    assert re.fullmatch(r"(?i)\W*verdict\W*:?\W*approved\W*", lines[-1]), f"the last line must be 'Verdict: APPROVED', got {lines[-1]!r}"
+- {id: delegated-implementer, type: delegated, min: 1, to: [implementer]}
+- {id: delegated-reviewer, type: delegated, min: 1, to: [reviewer]}
