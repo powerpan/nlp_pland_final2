@@ -129,8 +129,8 @@ class ModelConfig:
     base_url: str | None = None
     api_key: str | None = None
     # Thinking mode (DeepSeek's switch; HKGAI thinks when a reasoning level is sent). On by default since the
-    # official evaluation on DeepSeek: on the hard suite it lifted goal completion from ~66% to 88–100% at similar
-    # cost (fewer degenerate loops), for ~1.3–2x latency on easy tasks. Short calls (discussion turns, approval
+    # official evaluation on DeepSeek: on the hard suite it lifted goal completion from ~66% to 87.5% on average at
+    # similar cost (fewer degenerate loops), for ~1.3–2x latency on easy tasks. Short calls (discussion turns, approval
     # guard, compaction) switch it off per call.
     thinking: bool = True
     # Thinking intensity (see pland/llm/reasoning.py): None = provider default, "off", or a level (minimal…max).
@@ -172,8 +172,8 @@ def default_provider() -> str:
 @dataclass
 class ApprovalConfig:
     # manual: ask the human for every operation that needs permission
-    # smart:  a guard model call triages flagged shell/python commands (approve / deny / escalate to the
-    #         human); deleting files, git push, credentials and publishing always go to the human
+    # smart:  a guard model call triages flagged shell/python commands and workspace file cleanup
+    #         (approve / deny / escalate); git push, credentials and publishing go to the human
     # off:    never ask (still subject to the hardline blocklist)
     mode: str = "manual"
     timeout: float = 600.0
@@ -214,6 +214,12 @@ class AgentSettings:
     experience_top_k: int = 3
     max_delegation_depth: int = 2
     max_parallel_delegations: int = 4
+    # Operator-owned ceilings for structured reviews. The delegator can request smaller limits.
+    review_max_steps: int = 30
+    review_timeout_seconds: int = 240
+    fast_review_steps: int = 16
+    fast_review_seconds: int = 210
+    fast_followup_seconds: int = 120
     # Per top-level run (shared by every delegate/subagent it spawns; a group drive gets twice this). Cache hits
     # count 0.1 token. Raised from 120 / 3M after a 5-bot review used 216 of its 240 drive calls. At ~95% cache
     # hits this bounds a single run at roughly $1 of DeepSeek peak pricing (a group drive at roughly $2).

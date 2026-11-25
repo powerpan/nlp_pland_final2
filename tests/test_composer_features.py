@@ -61,31 +61,38 @@ def test_parse_and_clamp_follow_the_ladder():
     assert reasoning.choices("deepseek") == ("off", "default", "low", "medium", "high", "max")
 
 
-def test_hkgai_offers_its_seven_slots_and_thinks_only_when_asked():
-    # probed: HKGAI accepts none/minimal/low/medium/high/xhigh/max; no field (or none) means no thinking
-    assert reasoning.choices("hkgai") == ("off", "default", "minimal", "low", "medium", "high", "xhigh", "max")
-    assert reasoning.clamp("minimal", "hkgai") == "minimal" and reasoning.clamp("xhigh", "hkgai") == "xhigh"
-    assert reasoning.resolve(True, None, "hkgai") == (True, "medium")  # "default" must still think there
+def test_hkgai_offers_the_levels_its_endpoint_accepts():
+    # probed 2026-11-20: HKGAI accepts none/low/high/xhigh/max; minimal and medium are now a 400
+    assert reasoning.choices("hkgai") == ("off", "default", "low", "high", "xhigh", "max")
+    assert reasoning.clamp("xhigh", "hkgai") == "xhigh" and reasoning.clamp("low", "hkgai") == "low"
+    # a level it no longer takes goes to the nearest weaker one (the weakest when nothing is weaker): never a 400,
+    # never more thinking than was asked for
+    assert reasoning.clamp("medium", "hkgai") == "low" and reasoning.clamp("minimal", "hkgai") == "low"
+    assert reasoning.resolve(True, "medium", "hkgai") == (True, "low")  # a profile saved before the change
+    assert reasoning.resolve(True, None, "hkgai") == (True, "high")  # "default" always names a level there
     assert reasoning.resolve(True, "off", "hkgai") == (False, None)
-    assert reasoning.describe("default", "hkgai") == "default (sends medium on hkgai)"
+    assert reasoning.describe("default", "hkgai") == "default (sends high on hkgai)"
+    assert reasoning.describe("medium", "hkgai") == "medium (sends low on hkgai)"
     assert reasoning.describe("default", "deepseek") == "default" and reasoning.describe("xhigh", "hkgai") == "xhigh"
-    assert "medium" in reasoning.description("default", "hkgai")
+    assert "high" in reasoning.description("default", "hkgai")
+    for level in reasoning.PROVIDER_LEVELS["hkgai"] + (reasoning.PROVIDER_DEFAULT_LEVEL["hkgai"],):
+        assert level in {"low", "high", "xhigh", "max"}, f"{level} is rejected by the HKGAI endpoint"
 
 
 def test_hkgai_payload_sends_the_level_or_none():
     cfg = dict(provider="hkgai", api_key="k", base_url="https://api.hkgai.example.hk/v1", model="hk-1")
     c, seen = _capture(ModelConfig(**cfg))
     c.chat([{"role": "user", "content": "hi"}])  # bot setting "default"
-    assert seen[-1]["reasoning_effort"] == "medium" and "thinking" not in seen[-1] and "temperature" not in seen[-1]
+    assert seen[-1]["reasoning_effort"] == "high" and "thinking" not in seen[-1] and "temperature" not in seen[-1]
     c.chat([{"role": "user", "content": "hi"}], thinking=False)  # e.g. a discussion turn or the approval guard
     assert seen[-1]["reasoning_effort"] == "none" and seen[-1]["temperature"] == 0
     c.chat([{"role": "user", "content": "hi"}], thinking=True, effort="xhigh")  # a chat's own setting
     assert seen[-1]["reasoning_effort"] == "xhigh"
     c.chat([{"role": "user", "content": "hi"}], thinking=True, effort="default")
-    assert seen[-1]["reasoning_effort"] == "medium"
+    assert seen[-1]["reasoning_effort"] == "high"
     c.chat([{"role": "user", "content": "hi"}], json_mode=True)  # JSON mode never thinks there (malformed JSON when it did)
     assert seen[-1]["reasoning_effort"] == "none" and seen[-1]["response_format"] == {"type": "json_object"}
-    for setting, sent in (("minimal", "minimal"), ("max", "max"), ("ultra", "max"), ("off", "none")):
+    for setting, sent in (("minimal", "low"), ("medium", "low"), ("max", "max"), ("ultra", "max"), ("off", "none")):
         c2, seen2 = _capture(ModelConfig(**cfg, reasoning_effort=setting))
         c2.chat([{"role": "user", "content": "hi"}])
         assert seen2[-1]["reasoning_effort"] == sent, setting
@@ -242,8 +249,11 @@ def test_requirements_team_template(client, rt):
     assert s["reviewer"].sandbox.backend in {"docker", "local"}  # local (with a note) where Docker is missing
     room = rt.rooms.by_name("Build team")
     assert room["members"] == ["lead", "researcher", "coder", "reviewer", "writer"] and room["settings"]["lead"] == "lead"
+    assert all(r["settings"]["fast_mode"] is True for r in rt.rooms.list())
+    rt.rooms.update(room["id"], settings={"fast_mode": False})
     again = apply_template(rt, "requirements-team")  # idempotent: nothing is overwritten
     assert again["created"] == [] and len(again["skipped"]) == 5 and {g["status"] for g in again["groups"]} == {"exists"}
+    assert rt.rooms.get(room["id"])["settings"]["fast_mode"] is False
     assert client.post("/api/team-templates/nope/apply").status_code == 404
 
 
@@ -405,6 +415,7 @@ def test_deliverables_are_read_from_expected_output():
         ["shared/r/01-review.md", "02-scan.csv"]
     assert deliverables({"expected_output": "~/n.md, ../y.py; v2.6.4, e.g. a version"}) == ["~/n.md", "../y.py"]
     assert deliverables({"expected_output": "a short answer"}) == [] and deliverables({}) == []
+    assert deliverables({"context": "输入：shared/plan.md\n输出：`shared/doc_review.md`，含结论"}) == ["shared/doc_review.md"]
 
 
 def _worker(rt, session_meta, step):

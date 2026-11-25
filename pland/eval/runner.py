@@ -27,6 +27,7 @@ from typing import Any
 
 from ..config import pland_home
 from ..hitl import ScriptedHITL, ScriptedRule
+from ..llm.pricing import cost
 from ..memory import ExperienceStore, NotesMemory, SkillStore
 from ..runtime import Runtime
 from ..sandbox.backends import scrub_env
@@ -47,6 +48,10 @@ class RunOptions:
     thinking: bool | None = None  # None: profile/default setting
     reasoning: str | None = None  # thinking intensity: off|default|low|medium|high|max (None: profile setting)
     label: str = ""
+    # After a timeout the task is cancelled. Agents stop at their next step, but a model call (300 s, with retries)
+    # or a blocking tool can keep the task's thread busy that long. The runner waits up to this long for it to exit
+    # before verifying and moving on; a thread still alive then is recorded as a straggler (see SuiteRunner).
+    cancel_grace_s: float = 1500.0
 
 
 def _hitl_for(task: Task) -> ScriptedHITL:
@@ -78,6 +83,13 @@ class SuiteRunner:
         self._events: list[dict[str, Any]] = []
         self._ev_lock = threading.Lock()
         self.rt.bus.subscribe(self._on_event)
+        # Usage is attributed by the ledger's root run (one per top-level agent run, shared by its delegates), not
+        # by time window: rows of a root that belongs to an earlier task (a late reflection, a straggler) never
+        # count for a later one.
+        self._done_roots: set[str] = set()
+        # Task threads still alive after cancel + cancel_grace_s: their sessions stay cancelled, their ledger rows
+        # and events are kept out of later tasks, and no later task starts in a workspace they can still write.
+        self._stragglers: list[dict[str, Any]] = []
 
     # ------------------------------------------------------------------ setup helpers
     def _on_event(self, ev: dict[str, Any]) -> None:
@@ -166,6 +178,58 @@ class SuiteRunner:
                 raise RuntimeError(f"setup command failed: {cmd}: {r.stderr[-400:]}")
         return {"involved": involved, "primary": primary, "room": room}
 
+    # ------------------------------------------------------------------ stragglers & usage attribution
+    @staticmethod
+    def _task_profiles(task: Task) -> set[str]:
+        if task.mode == "team":
+            return {b["name"] for b in task.team.get("bots") or []}
+        return {"default"}
+
+    def _settle_stragglers(self, profiles: set[str]) -> None:
+        """Before a task starts: retire stragglers that have exited; wait (bounded) for live ones that work in one
+        of this task's profiles, and refuse to start the task in a workspace one of them can still write to."""
+        for s in list(self._stragglers):
+            if s["thread"].is_alive() and s["profiles"] & profiles:
+                s["thread"].join(self.opts.cancel_grace_s)
+            if not s["thread"].is_alive():
+                self._done_roots |= self._roots_of(s["sessions"], s["started"])
+                self._stragglers.remove(s)
+        busy = [s for s in self._stragglers if s["profiles"] & profiles]
+        if busy:
+            names = ", ".join("@" + n for n in sorted(busy[0]["profiles"] & profiles))
+            raise RuntimeError(f"task {busy[0]['task_id']} is still running in the workspace of {names} after being "
+                               "cancelled; not starting this task there")
+
+    def _roots_of(self, sessions: set[tuple[str, str]], since: float) -> set[str]:
+        if not sessions:
+            return set()
+        rows = self.rt.ledger.db.query("SELECT DISTINCT root_run, profile, session_id FROM llm_calls WHERE ts>=?", [since])
+        return {r["root_run"] for r in rows if (r["profile"], r["session_id"]) in sessions}
+
+    def _ledger_rows(self, since: float) -> list[dict[str, Any]]:
+        return self.rt.ledger.db.query(
+            "SELECT root_run, profile, session_id, model, prompt_tokens, cached_tokens, completion_tokens, duration"
+            " FROM llm_calls WHERE ts>=?", [since])
+
+    @staticmethod
+    def _usage_totals(rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Same figures as `Ledger.totals`, over the given rows."""
+        by_model: dict[str, list[int]] = {}
+        seconds = 0.0
+        for r in rows:
+            m = by_model.setdefault(r["model"], [0, 0, 0])
+            m[0] += int(r["prompt_tokens"] or 0)
+            m[1] += int(r["cached_tokens"] or 0)
+            m[2] += int(r["completion_tokens"] or 0)
+            seconds += float(r["duration"] or 0)
+        prompt = sum(v[0] for v in by_model.values())
+        cached = sum(v[1] for v in by_model.values())
+        completion = sum(v[2] for v in by_model.values())
+        return {"calls": len(rows), "prompt_tokens": prompt, "cached_tokens": cached, "completion_tokens": completion,
+                "cache_hit_rate": round(cached / prompt, 3) if prompt else 0.0,
+                "cost_usd": round(sum(cost(v[0], v[1], v[2], m) for m, v in by_model.items()), 5),
+                "model_seconds": round(seconds, 1), "models": sorted(m for m in by_model if m)}
+
     def _memory_snapshot(self, names: list[str]) -> dict[str, Any]:
         snap = {}
         for n in names:
@@ -184,6 +248,7 @@ class SuiteRunner:
                                "pass": pass_no, "source": task.source}
         hitl = _hitl_for(task)
         try:
+            self._settle_stragglers(self._task_profiles(task))
             env_info = self._prepare(task)
         except Exception as exc:
             rec.update(outcome="crashed", error=f"setup failed: {exc}", duration_s=0.0, checks=[], subtask_rate=0.0)
@@ -194,6 +259,9 @@ class SuiteRunner:
             self._events.clear()
         box: dict[str, Any] = {}
         self.rt.cancel_everything(False)
+        # what belongs to earlier tasks, fixed before this one starts
+        foreign_sessions: set[tuple[str, str]] = set().union(*(s["sessions"] for s in self._stragglers))
+        foreign_roots = set(self._done_roots)
 
         def work():
             try:
@@ -215,13 +283,40 @@ class SuiteRunner:
         th.join(task.timeout)
         timed_out = th.is_alive()
         if timed_out:
-            self.rt.cancel_everything(True)
-            th.join(90)
+            self.rt.cancel_everything(True)  # stays set while the thread winds down (bounded)
+            th.join(self.opts.cancel_grace_s)
         duration = time.time() - started  # execution time ends when the final result is produced
+        straggler = None
+        if th.is_alive():
+            # Still busy (a model call or a tool that does not poll cancellation). Keep its sessions cancelled once
+            # the global flag is cleared for the next task, and remember them so nothing of it is counted there.
+            with self._ev_lock:
+                mine = {(e["profile"], e["session_id"]) for e in self._events
+                        if e["type"] == "run.started" and e.get("profile") and e.get("session_id")}
+            mine -= foreign_sessions
+            for prof_name, sid in sorted(mine):
+                self.rt.cancel(prof_name, sid)
+            self._stragglers.append({"thread": th, "task_id": task.id, "profiles": set(self._task_profiles(task)),
+                                     "sessions": mine, "started": started})
+            straggler = {"alive_after_cancel_s": self.opts.cancel_grace_s, "sessions": sorted([list(x) for x in mine]),
+                         "note": "the task's thread was still running after cancellation; its sessions stay cancelled, "
+                                 "its later model usage and events are not counted for other tasks, and no task "
+                                 "starts in its workspace while it runs"}
         self.rt.cancel_everything(False)
         self.rt.wait_reflections(180)  # post-task learning finishes before verification feeds back into it
+        rows = self._ledger_rows(started)
+        foreign_roots |= self._roots_of(foreign_sessions, min([started] + [s["started"] for s in self._stragglers]))
+        session_roots: dict[tuple[str, str], set[str]] = {}
+        for r in rows:
+            session_roots.setdefault((r["profile"], r["session_id"]), set()).add(r["root_run"])
+
+        def foreign(e: dict[str, Any]) -> bool:
+            key = (e.get("profile"), e.get("session_id"))
+            roots = session_roots.get(key)  # type: ignore[arg-type]
+            return key in foreign_sessions or bool(roots and roots <= foreign_roots)
+
         with self._ev_lock:
-            events = list(self._events)
+            events = [e for e in self._events if not foreign(e)]
 
         # ---- final answer & run status
         answer, run_status, error = "", None, box.get("exception")
@@ -250,9 +345,11 @@ class SuiteRunner:
 
         # ---- checks
         ws = self.rt.profiles.get(primary).workspace
+        prof = self.rt.profiles.get(primary)
         env = CheckEnv(self.rt, primary, ws, answer, room["id"] if room else None,
                        room["id"] if room else f"dm:{primary}", hitl.log, events,
-                       result={"run_status": run_status, "duration_s": duration})
+                       result={"run_status": run_status, "duration_s": duration},
+                       backend=self.rt.backend_for(prof, prof.settings()))  # checks run in the task's sandbox
         checks = [run_check(env, c) for c in task.checks]
         total_w = sum(c["weight"] for c in checks)
         passed_w = sum(c["weight"] for c in checks if c["passed"])
@@ -285,7 +382,9 @@ class SuiteRunner:
                 pass
 
         mem_after = self._memory_snapshot(involved)
-        usage = self.rt.ledger.totals(since=started)
+        rows = [r for r in self._ledger_rows(started) if r["root_run"] not in foreign_roots]
+        self._done_roots |= {r["root_run"] for r in rows}
+        usage = self._usage_totals(rows)
         tool_events = [e for e in events if e["type"] == "tool.finished"]
         rec.update(
             outcome=outcome, run_status=run_status, timed_out=timed_out, error=(error or "")[:2000] or None,
@@ -302,6 +401,7 @@ class SuiteRunner:
                                 "lessons": e.get("lessons")} for e in events if e["type"] == "experience.added"],
             memory_before=mem_before, memory_after=mem_after, sessions=[list(s) for s in sessions],
             room_id=room["id"] if room else None, failure_mode=None, internal_errors=internal_errors,
+            straggler=straggler,
         )
         rec["failure_mode"] = classify_failure(rec)
         self._save_task_artifacts(task, rec, events, involved, room, pass_no)

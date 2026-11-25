@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
+import threading
 from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
@@ -46,6 +48,27 @@ class MemoryError_(ValueError):
     pass
 
 
+_file_locks: dict[str, threading.RLock] = {}
+_file_locks_guard = threading.Lock()
+
+
+def _file_lock(path: Path) -> threading.RLock:
+    """One lock per memory file: a background reflection and a memory tool call on the same bot must not
+    interleave their read-modify-write and lose an entry."""
+    key = str(path.resolve())
+    with _file_locks_guard:
+        return _file_locks.setdefault(key, threading.RLock())
+
+
+def _write_atomic(path: Path, text: str) -> None:
+    tmp = path.with_name(f".{path.name}.{new_id('t')}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 class NotesMemory:
     def __init__(self, profile: "Profile"):
         self.profile = profile
@@ -62,32 +85,36 @@ class NotesMemory:
             return []
         return [e.strip() for e in text.split("§") if e.strip()]
 
-    def _write(self, target: str, entries: list[str]) -> None:
+    def _write(self, target: str, entries: list[str], *, validate_only: bool = False) -> None:
         total = len(SEP.join(entries))
         if total > LIMITS[target]:
             raise MemoryError_(
                 f"{target} memory would be {total} chars (limit {LIMITS[target]}). Consolidate or remove entries first."
             )
-        self._path(target).write_text(SEP.join(entries), encoding="utf-8")
+        if not validate_only:
+            _write_atomic(self._path(target), SEP.join(entries))
 
     def usage(self, target: str) -> tuple[int, int]:
         return len(SEP.join(self.entries(target))), LIMITS[target]
 
-    def add(self, target: str, content: str, session_id: str | None = None) -> str:
+    def add(self, target: str, content: str, session_id: str | None = None, *, validate_only=False) -> str:
         content = content.strip()
         if not content:
             raise MemoryError_("content is empty")
-        entries = self.entries(target)
-        if any(content == e or content in e for e in entries):
-            return "Already remembered (duplicate skipped)."
-        similar = self.similar(target, content)
-        if similar:
-            return ("A very similar entry already exists, so nothing was added. To refine it, use action=replace with "
-                    f"old_text from: {similar[:200]!r}")
-        entries.append(content)
-        self._write(target, entries)
-        _log(self.profile, target, "add", {"content": content}, session_id)
-        used, cap = self.usage(target)
+        with _file_lock(self._path(target)):
+            entries = self.entries(target)
+            if any(content == e or content in e for e in entries):
+                return "Already remembered (duplicate skipped)."
+            similar = self.similar(target, content)
+            if similar:
+                return ("A very similar entry already exists, so nothing was added. To refine it, use action=replace "
+                        f"with old_text from: {similar[:200]!r}")
+            entries.append(content)
+            self._write(target, entries, validate_only=validate_only)
+            if validate_only:
+                return ""
+            _log(self.profile, target, "add", {"content": content}, session_id)
+            used, cap = self.usage(target)
         return f"Saved to {target} ({used}/{cap} chars)."
 
     def similar(self, target: str, content: str, threshold: float = 0.6) -> str | None:
@@ -103,27 +130,33 @@ class NotesMemory:
                 return e
         return None
 
-    def replace(self, target: str, old_text: str, content: str, session_id: str | None = None) -> str:
-        entries = self.entries(target)
-        hits = [i for i, e in enumerate(entries) if old_text.strip() and old_text.strip() in e]
-        if not hits:
-            raise MemoryError_(f"no {target} entry contains {old_text!r}")
-        if len(hits) > 1:
-            raise MemoryError_(f"{len(hits)} entries contain {old_text!r}; use a more specific substring")
-        before = entries[hits[0]]
-        entries[hits[0]] = content.strip()
-        self._write(target, entries)
-        _log(self.profile, target, "replace", {"before": before, "after": content.strip()}, session_id)
+    def replace(self, target: str, old_text: str, content: str, session_id: str | None = None, *, validate_only=False) -> str:
+        with _file_lock(self._path(target)):
+            entries = self.entries(target)
+            hits = [i for i, e in enumerate(entries) if old_text.strip() and old_text.strip() in e]
+            if not hits:
+                raise MemoryError_(f"no {target} entry contains {old_text!r}")
+            if len(hits) > 1:
+                raise MemoryError_(f"{len(hits)} entries contain {old_text!r}; use a more specific substring")
+            before = entries[hits[0]]
+            entries[hits[0]] = content.strip()
+            self._write(target, entries, validate_only=validate_only)
+            if validate_only:
+                return ""
+            _log(self.profile, target, "replace", {"before": before, "after": content.strip()}, session_id)
         return "Entry replaced."
 
     def remove(self, target: str, old_text: str, session_id: str | None = None) -> str:
-        entries = self.entries(target)
-        keep = [e for e in entries if old_text.strip() not in e]
-        if len(keep) == len(entries):
-            raise MemoryError_(f"no {target} entry contains {old_text!r}")
-        removed = [e for e in entries if old_text.strip() in e]
-        self._write(target, keep)
-        _log(self.profile, target, "remove", {"removed": removed}, session_id)
+        if not old_text.strip():
+            raise MemoryError_("old_text must identify the entry to remove")
+        with _file_lock(self._path(target)):
+            entries = self.entries(target)
+            keep = [e for e in entries if old_text.strip() not in e]
+            if len(keep) == len(entries):
+                raise MemoryError_(f"no {target} entry contains {old_text!r}")
+            removed = [e for e in entries if old_text.strip() in e]
+            self._write(target, keep)
+            _log(self.profile, target, "remove", {"removed": removed}, session_id)
         return f"Removed {len(removed)} entr{'y' if len(removed) == 1 else 'ies'}."
 
     def render(self) -> str:
@@ -359,11 +392,12 @@ class SkillStore:
             return {}
 
     def _bump(self, name: str, key: str) -> None:
-        data = self.usage()
-        entry = data.setdefault(name, {"views": 0, "saves": 0})
-        entry[key] = entry.get(key, 0) + 1
-        entry["last_" + key[:-1]] = now()
-        self._usage_path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+        with _file_lock(self._usage_path):
+            data = self.usage()
+            entry = data.setdefault(name, {"views": 0, "saves": 0})
+            entry[key] = entry.get(key, 0) + 1
+            entry["last_" + key[:-1]] = now()
+            _write_atomic(self._usage_path, json.dumps(data, indent=1))
 
     def list(self) -> list[dict[str, Any]]:
         out = []
@@ -387,12 +421,15 @@ class SkillStore:
         self._bump(name, "views")
         return path.read_text(encoding="utf-8")
 
-    def save(self, name: str, description: str, content: str, session_id: str | None = None) -> str:
-        if not _SKILL_NAME.match(name):
+    @staticmethod
+    def validate_name(name: str) -> None:
+        if not _SKILL_NAME.fullmatch(name):
             raise ValueError("skill name must match [a-z0-9][a-z0-9_-]{0,47}")
+    def save(self, name: str, description: str, content: str, session_id: str | None = None) -> str:
+        self.validate_name(name)
         path = self.profile.skills_dir / f"{name}.md"
         existed = path.exists()
-        path.write_text(f"---\nname: {name}\ndescription: {description.strip()}\n---\n\n{content.strip()}\n", encoding="utf-8")
+        _write_atomic(path, f"---\nname: {name}\ndescription: {description.strip()}\n---\n\n{content.strip()}\n")
         self._bump(name, "saves")
         _log(self.profile, "skill", "replace" if existed else "add", {"name": name, "description": description}, session_id)
         return f"Skill '{name}' {'updated' if existed else 'saved'}."

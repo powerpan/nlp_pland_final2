@@ -1130,7 +1130,7 @@ write_task(SUITE, "07-team-private-pricing.yaml", {
             bad = [f"{g} != expected {w}" for g, w in zip(rows, want) if g != w]
             assert not bad, "; ".join(bad)
         """, QUOTES_COMPARE, WANT=D.quotes_csv(D.QUOTES))},
-        {"id": "owner-consulted", "type": "python", "code": chk(r"""
+        {"id": "owner-consulted", "type": "python", "host": True, "code": chk(r"""
             import json, sqlite3
             shared = path("shared").resolve()
             db = shared.parents[2] / "shared.db"

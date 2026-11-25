@@ -72,6 +72,9 @@ class ToolContext:
 
 
 TOOLS: dict[str, Tool] = {}
+# Every agent has this toolset whatever its profile's `toolsets` says: it is how an agent answers questions about
+# the platform and its own setup (pland/handbook), and it is read-only.
+ALWAYS_ON = "platform"
 
 
 def tool(name: str, description: str, parameters: dict[str, Any], toolset: str):
@@ -91,7 +94,8 @@ def select_tools(toolsets: list[str], exclude: set[str] | None = None) -> list[T
 
     load_builtin_tools()
     exclude = exclude or set()
-    return [t for t in TOOLS.values() if t.toolset in toolsets and t.name not in exclude]
+    wanted = {*toolsets, ALWAYS_ON}
+    return [t for t in TOOLS.values() if t.toolset in wanted and t.name not in exclude]
 
 
 _COERCE = {"integer": int, "number": float}

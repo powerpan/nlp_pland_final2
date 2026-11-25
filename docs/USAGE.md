@@ -20,6 +20,8 @@ pland            # 等同 pland chat
 - `/reasoning` 查看並切換這個對話的思考強度（`/reasoning off` 最快、`/reasoning max` 最深、`/reasoning reset` 回到 Profile 設定）；
   `/model deepseek-v4-pro` 讓這個對話改用較強的模型。
 - `/memory` 查看筆記與經驗；`/sessions`、`/resume <id>` 管理會話。
+- `你有哪些可配置項？`、`你如何與團隊協作？`、`你知道這個平台是什麼嗎？` —— 它會先查內建的平台手冊（`platform_info` 工具）再回答，
+  並說明每項設定目前的值與要到哪裡更改；它不能自己改設定。
 
 Profile 的預設值（模型、思考強度、沙箱、授權模式）用 `pland setup` 設定，與 `hermes setup` 一樣在選完模型後詢問思考強度。
 
@@ -41,7 +43,7 @@ pland desktop    # 以獨立視窗開啟；伺服器在背景執行，pland desk
 **設定頁與版面**（參考 Hermes Desktop 的設定與側欄）：
 
 - **⌘,**（Windows/Linux 為 Ctrl+,）或側欄底部的 **Settings** 開啟設定頁，左側分類、上方可搜尋所有設定：
-  - **Appearance**：淺色/深色/跟隨系統、強調色、對話字級、思考區塊顯示或隱藏、側欄密度與寬度、右側面板預設開關與寬度（只存在這個瀏覽器）。
+  - **Appearance**：介面語言（自動／English／繁體中文，切換後頁面重新載入）、淺色/深色/跟隨系統、強調色、對話字級、思考區塊顯示或隱藏、側欄密度與寬度、右側面板預設開關與寬度（只存在這個瀏覽器）。
   - **Model / Agent / Sandbox & folders / Run limits**：所有 Bot 共用的**全域預設**，改動立即寫入 `~/.pland/settings.yaml`、下一次運行生效；
     已自行設定的 Bot 會列在該列下方（點名稱可前往）。每列的「reset」回到內建預設。
   - **Model → Provider and keys**：貼上 API 金鑰後按 **Save & test**，先以一次很小的真實調用確認金鑰有效（被拒絕就不會儲存），
@@ -66,6 +68,10 @@ pland desktop    # 以獨立視窗開啟；伺服器在背景執行，pland desk
 | `writer` | 只寫 `.md` / `.txt` 文件（不能上網、不能執行程式） | low | local |
 
 群組 **Build team**（五人，主導者 `lead`）與 **Research desk**（`researcher`、`writer`，主導者 `researcher`）。
+獨立檔案審查會記錄審查時的共享檔案版本。主導者交付前若修改了本輪審查過的檔案，原審查者會在同一張卡上只複核改動。
+看板確認目前版本通過後才會送出主導者的完整交付結論。部分審查未完成時，群組會列出已核准的範圍、待查的範圍與目前可取用的檔案。
+在「運行限制」可設定單次獨立審查的步數與時限，預設為 30 步、4 分鐘。Bot 可為較小的審查指定較低上限。
+重試可沿用原任務卡。若已有報告但未完成審查，看板會同時保留報告與未完成狀態。
 可以試（每一項對應需求文件的一個重點）：
 
 | 在哪裡 | 輸入 | 觀察 |
@@ -78,14 +84,21 @@ pland desktop    # 以獨立視窗開啟；伺服器在背景執行，pland desk
 
 ### 2.2 自己建立 Bot 與群組
 
-1. **+ New bot**：名稱、職稱、描述會影響分工；思考強度可選 Off / Default / Low / Medium / High / Max（HKGAI 另有 Minimal 與 Extra high）。
+1. **+ New bot**：名稱、職稱、描述會影響分工；思考強度可選 Off / Default / Low / Medium / High / Max（HKGAI 為 Off / Default / Low / High / Extra high / Max）。
 2. 點任一 Bot 進入它的 **Bot Chat**（與它私聊）；右側面板可看它的記憶、經驗、技能、工作區檔案與設定。
 3. **+ New group** 建立群組並選主導者，送出目標後觀察：討論輪 → 主導者在 **Board** 建立任務 → 委派（活動列顯示開始/完成）
    → 受託者在各自的工作區工作 → 主導者整合、驗證後回報。右側 **Files** 可查看 `shared/` 中的成果。
    標題列切到 **Board** 可全寬檢視看板：五個狀態欄，卡片隨委派即時移動；點卡片展開完整說明與結果，切回 **Chat** 繼續對話。
-4. 在群組中用 `@名稱 ...` 指定對象；Bot 需要你時群組會出現 **needs you**，澄清與授權以卡片顯示在對話中。
+4. 在群組中用 `@名稱 ...` 指定對象。Bot 的回覆可在開頭用 `!handoff @名稱 要做的事` 明確交接，
+   總結中提到 Bot 名稱不會開始新一輪。澄清與授權以卡片顯示在對話中。
 
 CLI 也能和同一個 Bot 對話：`pland chat -p coder --bot-chat`（就是網頁上那個 Bot Chat）。
+
+### 2.3 快速模式
+
+新群組預設開啟 **Fast Mode**。可在群組設定切換，或點群組標題列的 **⚡ Fast Mode** 關閉，從下一則訊息起生效。每個 Bot 仍用自己設定的思考強度，
+只有「檢查」受限：每個 Shell／Python 指令最多 25 秒、整個團隊合計 90 秒；主導者把每張卡片的交付檔案與驗收指令記在看板上，
+用 `run_checks` 跑這些檢查。群組的 `review.criterion` 指定要驗的要求。同一卡片可續查一次未完成的工作，改稿可複核一次。設定頁可分別調整首審、改稿複核時限及步數（預設首審 210 秒、改稿 120 秒，各 16 步），兩者均受平台審查上限約束。跨卡沿用結論需要相同的明確要求、上下文和有效的版本證據。收尾時會列出已驗證的交付檔案；仍有項目待查時，還會分開顯示檔案存在數與驗證通過數。
 
 ## 3. 評測
 
@@ -109,7 +122,7 @@ pland eval run hard --reasoning max      # 比較不同思考強度
 | 設定 | 說明 |
 |---|---|
 | `model.model` | `deepseek-flash`（預設）或 `deepseek-v4-pro` |
-| `model.thinking`、`model.reasoning_effort` | 思考強度：`pland setup` / `pland profile set <名稱> --reasoning <off\|default\|minimal\|low\|medium\|high\|xhigh\|max>` 會寫入這兩個欄位；預設為 default（開啟思考、不指定強度；HKGAI 送 medium） |
+| `model.thinking`、`model.reasoning_effort` | 思考強度：`pland setup` / `pland profile set <名稱> --reasoning <off\|default\|minimal\|low\|medium\|high\|xhigh\|max>` 會寫入這兩個欄位；預設為 default（開啟思考、不指定強度；HKGAI 送 high）。供應商不接受的等級會改送最接近的較弱等級 |
 | `sandbox.backend` | `local`（macOS 上自動以 Seatbelt 限制檔案存取）或 `docker` |
 | `approvals.mode` | `manual`（預設）、`smart`（守門模型分流低風險指令）、`off` |
 | `toolsets` | 例如移除 `web` 讓某個 Bot 不能上網 |

@@ -101,9 +101,35 @@ CREATE TABLE IF NOT EXISTS team_tasks (
     parent_id TEXT,
     depends_on TEXT NOT NULL DEFAULT '[]',
     result TEXT,
+    conflict_source TEXT,
     created REAL NOT NULL,
     updated REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS team_reviews (
+    task_id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS task_scopes (     -- a board card's acceptance scope (Fast Mode, pland/team/fast.py)
+    task_id TEXT PRIMARY KEY,
+    room_id TEXT,
+    files TEXT NOT NULL DEFAULT '[]',       -- absolute paths of the files the card delivers
+    checks TEXT NOT NULL DEFAULT '[]',      -- commands that accept them
+    updated REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS verifications (   -- Fast Mode acceptance-check results, tied to file contents
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    room_id TEXT,
+    task_id TEXT,
+    kind TEXT NOT NULL,                     -- check
+    subject TEXT NOT NULL,                  -- the check's command
+    files TEXT NOT NULL,                    -- {path: sha256} the result was obtained on
+    verdict TEXT NOT NULL,                  -- pass | fail
+    round INTEGER NOT NULL DEFAULT 1,       -- (unused, kept for older databases)
+    report TEXT,
+    snapshot TEXT,                          -- (unused, kept for older databases)
+    created REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_verifications_room ON verifications(room_id, id);
 CREATE TABLE IF NOT EXISTS deliveries (
     id TEXT PRIMARY KEY,
     sender TEXT NOT NULL,
@@ -196,6 +222,10 @@ class DB:
             self._conn.execute("PRAGMA journal_mode=WAL")
             self._conn.execute("PRAGMA busy_timeout=30000")
             self._conn.executescript(schema)
+            if schema == SHARED_SCHEMA:
+                self._conn.execute("BEGIN IMMEDIATE")
+                if "conflict_source" not in {r[1] for r in self._conn.execute("PRAGMA table_info(team_tasks)")}:
+                    self._conn.execute("ALTER TABLE team_tasks ADD COLUMN conflict_source TEXT")
             self._conn.commit()
 
     @classmethod
@@ -213,7 +243,8 @@ class DB:
         with cls._registry_lock:
             for db in cls._registry.values():
                 try:
-                    db._conn.close()
+                    with db._lock:
+                        db._conn.close()
                 except sqlite3.Error:
                     pass
             cls._registry.clear()

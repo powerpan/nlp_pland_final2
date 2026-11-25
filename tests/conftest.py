@@ -81,6 +81,7 @@ def rt(tmp_path, monkeypatch):
 
     runtime.agent = agent
     yield runtime
+    runtime.wait_reflections()
     set_client_override(None)
     runtime.shutdown()
     DB.close_all()

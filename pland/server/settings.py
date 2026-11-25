@@ -54,6 +54,11 @@ FIELDS: dict[str, Field] = {
     "max_run_tokens": Field(("max_run_tokens",), "int", lo=100_000, hi=50_000_000),
     "max_parallel_delegations": Field(("max_parallel_delegations",), "int", lo=1, hi=8),
     "max_delegation_depth": Field(("max_delegation_depth",), "int", lo=1, hi=4),
+    "fast_review_steps": Field(("fast_review_steps",), "int", lo=1, hi=200),
+    "fast_review_seconds": Field(("fast_review_seconds",), "int", lo=1, hi=900),
+    "fast_followup_seconds": Field(("fast_followup_seconds",), "int", lo=1, hi=900),
+    "review_max_steps": Field(("review_max_steps",), "int", lo=1, hi=200),
+    "review_timeout_seconds": Field(("review_timeout_seconds",), "int", lo=1, hi=900),
     "context_char_budget": Field(("context_char_budget",), "int", lo=50_000, hi=2_000_000),
 }
 

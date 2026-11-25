@@ -33,7 +33,7 @@
 ┌───────────────▼──────────── 核心層 ─────────────────────────────┐
 │ ProfileManager  每個 Agent 一個 Profile 目錄（身份/設定/記憶/工作區）│
 │ Agent           執行循環：提示詞 → 模型（串流）→ 工具 → … → 回答 → 背景反思 │
-│ Tools           files / code / web / git / memory / plan / hitl / delegation / team │
+│ Tools           files / code / web / git / memory / plan / hitl / delegation / team / platform │
 │ HITL            ask_user 澄清、操作授權（once/session/always/deny）│
 │ Memory          有界筆記、經驗庫（BM25＋效用回饋）、技能、會話全文檢索 │
 │ Team            delegate_task、message_agent、任務看板、群組 Room │
@@ -55,6 +55,7 @@
 | `pland/profiles.py`, `sessions.py`, `store.py` | Profile、會話、SQLite 持久化 |
 | `pland/agent.py`, `prompts.py`, `reflection.py` | 執行循環、系統提示詞、任務後反思 |
 | `pland/tools/` | 所有可被模型調用的工具 |
+| `pland/handbook/` | Agent 對平台自身的認識：手冊主題、由程式產生的設定表與工具清單、即時狀態（2.2 節） |
 | `pland/hitl.py`, `approvals.py` | 人類澄清與授權 |
 | `pland/memory.py` | 筆記、經驗、技能（`tools/memory_tools.py` 另含 `session_search`；`tools/plan.py` 為 `todo`） |
 | `pland/team/` | 委派、Bot 間訊息、任務看板、群組 Room |
@@ -143,6 +144,36 @@ profiles/<name>/
   回覆不是有效 JSON 時才退回獨立的摘要提示詞。
 - 每次模型調用都寫入 `shared.db` 的 `llm_calls` 帳本（運行 ID、Agent、用途、輸入/快取/輸出 token、耗時），不含訊息內容。
 
+### 2.2 Agent 對平台自身的認識（`pland/handbook/`、`platform_info` 工具）
+
+使用者會問 Agent「你有哪些可配置項」「你如何與團隊協作」「這個平台是什麼」。沒有依據時，模型只能依對其他產品的印象猜測。
+評估過兩種做法：
+
+| 做法 | 優點 | 問題 |
+|---|---|---|
+| 把原始碼以唯讀方式開放給 Agent | 一定與實作一致 | 約 1.2 萬行，回答一題要讀很多檔、耗 token 且慢；答案停在實作層級而非使用者問的層級；沙箱刻意讓 Agent 看不到安裝目錄與 `PLAND_HOME`，開放等於放寬隔離；無法回答「我現在的設定是什麼」 |
+| 一批寫給 Agent 讀的解讀文件 | 精簡、層級正確、一次調用就能回答 | 會與程式脫節；同樣不知道即時狀態 |
+
+採用的是**文件為主、事實由程式產生、再加即時狀態**，三者都經由同一個唯讀工具 `platform_info(topic)` 取得：
+
+- **手冊主題**（`pland/handbook/*.md`，隨套件發行，英文——與系統提示詞同語言，Agent 以使用者的語言回答）：
+  `overview`（平台是什麼、單 Agent 與 Bot Mode、允許的模型）、`configuration`、`collaboration`、`memory`、`safety`、`limits`、`interfaces`。
+  每篇控制在數千字元內，一次調用不會被工具結果上限截斷。
+- **由程式產生的段落**：`configuration` 的設定表直接取自設定頁背後的欄位清單（`pland/server/settings.py` 的 `FIELDS`：可選值、範圍、
+  內建預設）並附上**提問者目前生效的值**；`tools` 取自工具登錄表，並標示這個 Agent 這次運行沒有的工具。這兩部分不可能與程式脫節。
+- **即時狀態 `status`**：身份與會話種類、模型與思考強度（含此對話的覆寫）、授權模式、實際的沙箱後端、工作資料夾、可用工具集、
+  步數與預算用量、記憶條目數、隊友與所在群組。只回報「金鑰已設定／未設定」，不含金鑰或其位置。
+- **不必設定即可用**：`platform` 工具集不受 Profile 的 `toolsets` 限制，每個 Agent（含受限的 Bot、受託者、臨時子 Agent）都有；
+  工具唯讀、不呼叫模型。系統提示詞多一小段固定文字，說明自己執行在 PlanD 上、相關問題先查 `platform_info`、設定只能由使用者更改。
+  既有對話的系統提示詞不改寫（保住前綴快取），但工具說明本身已足以引導模型使用。
+- **防脫節測試**（`tests/test_platform_info.py`）：每個 `AgentSettings` 欄位都有說明、說明中沒有已不存在的欄位；手冊內文引用的預設值
+  （80 步、300 次調用、800 萬 token、32,768、筆記容量、群組 3 輪／12 則…）與程式常數一致；內文提到的工具、參數、`pland` 子命令、
+  旗標與 `/` 指令都真的存在；任何主題都不會輸出金鑰。改了程式而沒改手冊時，測試會指出是哪一句。
+
+實測（2026-11-20，HKGAI `t2_hkgai-v3_fp8_1m_e7`、思考強度 low，各一次）：「你有哪些可配置項？」讀 `configuration`＋`status` 後列出設定層級、
+全部欄位與目前的值；「你如何與團隊協作？」（對 `@lead`）讀 `collaboration`＋`status` 後說明四種通道並點名實際的隊友；
+「你知道當前這個 harness 平台是什麼嗎？」讀 `overview` 後回答。每題 2 步、約 1.2–1.4 萬 token、約 18 秒。
+
 ---
 
 ## 3. Agent 通訊與路由
@@ -152,7 +183,7 @@ PlanD 有四種、而且只有這四種跨 Agent 的資訊通道。除此之外�
 | 通道 | 機制 | 何時使用 |
 |---|---|---|
 | **委派** `delegate_task` | 在目標 Bot 的 Profile 中新建 `delegation` 會話並跑完整執行循環，回傳結構化報告 | 實質工作（寫程式、研究、撰寫文件） |
-| **私訊** `message_agent` | 把訊息投遞到目標 Bot 的永久 Bot Chat，跑一輪後回傳回覆（同步） | 詢問、審閱、快速確認 |
+| **私訊** `message_agent` | 把訊息投遞到目標 Bot 的永久 Bot Chat，跑一輪後回傳回覆（同步；`timeout` 預設 900 秒，同時限制等待與目標的運行） | 詢問、審閱、快速確認 |
 | **群組 Room** | 人類與多個 Bot 共享的對話紀錄；每個 Bot 只看到自己上一輪之後的新訊息 | 討論、協商、由主導者推進 |
 | **顯式檔案交換** | `share_file`（複製到對方工作區 `inbox/from-<我>/` 或群組的 `shared/`）、委派時附帶 `files` | 交付成果 |
 
@@ -164,6 +195,7 @@ PlanD 有四種、而且只有這四種跨 Agent 的資訊通道。除此之外�
   這是「依情境選出」而非固定角色。
 - **Bot → Bot**：模型在系統提示詞中看得到隊友名冊（名稱、職稱、描述），自行決定 `delegate_task(to=…)`、
   `message_agent(target=…)` 或在群組中 `@name`。目標會依 Profile 名稱驗證，不存在時回傳可用名單。
+  同一個會話一次只跑一個運行；等待會話鎖時每 0.25 秒檢查一次停止請求，A 等 B、B 又等 A 的跨鏈循環會立即以「would deadlock」錯誤拒絕其中一方，不再卡住 30 分鐘。
 - **循環防護**：每個運行帶有委派鏈（例如 `planner → coder`）。若目標已在鏈中（A→B→A），委派與私訊都會被拒絕，
   避免互相等待造成死鎖；委派深度上限預設為 2。
 
@@ -175,15 +207,14 @@ PlanD 有四種、而且只有這四種跨 Agent 的資訊通道。除此之外�
    （在呼叫時拒絕，工具清單不變以維持快取），內容限於「我適合哪部分、有什麼風險、我知道什麼」，沒有要補充就回 `[PASS]`。
    各成員的討論輪彼此獨立，因此**並行執行**，再依名冊順序貼出。
    接著主導者帶著隊友的意見行動：在看板上拆解任務、用 `delegate_task` 分派、整合並驗證成果。
-2. **之後的輪次**：只有被 Bot 在訊息中 @ 到的成員獲得發言機會（他們此時有完整工具，可以修正或補做，但步數上限為 20；
-   討論輪為 6 步——實測中曾有成員因為一句客套的 @ 而花 30 分鐘重新驗證已完成的工作）。
-   提示詞要求只在真的需要對方行動時才 @，避免客套式提及造成多餘輪次。
+2. **之後的輪次**：Bot 要公開交接，可以在回覆開頭寫 `!handoff @名稱 待辦事項`。
+   收件成員有完整工具，步數上限為 40。普通提及不會觸發新一輪，人類的 `@名稱` 發題仍照常路由。
 3. 某輪無人發言、達到 3 輪或 12 則訊息、預算接近上限、或有 Bot 寫了 `@user`（需要人類）時，本次推進結束；
    `@user` 會在群組上亮起「needs you」標記。
 4. 每個成員在每個群組有一個持久的 `room_member` 會話（它在該群組的私人視角），跨多次推進保留脈絡。
 
 實測（3 個 Bot：planner / coder / writer，DeepSeek `deepseek-flash`）：planner 在看板建立 3 個任務，
-**並行**委派 coder（實作＋測試）與 writer（README），整合時發現 README 範例數值錯誤並 @coder 修正，
+**並行**委派 coder（實作＋測試）與 writer（README），整合時發現 README 範例數值錯誤並交回 coder 修正，
 最終 16 個測試通過；全程 78 次模型調用、194 秒、快取命中 89%、約 $0.05。
 
 ---
@@ -226,7 +257,24 @@ delegate_task(tasks=[
 - **人類授權不會被繞過**：受託者觸發的澄清與授權請求，會以受託者的身份送到同一個人類通道。
 - **可觀測**：每次委派都有 `delegation.started / finished` 事件、`deliveries` 紀錄，群組中也會顯示活動訊息。
 
-### 4.3 協商
+### 4.3 快速模式（`pland/team/fast.py`，群組可選）
+
+群組設定 `fast_mode` 開啟後，每則人類訊息引發的整個 drive 共用一個 `FastMode` 物件（掛在 drive 的 `Budget` 上，
+所以主導者、受託者與其子 Agent 看到的是同一組上限）。它只限制「檢查」，不動任何 Bot 的思考強度：每個 Bot 都用自己設定的等級。
+
+- **指令時間**：`run_shell`、`run_python`、`run_checks` 的每個指令最多 25 秒，整個團隊合計 90 秒。指令開始前先預留時間、
+  結束後按實際耗時結算，並行的受託者不會超出總額；用完後指令會被拒絕，並附上目前的驗證狀態。
+- **驗收範圍**：看板卡片可記錄 `files`（交付的檔案）與 `checks`（驗收指令），存於 `task_scopes` 表。
+  `run_checks(task_id)` 只執行這些檢查；同一檢查若已在相同檔案內容（SHA-256）上通過就不再執行。結果存於 `verifications` 表。
+- **審查**：沿用群組審查機制（`delegate_task` 的 `review={inputs, report}`，見 `pland/team/review.py`），
+  快速模式按驗收要求、檔案版本和報告完整性判斷能否沿用先前結論。跨卡沿用須明確指定相同要求與上下文。
+  首審或改稿複核中斷時，每張卡另有一次續查機會；已結案的改稿可在原卡複核一次。時限和步數在設定頁調整，
+  仍受平台審查上限約束。透過 `message_agent` 要求審查會被拒絕；審查角色經交接啟動的輪次也受首審限制。
+- **收尾**：drive 結束時，若有卡片帶驗收範圍，群組會顯示交付檔案的驗證數，未全部通過時也會顯示實際存在的檔案數，
+  詳細列出已驗證的檔案（所有檢查通過且審查沒有 FAIL，且都對應目前的內容）與尚待檢查的項目及原因。
+- `run_checks` 只在快速模式的 drive 中提供給 Agent；未開啟時一切行為不變。
+
+### 4.4 協商
 
 協商發生在群組的討論輪：成員表達能力與風險，主導者據此決定分工；之後成員可以在被 @ 時提出異議或補充。
 主導者也可以用 `message_agent` 私下詢問某個隊友的意見再決定。這些都是模型的自主決策，系統只提供通道與規則。
@@ -337,7 +385,7 @@ CPU 時間與檔案大小上限，並清除機密環境變數。**行程屬於�
   （模式參考 Hermes `tools/approval_detection.py`，已註明出處。）
 - **一律需授權的工具**：`delete_file`、`git_push`。
 
-**Docker 後端（`sandbox.backend: docker`）**：每個 Profile 一個長駐容器（專用映像檔 `pland-sandbox:py3.11`，
+**Docker 後端（`sandbox.backend: docker`）**：每個（Bot、工作資料夾）組合一個長駐容器（專用映像檔 `pland-sandbox:py3.11`，
 由 `docker/sandbox.Dockerfile` 首次使用時自動建置：Python 3.11、git、pytest、curl；建置失敗時退回 `python:3.11-slim`），
 `--cap-drop ALL`、`--security-opt no-new-privileges`、`--pids-limit 256`、記憶體與 CPU 上限、`/tmp` 為大小受限的 tmpfs，
 可選 `--network none`；**只**掛載該 Agent 的工作區（群組情境再巢狀掛載 `shared/`）。實測容器內看不到主機的 `/Users`，
@@ -345,28 +393,29 @@ CPU 時間與檔案大小上限，並清除機密環境變數。**行程屬於�
 但與 Hermes 不同，PlanD 把 Agent 真實的工作區掛載進容器，所以**破壞資料的操作**（遞迴刪除、`find -delete`、`git reset --hard`、
 SQL DROP/DELETE/TRUNCATE）與對外動作（push、憑證、秘密、發布）在容器內仍然必須經人類授權——這是在 Docker 後端跑 midterm
 時發現「拒絕刪除」的任務被直接刪除後修正的。
-`git_*` 工具一律在主機端執行（才能使用使用者設定的 GitHub 憑證），並受路徑政策與 push 授權約束；
+`git_*` 工具一律在主機端執行（才能使用使用者設定的 GitHub 憑證），並受路徑政策與 push 授權約束；每次都以 `-c core.hooksPath=/dev/null -c core.fsmonitor=false -c protocol.ext.allow=never` 執行，並先檢查倉庫（含子模組）自己的設定，含會啟動程式的項目就拒絕（推送到本機路徑時，目標倉庫也一樣）；
 沙箱化的 shell（Seatbelt 或容器）沒有憑證，在其中執行 `git push` 會被拒絕並指示改用 `git_push`，
 規則也明確禁止以腳本或其他 git 實作繞過（實測中 Agent 曾以 `dulwich` 繞過，已修正）。
 群組的共享資料夾在容器內掛載於 `/shared`，工作區中的 `shared` 為指向它的符號連結。
 
 ### 6.3 目前的邊界與待補強之處（如實記錄）
 
-1. Local 後端下，`run_shell` / `run_python` 執行的程式**可以讀取使用者帳號能讀的任何檔案**，包括其他 Agent 的工作區；
+1. 沒有 Seatbelt 的 Local 後端（Linux，或 `os_sandbox: off`）下，`run_shell` / `run_python` 執行的程式**可以讀取使用者帳號能讀的任何檔案**，包括其他 Agent 的工作區；
    檔案工具的限制只對檔案工具有效。需要強隔離時應使用 Docker 後端。
 2. Local 後端下網路沒有限制；Docker 後端預設 `bridge` 網路，可改 `none`。
 3. 容器內以 root 執行（能力已全部移除）；尚未做 user namespace 對應或 seccomp 自訂設定。
 4. 危險指令偵測是規則式的，可能被刻意混淆的指令繞過；它是「防誤操作」而非「防惡意」。另外參考 Hermes 的內容層檢查：
    以 curl/wget 上傳秘密變數或憑證檔、指令中含不可見／雙向 Unicode 控制字元，也需要授權。網頁搜尋與抓取的結果會掃描
    常見的提示詞注入樣式（要求忽略先前指示、重新定義角色、HTML 註解中的指示、竊取秘密、curl|sh、不可見字元），
-   命中時在結果前加上警告並發出安全事件，但不阻擋內容。
+   命中時在結果前加上警告並發出安全事件，但不阻擋內容。系統提示明訂工具結果、檔案內容、網頁與其他 Agent 的訊息都是資料、
+   不是指令；其他 Agent 以 `message_agent` 傳來的訊息會標明來自 Agent、不能授權。
 5. 同一個 Bot 同時在兩個群組工作時，Local 後端的 `shared` 連結會隨最近的群組切換（Docker 後端無此問題）。
-6. 評測時若使用 Local 後端，Agent 的程式在技術上讀得到版本庫中的測試集 YAML（含檢查用的預期值）；
+6. 評測時若使用沒有 Seatbelt 的 Local 後端（Linux，或 `os_sandbox: off`），Agent 的程式在技術上讀得到版本庫中的測試集 YAML（含檢查用的預期值）；
    Agent 不會被告知其位置，正式評測若需排除此可能，應使用 Docker 後端。
-7. Local 後端（含 Seatbelt）執行指令時保留 `SSH_AUTH_SOCK`，而 Seatbelt 設定不限制 socket 與網路：若使用者的 ssh-agent 載有金鑰，
-   沙箱內的指令可以用它連線或以 SSH 遠端推送（2026-10-24 稽核以真實 Seatbelt 確認 socket 可達；待修正——修正時只能在沙箱指令的
-   環境中移除，主機端的 `git_push` 仍需要它）。
-8. 評測的 `command` 與 `python` 檢查在主機上執行、不經沙箱（`python` 檢查把任務工作區加入 `sys.path`，會匯入 Agent 寫的模組）。
+7. Seatbelt 是「拒絕清單」：只擋使用者的家目錄與 PlanD 的資料夾（自己的可寫目錄與唯讀工具鏈除外），系統路徑與 `/tmp`
+   仍依使用者的權限可讀寫，網路也不受限。沙箱指令的環境不含 `SSH_AUTH_SOCK`（2026-10-24 稽核確認 ssh-agent 可達，
+   2026-11-20 修正；主機端的 `git_push` 不受影響）。
+8. 評測的 `command`、`python` 與 git 檢查自 2026-11-20 起經任務自己的沙箱後端執行（Seatbelt 或同一個容器），檢查程式碼由 stdin 傳入、不寫入磁碟；唯一例外是需要讀取執行紀錄資料庫的檢查（標記 `host: true`），它在主機上以隔離模式執行、不匯入工作區的模組。
    對信任的題庫與腳本化使用者沒有問題，但這是一條邊界：對不受信任的模型或輸入執行封閉測試集時應留意。
 9. 後續可補強：每個 Profile 一個作業系統使用者、容器使用非 root 使用者與唯讀根檔案系統、網路白名單、
    以容器執行 git 並注入受限的部署金鑰。
@@ -380,7 +429,7 @@ SQL DROP/DELETE/TRUNCATE）與對外動作（push、憑證、秘密、發布）�
 | 指令歧義、缺少關鍵資訊 | 模型呼叫 `ask_user(question, options)`；系統提示詞要求在不可逆或昂貴的工作前先確認 |
 | 需要許可的操作 | 工具在執行前呼叫授權閘門；人類可選 **once / session / always / deny**；`always` 寫入 Profile 的永久規則 |
 | 無人可回應（背景/無人值守） | 澄清回覆「目前無人，請自行做合理假設並說明」；授權預設拒絕 |
-| 選用：smart 授權模式 | 參考 Hermes：被標記的 shell/Python 指令先交給一次「守門」模型調用（同一個 DeepSeek 模型、temperature 0、限 8 tokens），低風險直接核准、明顯危險直接拒絕、不確定才問人；指令中的註解先移除並以 `<command>` 包住當作不可信輸入。**刪除檔案、git push、憑證、發布、sudo 一律問人**；預設仍為 manual |
+| 選用：smart 授權模式 | 參考 Hermes：被標記的 shell/Python 指令先交給一次「守門」模型調用（同一個 DeepSeek 模型、temperature 0、限 8 tokens），低風險直接核准、明顯危險直接拒絕、不確定才問人；適用於 shell、Python 與工作區內的單一檔案刪除。指令以 `<command>` 包住當作不可信輸入，註解只在能確定解析時才移除（引號未閉合、heredoc、`$(…)`、反引號等一律原文送出；Python 以 tokenizer 移除且需 AST 不變），超過長度上限而被截短的指令不交給守門、直接問人（卡片標示省略的字數）。**git push、憑證、秘密、發布、sudo 一律問人**；預設仍為 manual |
 
 **續跑而不重來**：請求發生在工具呼叫「內部」，執行緒在該點等待；答覆抵達後工具回傳答案，**同一個運行**繼續往下，
 不會重新開始任務。請求同時寫入 `shared.db`：若行程在等待中死掉，會話中留下「有呼叫、無結果」的工具呼叫，
@@ -406,6 +455,8 @@ SQL DROP/DELETE/TRUNCATE）與對外動作（push、憑證、秘密、發布）�
   後端被封鎖或限流時回報「失敗」，不會偽裝成「沒有結果」。HKGAI 沒有搜尋與抓取 API，因此不論模型由哪個供應商執行，
   只要設定了 `DEEPSEEK_API_KEY` 就使用 DeepSeek 的 Search / Fetch；送出前同樣經過端點護欄，DeepSeek 金鑰只會送到 DeepSeek 的主機。
   設定頁切換到 HKGAI 時會說明網路工具改走哪裡；`pland doctor` 也會顯示。
+  `web_fetch` 直接抓取時逐一追蹤重新導向（最多 5 次），每一跳都先檢查不是內網、迴路或保留位址，避免公開網址轉址到本機的
+  PlanD API；尚未防範 DNS rebinding（檢查與連線之間名稱改指向內網）。
 - **思考強度**（`pland/llm/reasoning.py`，參考 Hermes 的 `agent/reasoning_effort.py` 與 DeepSeek provider profile）：
   使用者可選 `off`、`default`（不送 effort，由 DeepSeek 決定，評測即用此設定）、`low`、`medium`、`high`、`max`。
   內部採用 Hermes 的完整階梯（minimal…ultra），送出前**夾到供應商支援的層級**：支援就原樣送出，否則先查宣告的對應
@@ -423,6 +474,12 @@ SQL DROP/DELETE/TRUNCATE）與對外動作（push、憑證、秘密、發布）�
   （否則預設開啟思考在 HKGAI 上等於沒開）。推理文字回在 `reasoning` 欄位（DeepSeek 是 `reasoning_content`），一般回應與串流都會讀取，
   帶工具時同樣回放。實測各等級都會思考，但思考長短與等級並不總是成正比（單次樣本，minimal 有時比 medium 長）。
   開啟思考時 HKGAI 的 JSON 模式曾回傳不合法的 JSON（3 次中 2 次），所以 JSON 模式的呼叫在 HKGAI 上一律關閉思考。
+- **HKGAI 於 2026-11 更換了後端模型（2026-11-20 重新實測）**：同一個模型 ID 現在回報為 DeepSeek V4.1，`reasoning_effort` 只接受
+  none / low / high / xhigh / max；`minimal` 與 `medium` 回 400（整數也被閘道拒絕），而 **不送欄位現在會思考**（十月時不會）。
+  當時 `default` 送的正是 `medium`，因此預設設定下的每次對話都失敗（`pland doctor --probe` 的對話與工具調用兩項回 400）。
+  修正：HKGAI 的等級改為 off / default / low / high / xhigh / max，`default` 改送 `high`（與不送欄位時的思考長度相近）；
+  仍然每次明確送出等級，不依賴「不送」的含意。已存成 `minimal` 或 `medium` 的設定依既有規則夾到較弱的 `low`，不必手動修改。
+  上面兩段保留十月的實測紀錄以供對照。
 - `pland doctor --probe` 以數次小調用驗證：對話、原生工具、工具＋思考（含回放）、思考強度（max 有推理、off 沒有）、JSON 模式、Search、Fetch。
 
 ---
@@ -481,6 +538,19 @@ Hermes 的 Bot Mode 是 Desktop 插件（名冊、群組、Routines 都是 UI �
   關閉思考、8 個輸出 token 的真實調用驗證（401／403 不儲存，402 餘額不足則儲存並警告），並記入 ledger。這三個端點只接受
   loopback 用戶端、loopback 的 Host 標頭（防 DNS rebinding）、同源 Origin（防其他網頁跨站送出）與 JSON 內容。
   HKGAI 端點必須是 https 並通過端點護欄；護欄比對主機名稱前會先去掉結尾的點（`api.openai.com.` 不再能通過）。
+- **介面語言**（`static/i18n/zh-Hant.json`）：介面文字以英文原文為鍵，`t('…', {參數})` 查表並填入 `{名稱}` 佔位符，查不到就顯示英文。
+  語言是瀏覽器層級的設定（`ui.lang`：auto／en／zh-Hant；auto 在瀏覽器第一語言為 zh-TW／zh-HK／zh-MO／zh-Hant 時選繁體中文）。
+  `<head>` 的小段程式先決定語言並開始抓取字典，`app.js` 等字典到了才載入，所以第一次繪製就是譯文；字典 3 秒內沒有載入就以英文啟動並提示，
+  頁面最多隱藏 4 秒。日期、相對時間與數字用對應的 locale 格式化。訊息、Bot 與群組名稱、工具名、模型 ID 保持原樣。
+  `tests/test_i18n.py` 檢查每個 `t()` 鍵都有譯文、沒有多餘的鍵、佔位符一致、沒有簡體專用字。
+- **伺服器送出的文字**（`static/i18n/zh-Hant.server.json`，123 則）：API 錯誤、金鑰與供應商提示、資料夾檢查的原因、伺服器寫入群組紀錄的
+  系統訊息與委派活動列、範例團隊的說明。伺服器端**仍然只產生英文**——CLI、其他 API 用戶端與 Bot 讀的是同一份文字（群組系統訊息會進入
+  Bot 的提示詞），改成依語言輸出會讓 Agent 看到的內容隨瀏覽器設定而變。因此翻譯只在瀏覽器顯示時進行：字典的鍵是帶 `{名稱}` 佔位符的
+  英文樣板，`ts()` 先比對完全相同的字串，再把樣板編成正規表示式比對（字面文字最多的樣板優先），取出的值若本身是已知片語
+  （「a subagent」「an API key and a model」）也一併翻譯；多句串接的提示逐句處理，認不得的文字原樣顯示。`api()` 在建立錯誤時就翻譯
+  （原文保留在 `err.detail`），所以所有顯示錯誤的地方都生效。Bot 的描述只做**完全相同**的比對，使用者自己改寫過的描述不會被動到；
+  編輯表單顯示的是實際儲存的英文。`tests/test_i18n_server.py` 以 AST 從 Python 原始碼收集這些樣板（`HTTPException` 與各模組的例外訊息、
+  金鑰提示、群組貼文、同源護欄的拒絕訊息、範本 YAML），缺譯文或有多餘條目都會失敗。
 - **版面**：側欄與右側面板可拖曳調整寬度（夾在 220–440 / 300–640 px，雙擊重設，方向鍵微調），側欄拖到幾乎合起即收起；
   ⌘B / ⌘. / ⌘, / ⇧⌘O 等快捷鍵（非 macOS 為 Ctrl）。設定頁開啟時主畫面設為 `inert`，Esc 關閉並把焦點還給原處。
 - **視覺設計**：「工作日誌」風格——紙色底與墨色文字、襯線字體用於名稱與標題、等寬字用於機器產生的內容（模型、路徑、計數、狀態）、
@@ -497,6 +567,9 @@ API 預設只綁定 127.0.0.1，沒有身分驗證，但只回應自己的頁面
 Host 必須是本機位址（防 DNS rebinding）；帶 Origin 的寫入請求與 WebSocket 握手必須與 Host 同源，`Sec-Fetch-Site: cross-site` 一律拒絕；
 讀取與沒有這些標頭的請求（curl、測試）不受影響（跨來源讀取沒有 CORS 標頭，別的頁面本來就讀不到回應）。`pland serve --allowed-hosts`
 可為反向代理加入允許的網域；綁定非回送位址（`--host 0.0.0.0`）時不檢查 Host，Origin 規則照舊。
+每個回應都帶嚴格的 Content-Security-Policy（只允許同源的腳本與樣式，`object-src`／`base-uri`／`frame-ancestors` 皆為 none）、
+`X-Content-Type-Options: nosniff` 與 `Referrer-Policy: no-referrer`；頁面因此沒有任何內嵌腳本或樣式（語言判斷在 `boot.js`）。
+找不到的 Profile、會話、群組、授權請求與看板任務丟出 `NotFound` 並回 404；其他 `KeyError` 回 500 並記錄完整堆疊，不再偽裝成「找不到」。
 
 ---
 

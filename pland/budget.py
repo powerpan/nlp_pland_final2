@@ -13,6 +13,7 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass, field
+from typing import Any
 
 from .llm.base import Usage
 from .llm.pricing import cost
@@ -31,6 +32,8 @@ class Budget:
     usage: Usage = field(default_factory=Usage)
     started: float = field(default_factory=time.time)
     root_run: str = field(default_factory=lambda: new_id("w_"))
+    fast: Any = None  # the drive's FastMode (pland/team/fast.py) when its group has Fast Mode on
+    team_turn: Any = None  # shared review and learning state for this room request
 
     def __post_init__(self):
         self._lock = threading.Lock()

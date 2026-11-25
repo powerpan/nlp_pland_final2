@@ -13,17 +13,39 @@ from .registry import ToolContext, ToolError, obj, tool
     "Notes are bounded; consolidate when full. They appear in your system prompt from the next session on.",
     obj({"action": {"type": "string", "enum": ["add", "replace", "remove", "read"]},
          "target": {"type": "string", "enum": ["memory", "user"]},
+         "verified_task_id": {"type": "string", "description": "Store the exact signed resolution or observed evidence from a passing board card."},
+         "user_quote": {"type": "string", "description": "For a preference explicitly stated by the current human, quote their exact words. Saves those words immediately to target=user."},
          "content": {"type": "string"}, "old_text": {"type": "string"}}, ["action", "target"]),
     "memory",
 )
 def memory_tool(ctx: ToolContext, a):
     mem = NotesMemory(ctx.profile)
     action, target = a["action"], a["target"]
-    try:
+    verified = a.get("verified_task_id")
+    turn = ctx.agent.budget.team_turn
+    quote = (a.get("user_quote") or "").strip()
+    content = (a.get("content") or "").strip()
+    if quote and (target != "user" or action not in {"add", "replace"} or (turn and quote not in turn.user_text)):
+        raise ToolError("For user_quote, copy an exact preference from the current human's message and use target=user.")
+    if target == "user" and verified:
+        raise ToolError("A card verifies team work. For the human's preference use user_quote with the human's exact words.")
+    if turn and target == "user" and content and content in turn.user_text and action in {"add", "replace"}:
+        quote = quote or content
+
+    def write(*, validate_only=False):
+        content = quote or a.get("content") or ""
+        if verified:
+            card = ctx.runtime.board.get(verified)
+            review = card.get("review") or {}
+            if (not ctx.room_id or card["room_id"] != ctx.room_id or action != "add" or target != "memory"
+                    or card["status"] != "done" or review.get("verdict") != "pass"
+                    or not (review.get("resolution") or review.get("evidence", {}).get("basis") == "observed")):
+                raise ToolError("Only a current signed resolution on this group's card can be remembered this way.")
+            content = review.get("resolution") or review["evidence"]["detail"]
         if action == "add":
-            msg = mem.add(target, a.get("content") or "", ctx.session_id)
+            msg = mem.add(target, content, ctx.session_id, validate_only=validate_only)
         elif action == "replace":
-            msg = mem.replace(target, a.get("old_text") or "", a.get("content") or "", ctx.session_id)
+            msg = mem.replace(target, a.get("old_text") or "", content, ctx.session_id, validate_only=validate_only)
         elif action == "remove":
             msg = mem.remove(target, a.get("old_text") or "", ctx.session_id)
         elif action == "read":
@@ -32,10 +54,24 @@ def memory_tool(ctx: ToolContext, a):
             return f"{target} [{used}/{cap}]\n" + ("\n§\n".join(entries) or "(empty)")
         else:
             raise ToolError(f"unknown action {action}")
+        if not validate_only:
+            ctx.emit("memory.changed", store=target, action=action)
+        return msg
+
+    try:
+        if quote:
+            return write()  # The human is the source; later findings cannot invalidate this preference.
+        if action in {"add", "replace"} and turn:
+            if feedback := write(validate_only=True):
+                return feedback
+            if target == "user" and turn.conflicts:
+                raise ToolError("For the user's own preference, use user_quote with their exact words. Work conclusions belong on the board.")
+            turn.defer_learning(ctx.agent, write, independently_sourced=bool(verified))
+            return ("Queued until group verification settles. To remember an explicit user preference immediately, "
+                    "use target=user with user_quote copied from the latest human message.")
+        return write()
     except MemoryError_ as exc:
         raise ToolError(str(exc))
-    ctx.emit("memory.changed", store=target, action=action)
-    return msg
 
 
 @tool(
@@ -78,9 +114,15 @@ def skill_view(ctx: ToolContext, a):
     "memory",
 )
 def skill_save(ctx: ToolContext, a):
-    msg = SkillStore(ctx.profile).save(a["name"], a["description"], a["content"], ctx.session_id)
-    ctx.emit("memory.changed", store="skill", action="save", name=a["name"])
-    return msg
+    SkillStore.validate_name(a["name"])
+    def save():
+        msg = SkillStore(ctx.profile).save(a["name"], a["description"], a["content"], ctx.session_id)
+        ctx.emit("memory.changed", store="skill", action="save", name=a["name"])
+        return msg
+    if ctx.agent.budget.team_turn:
+        ctx.agent.budget.team_turn.defer_learning(ctx.agent, save)
+        return "Queued until group verification settles. Unverified procedures from a disputed task are withheld."
+    return save()
 
 
 @tool(

@@ -39,8 +39,16 @@ def client(rt):
 
 
 def idle(client, profile, sid):
-    data = client.get(f"/api/profiles/{profile}/sessions/{sid}/messages").json()
-    return data if not data["busy"] else None
+    """The session payload once its run has ended, else None.
+
+    The endpoint reads the transcript before it computes `busy`, so a poll that lands while the run finishes can say
+    "not busy" next to a transcript from before the last messages were stored. `busy` stays True from the moment a
+    run is accepted (the server marks it active before answering 202) until it has fully ended, so once a poll sees it
+    False, a second read is complete."""
+    url = f"/api/profiles/{profile}/sessions/{sid}/messages"
+    if client.get(url).json()["busy"]:
+        return None
+    return client.get(url).json()
 
 
 # --------------------------------------------------------------------------- status & static

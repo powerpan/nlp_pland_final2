@@ -20,6 +20,7 @@ import threading
 import time
 from typing import TYPE_CHECKING, Any
 
+from ..errors import NotFound
 from ..sessions import SessionStore
 from .views import session_todos
 
@@ -142,7 +143,7 @@ class LiveState:
     def _session(self, profile: str, session_id: str):
         try:
             return SessionStore(self.rt.profiles.get(profile)).get(session_id)
-        except KeyError:
+        except NotFound:
             return None
 
     def _kind_of(self, profile: str, session_id: str) -> str | None:

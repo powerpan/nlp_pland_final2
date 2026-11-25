@@ -11,10 +11,12 @@ requires-python = ">=3.10"
 license = { text = "MIT" }
 dependencies = [
   "httpx>=0.27",
+  "httpcore>=1.0",  # web_fetch pins connections through its network backend
   "pyyaml>=6.0",
   "fastapi>=0.110",
   "uvicorn[standard]>=0.29",
   "rich>=13.7",
+  "markdown-it-py>=3",  # parse role files using Markdown headings, tables and fenced prompts
   "beautifulsoup4>=4.12",
 ]
 
@@ -28,7 +30,7 @@ pland = "pland.cli:main"
 include = ["pland*"]
 
 [tool.setuptools.package-data]
-pland = ["server/static/*", "eval/suites/**/*", "team_templates/*.yaml"]
+pland = ["server/static/*", "server/static/i18n/*.json", "eval/suites/**/*", "team_templates/*.yaml", "handbook/*.md"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

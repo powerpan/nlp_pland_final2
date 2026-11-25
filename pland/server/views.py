@@ -105,6 +105,43 @@ def display_items(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return items
 
 
+_NO_LIMIT = 2 ** 62  # an id larger than any row's: "before" not given
+
+
+def records_page(profile: "Profile", session_id: str, *, before: int | None = None,
+                 latest: int = 150) -> tuple[list[dict[str, Any]], bool]:
+    """A page of a session's transcript, newest first: the last `latest` records before id `before` (the end when
+    None), widened back to the start of the turn the oldest one is in (its `user` record), so every tool result is on
+    the same page as its call and an assistant turn is never cut in two. Returns (records oldest first, whether there
+    are older records). Same record shape as `SessionStore.records`."""
+    cut = before or _NO_LIMIT
+    row = profile.db.one("SELECT MIN(id) AS m FROM (SELECT id FROM messages WHERE session_id=? AND id<? ORDER BY id DESC LIMIT ?)",
+                         (session_id, cut, latest))
+    if not row or row["m"] is None:
+        return [], False
+    turn = profile.db.one("SELECT MAX(id) AS m FROM messages WHERE session_id=? AND id<=? AND role='user'", (session_id, row["m"]))
+    start = turn["m"] if turn and turn["m"] is not None else 0  # no user record before it: from the beginning
+    rows = profile.db.query("SELECT id, role, body, meta, created FROM messages WHERE session_id=? AND id>=? AND id<? ORDER BY id",
+                            (session_id, start, cut))
+    more = bool(rows) and profile.db.one("SELECT 1 AS x FROM messages WHERE session_id=? AND id<? LIMIT 1",
+                                         (session_id, rows[0]["id"])) is not None
+    return [{"id": r["id"], "role": r["role"], "message": loads(r["body"], {}) or {}, "meta": loads(r["meta"], {}) or {},
+             "created": r["created"]} for r in rows], more
+
+
+def room_page(shared: "DB", room_id: str, *, before: int | None = None, latest: int = 150) -> tuple[list[dict[str, Any]], bool]:
+    """The last `latest` messages of a group before id `before` (the end when None), oldest first, and whether there
+    are older ones. Same row shape as `RoomManager.messages`."""
+    rows = shared.query("SELECT * FROM room_messages WHERE room_id=? AND id<? ORDER BY id DESC LIMIT ?",
+                        (room_id, before or _NO_LIMIT, latest))
+    rows.reverse()
+    for r in rows:
+        r["meta"] = loads(r["meta"], {})
+    more = bool(rows) and shared.one("SELECT 1 AS x FROM room_messages WHERE room_id=? AND id<? LIMIT 1",
+                                     (room_id, rows[0]["id"])) is not None
+    return rows, more
+
+
 def recalled_tasks(prompt: str) -> list[str]:
     """Tasks of the past experiences `Agent._with_experience` appended to a user prompt."""
     prompt = (prompt or "").rstrip()

@@ -22,12 +22,15 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from uuid import uuid4
 
 from ..config import SandboxConfig
 
 _SECRET_HINTS = ("KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "COOKIE", "SESSION")
 _ENV_KEEP = {"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TERM", "USER", "LOGNAME", "SHELL", "TMPDIR", "TZ",
-             "SSH_AUTH_SOCK", "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
+             "GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL", "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"}
+# Kept only for host-side tools (git_push over SSH): sandboxed commands never get the user's ssh-agent.
+_HOST_ONLY_KEEP = {"SSH_AUTH_SOCK"}
 
 
 @dataclass
@@ -57,10 +60,12 @@ def _truncate(text: str, limit: int) -> str:
     return f"{head}\n... [{len(text) - limit} chars truncated] ...\n{tail}"
 
 
-def scrub_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+def scrub_env(extra: dict[str, str] | None = None, *, sandbox: bool = False) -> dict[str, str]:
+    """Environment for a child process. `sandbox=True` (agent shells and Python) also drops the host-only
+    entries such as SSH_AUTH_SOCK, which the host-side git tools still need."""
     env = {}
     for k, v in os.environ.items():
-        if k in _ENV_KEEP or (k.startswith("LC_")):
+        if k in _ENV_KEEP or (k.startswith("LC_")) or (not sandbox and k in _HOST_ONLY_KEEP):
             env[k] = v
         elif any(h in k.upper() for h in _SECRET_HINTS):
             continue
@@ -91,6 +96,22 @@ class Backend:
 
 SANDBOX_EXEC = "/usr/bin/sandbox-exec"
 
+# Run as `python -I -S -c _RLIMIT_LAUNCHER <cpu seconds> <file size bytes> <argv...>`: sets the limits (hard = soft,
+# as before; a limit the OS refuses is skipped), then replaces itself with argv. stdin/stdout/stderr pass through.
+_RLIMIT_LAUNCHER = (
+    "import os,resource as r,sys\n"
+    "for k,v in ((r.RLIMIT_CPU,int(sys.argv[1])),(r.RLIMIT_FSIZE,int(sys.argv[2])),(r.RLIMIT_CORE,0)):\n"
+    "    try:\n"
+    "        r.setrlimit(k,(v,v))\n"
+    "    except (OSError,ValueError):\n"
+    "        pass\n"
+    "try:\n"
+    "    os.execvp(sys.argv[3],sys.argv[3:])\n"
+    "except OSError as e:\n"
+    "    sys.stderr.write(f'cannot run {sys.argv[3]}: {e}\\n')\n"
+    "    os._exit(127)\n"
+)
+
 
 def _sb_quote(path: Path | str) -> str:
     return '"' + str(path).replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -107,6 +128,8 @@ def seatbelt_profile(writable: list[Path], readable: list[Path], denied: list[Pa
     if readable:
         lines.append("(allow file-read* " + " ".join(f"(subpath {_sb_quote(p)})" for p in readable) + ")")
     lines.append("(allow file-read* file-write* " + " ".join(f"(subpath {_sb_quote(p)})" for p in writable) + ")")
+    # A private HOME protects files; keychain requests also use host services.
+    lines.append('(deny mach-lookup (global-name "com.apple.SecurityServer") (global-name "com.apple.securityd.xpc"))')
     return "\n".join(lines) + "\n"
 
 
@@ -150,17 +173,18 @@ class LocalBackend(Backend):
         env.setdefault("GIT_COMMITTER_EMAIL", env["GIT_AUTHOR_EMAIL"])
         return [SANDBOX_EXEC, "-p", seatbelt_profile(writable, self._readable, self._denied)] + argv
 
-    def _limits(self):  # pragma: no cover - runs in the child
-        try:
-            import resource
+    def _limit_values(self) -> tuple[int, int]:
+        """(CPU seconds, max file size in bytes) for one command; core dumps are always off."""
+        return int(self.cfg.command_timeout * 2) + 5, 512 * 1024 * 1024
 
-            cpu = int(self.cfg.command_timeout * 2) + 5
-            resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu))
-            fsize = 512 * 1024 * 1024
-            resource.setrlimit(resource.RLIMIT_FSIZE, (fsize, fsize))
-            resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
-        except Exception:
-            pass
+    def _with_limits(self, argv: list[str]) -> list[str]:
+        """Prefix `argv` with the rlimit launcher. Limits are set in a separate interpreter that then execs the
+        command (sandbox-exec, bash or Python), so no Python code runs between fork and exec in this
+        multi-threaded server (subprocess's preexec_fn can deadlock there). rlimits survive exec."""
+        if os.name != "posix":
+            return argv
+        cpu, fsize = self._limit_values()
+        return [sys.executable, "-I", "-S", "-c", _RLIMIT_LAUNCHER, str(cpu), str(fsize)] + argv
 
     def _exec(self, argv: list[str], cwd: Path, timeout: float, env: dict[str, str], stdin: str | None = None,
               cancel=None) -> ExecResult:
@@ -169,7 +193,7 @@ class LocalBackend(Backend):
         `cancel()` is polled once a second so a stopped run does not wait for a long command to finish."""
         start = time.time()
         proc = subprocess.Popen(
-            argv,
+            self._with_limits(argv),
             cwd=str(cwd),
             env=env,
             stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
@@ -177,8 +201,7 @@ class LocalBackend(Backend):
             stderr=subprocess.PIPE,
             text=True,
             errors="replace",
-            start_new_session=True,
-            preexec_fn=self._limits if os.name == "posix" else None,
+            start_new_session=True,  # own session and process group, set by subprocess without Python in the child
         )
         deadline = start + timeout
         pending_input = stdin
@@ -214,15 +237,53 @@ class LocalBackend(Backend):
 
     def run(self, command, cwd, *, timeout=None, env=None, mounts=None, cancel=None) -> ExecResult:
         cwd.mkdir(parents=True, exist_ok=True)
-        e = scrub_env(env)
+        e = scrub_env(env, sandbox=True)
+        e.pop("SSH_AUTH_SOCK", None)  # not even when passed in `env`
         argv = self._wrap(["/bin/bash", "-c", command], cwd, mounts, e)
         return self._exec(argv, cwd, timeout or self.cfg.command_timeout, e, cancel=cancel)
 
     def run_python(self, code, cwd, *, timeout=None, mounts=None, cancel=None) -> ExecResult:
         cwd.mkdir(parents=True, exist_ok=True)
-        e = scrub_env()
+        e = scrub_env(sandbox=True)
         argv = self._wrap([self.python, "-I", "-"], cwd, mounts, e)
         return self._exec(argv, cwd, timeout or self.cfg.command_timeout, e, stdin=code, cancel=cancel)
+
+
+# Killing the local Docker client does not stop docker exec inside the container.
+# The launcher owns the command's process group and enforces its timeout even if the client disconnects.
+_DOCKER_LAUNCHER = """
+import os, signal, subprocess, sys, time
+
+stop, timeout, *argv = sys.argv[1:]
+deadline = time.monotonic() + float(timeout)
+child = None
+timed_out = False
+try:
+    if os.path.exists(stop):
+        sys.exit(125)
+    child = subprocess.Popen(argv, stdin=sys.stdin, start_new_session=True)
+    while child.poll() is None:
+        if os.path.exists(stop):
+            sys.exit(125)
+        if time.monotonic() >= deadline:
+            timed_out = True
+            sys.exit(124)
+        time.sleep(0.05)
+    sys.exit(child.returncode if child.returncode >= 0 else 128 - child.returncode)
+finally:
+    if child is not None:
+        try:
+            os.killpg(child.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        child.wait()
+    try:
+        os.unlink(stop)
+    except FileNotFoundError:
+        pass
+    if timed_out:
+        print(f'\\n[{stop}: timeout]', file=sys.stderr, flush=True)
+"""
 
 
 class DockerBackend(Backend):
@@ -276,7 +337,7 @@ class DockerBackend(Backend):
             name = f"pland-{self.profile_name}-{suffix}"
             subprocess.run(["docker", "rm", "-f", name], capture_output=True, text=True)
             argv = [
-                "docker", "run", "-d", "--name", name,
+                "docker", "run", "-d", "--init", "--name", name,
                 "--label", "pland=1",
                 "--cap-drop", "ALL",
                 "--cap-add", "CHOWN", "--cap-add", "DAC_OVERRIDE", "--cap-add", "FOWNER",
@@ -315,27 +376,56 @@ class DockerBackend(Backend):
                 return f"/{alias}/" + cwd.relative_to(path).as_posix()
         return "/workspace"
 
-    def _exec(self, argv: list[str], timeout: float, stdin: str | None = None) -> ExecResult:
-        start = time.time()
-        try:
-            r = subprocess.run(argv, input=stdin, capture_output=True, text=True, errors="replace", timeout=timeout)
-            return ExecResult(r.returncode, r.stdout, r.stderr, False, time.time() - start)
-        except subprocess.TimeoutExpired as exc:
-            return ExecResult(-9, (exc.stdout or "") if isinstance(exc.stdout, str) else "",
-                              f"[killed after {timeout:.0f}s timeout]", True, time.time() - start)
+    def _exec(self, options: list[str], command: list[str], timeout: float, mounts: dict[str, Path] | None,
+              stdin: str | None = None, cancel=None) -> ExecResult:
+        if cancel is not None and cancel():
+            return ExecResult(-9, "", "[run cancelled]", True)
+        name = self._container_for(mounts)
+        if cancel is not None and cancel():
+            return ExecResult(-9, "", "[run cancelled]", True)
+        start = time.monotonic()
+        stop = f"/tmp/.pland-stop-{uuid4().hex}"
+        argv = ["docker", "exec", *options, name, "python", "-I", "-S",
+                "-c", _DOCKER_LAUNCHER, stop, str(timeout), *command]
+        with subprocess.Popen(argv, stdin=subprocess.PIPE if stdin is not None else subprocess.DEVNULL,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, errors="replace") as proc:
+            pending_input = stdin
+            # Give the launcher a short window to return the command output after enforcing its own timeout.
+            deadline = start + timeout + 1
+            timeout_marker = f"\n[{stop}: timeout]\n"
+            while True:
+                try:
+                    out, err = proc.communicate(pending_input, timeout=0.2)
+                    if err.endswith(timeout_marker):
+                        return ExecResult(-9, out, err[:-len(timeout_marker)] + f"\n[killed after {timeout:.0f}s timeout]",
+                                          True, time.monotonic() - start)
+                    return ExecResult(proc.returncode, out, err, False, time.monotonic() - start)
+                except subprocess.TimeoutExpired:
+                    pending_input = None
+                stopped = cancel is not None and cancel()
+                if not stopped and time.monotonic() < deadline:
+                    continue
+                # Signal just this command. Other sessions may be using the same container.
+                try:
+                    subprocess.run(["docker", "exec", name, "touch", stop], capture_output=True, timeout=2)
+                    out, err = proc.communicate(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    out, err = proc.communicate()
+                why = "run cancelled" if stopped else f"killed after {timeout:.0f}s timeout"
+                return ExecResult(-9, out, err.removesuffix(timeout_marker) + f"\n[{why}]", True,
+                                  time.monotonic() - start)
 
     def run(self, command, cwd, *, timeout=None, env=None, mounts=None, cancel=None) -> ExecResult:
-        name = self._container_for(mounts)
-        argv = ["docker", "exec", "-w", self._container_cwd(cwd, mounts)]
+        options = ["-w", self._container_cwd(cwd, mounts)]
         for k, v in (env or {}).items():
-            argv += ["-e", f"{k}={v}"]
-        argv += [name, "bash", "-c", command]
-        return self._exec(argv, timeout or self.cfg.command_timeout)
+            if k != "SSH_AUTH_SOCK":  # the container gets no ssh-agent (the socket is not mounted either)
+                options += ["-e", f"{k}={v}"]
+        return self._exec(options, ["bash", "-c", command], timeout or self.cfg.command_timeout, mounts, cancel=cancel)
 
     def run_python(self, code, cwd, *, timeout=None, mounts=None, cancel=None) -> ExecResult:
-        name = self._container_for(mounts)
-        argv = ["docker", "exec", "-i", "-w", self._container_cwd(cwd, mounts), name, "python", "-"]
-        return self._exec(argv, timeout or self.cfg.command_timeout, stdin=code)
+        options = ["-i", "-w", self._container_cwd(cwd, mounts)]
+        return self._exec(options, ["python", "-"], timeout or self.cfg.command_timeout, mounts, stdin=code, cancel=cancel)
 
     def shutdown(self) -> None:
         with self._lock:

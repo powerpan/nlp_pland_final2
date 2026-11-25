@@ -122,7 +122,7 @@ def edit_file(ctx: ToolContext, a):
 
 @tool(
     "delete_file",
-    "Delete a file or an empty directory in your workspace. Requires human approval.",
+    "Delete a file or an empty directory in your workspace. Follows the approval mode; Smart can approve routine cleanup.",
     obj({"path": {"type": "string"}}, ["path"]),
     "files",
 )
@@ -132,7 +132,8 @@ def delete_file(ctx: ToolContext, a):
         raise ToolError(f"{a['path']} does not exist")
     if path in [r.resolve() for r in ctx.paths.roots.values()]:
         raise ToolError("refusing to delete a workspace root")
-    ctx.require_approval("files:delete", f"Delete {ctx.paths.display(path)}", detail=f"absolute path: {path}")
+    ctx.require_approval("files:delete", f"Delete {ctx.paths.display(path)}",
+                         detail=f"workspace-validated path: {path}\ntarget: {'directory' if path.is_dir() else 'file'}")
     if path.is_dir():
         path.rmdir()
     else:

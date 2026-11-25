@@ -8,6 +8,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
 
+from .errors import NotFound
 from .store import dumps, loads, new_id, now
 
 if TYPE_CHECKING:
@@ -59,7 +60,7 @@ class SessionStore:
     def get(self, sid: str) -> Session:
         row = self.db.one("SELECT * FROM sessions WHERE id=?", (sid,))
         if row is None:
-            raise KeyError(f"no session {sid} in profile {self.profile.name}")
+            raise NotFound(f"no session {sid} in profile {self.profile.name}")
         return Session.from_row(row)
 
     def find(self, *, kind: str, room_id: str | None = None) -> Session | None:

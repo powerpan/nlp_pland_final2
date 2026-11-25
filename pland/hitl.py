@@ -20,6 +20,7 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
+from .errors import NotFound
 from .store import DB, dumps, loads, new_id, now
 
 APPROVAL_CHOICES = ("once", "session", "always", "deny")
@@ -99,30 +100,41 @@ class BrokerHITL(HITLChannel):
         )
         self.publish("hitl.requested", profile=req.profile, session_id=req.session_id, room_id=req.room_id,
                      run_id=req.run_id, request={"id": req.id, "kind": req.kind, **req.payload()})
-        got = ev.wait(timeout)
+        ev.wait(timeout)
         with self._lock:
             self._waiters.pop(req.id, None)
-        if not got or not box:
-            self.db.execute("UPDATE hitl_requests SET status='expired' WHERE id=? AND status='pending'", (req.id,))
+        if box:  # answered, possibly just as the wait timed out
+            return box[0]
+        if not self.db.execute("UPDATE hitl_requests SET status='expired' WHERE id=? AND status='pending'",
+                               (req.id,)).rowcount:
+            # Settled by someone else between the wait and this update: an answer that landed counts.
+            row = self.db.one("SELECT status, answer FROM hitl_requests WHERE id=?", (req.id,))
+            if row and row["status"] == "answered":
+                a = loads(row["answer"], {})
+                return HITLAnswer("answered", text=a.get("text") or "", choice=a.get("choice"))
+        else:
             self.publish("hitl.resolved", profile=req.profile, session_id=req.session_id, room_id=req.room_id,
                          request_id=req.id, status="timeout")
-            return HITLAnswer("timeout", text="The human did not answer in time.")
-        return box[0]
+        return HITLAnswer("timeout", text="The human did not answer in time.")
 
     def answer(self, request_id: str, *, text: str = "", choice: str | None = None) -> dict[str, Any]:
         row = self.db.one("SELECT * FROM hitl_requests WHERE id=?", (request_id,))
         if row is None:
-            raise KeyError(request_id)
+            raise NotFound(request_id)
         if row["status"] != "pending":
             raise ValueError(f"request {request_id} is already {row['status']}")
         if row["kind"] == "approval":
             if choice not in APPROVAL_CHOICES:
                 raise ValueError(f"approval choice must be one of {APPROVAL_CHOICES}")
         ans = HITLAnswer("answered", text=text, choice=choice)
-        self.db.execute(
-            "UPDATE hitl_requests SET status='answered', answer=?, answered=? WHERE id=?",
+        # Conditional: a timeout (or a second answer) may have settled the request since it was read above.
+        cur = self.db.execute(
+            "UPDATE hitl_requests SET status='answered', answer=?, answered=? WHERE id=? AND status='pending'",
             (dumps({"text": text, "choice": choice}), now(), request_id),
         )
+        if not cur.rowcount:
+            now_row = self.db.one("SELECT status FROM hitl_requests WHERE id=?", (request_id,)) or {}
+            raise ValueError(f"request {request_id} is already {now_row.get('status', 'settled')}")
         with self._lock:
             waiter = self._waiters.get(request_id)
         if waiter:

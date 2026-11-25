@@ -3,8 +3,30 @@ kanban-style prerequisite handoff, skill usage tracking."""
 
 from __future__ import annotations
 
+import pytest
+
 from pland.memory import SkillStore
+from pland.prompts import OUTPUT_RULES, _OLD_FILE_RULE, _PREVIOUS_OUTPUT_RULES
 from pland.sessions import SessionStore
+from pland.store import dumps
+
+
+@pytest.mark.parametrize("compacted", [False, True])
+@pytest.mark.parametrize("saved_rules", [_OLD_FILE_RULE, _PREVIOUS_OUTPUT_RULES, OUTPUT_RULES],
+                         ids=["early-file", "first-length-policy", "current"])
+def test_existing_session_uses_current_output_rules_without_rewriting_history(rt, compacted, saved_rules):
+    agent = rt.agent("default")
+    previous = "Original identity and workspace\n\n# How you work\n" + saved_rules + "\n\nOriginal memory"
+    agent.sessions.append(agent.session_id, {"role": "system", "content": previous})
+    turn = agent.sessions.append(agent.session_id, {"role": "user", "content": "Prior request"})
+    if compacted:
+        agent.sessions.patch_meta(agent.session_id, {"compacted_upto": turn, "summary": "Earlier work"})
+    agent.sessions.append(agent.session_id, {"role": "user", "content": "Continue in the same room"})
+
+    expected = previous.replace(saved_rules, OUTPUT_RULES)
+    assert agent._llm_messages()[0]["content"] == expected
+    assert agent._llm_messages()[-1]["content"].endswith("Continue in the same room")
+    assert agent.sessions.messages(agent.session_id)[0]["content"] == previous
 
 
 def test_session_search_finds_past_conversation(rt, script):
@@ -85,6 +107,46 @@ def test_prerequisites_gate_and_handoff(rt, script):
     assert "rejected" in tool_results[0] and "unfinished" in tool_results[0]  # writer had to wait for coder
     assert "RESULTS OF PREREQUISITE TASKS" in seen["prompt"] and "IMPLEMENTED add()" in seen["prompt"]
     assert board.get(b["id"])["status"] == "done"
+
+
+def test_board_numbers_resolve_within_the_board_and_validate_before_insert(rt):
+    board = rt.board
+    other = board.add("dm:other", "unrelated", created_by="other")
+    first = board.add("dm:lead", "draft", created_by="lead")
+    second = board.add("dm:lead", "check", created_by="lead")
+    refs = ["1", first["id"], "#2"]
+    card = board.add("dm:lead", "publish", created_by="lead", depends_on=refs)
+    assert card["depends_on"] == [first["id"], second["id"]]
+    assert f"{second['id']} (#2)" in board.render("dm:lead")
+    for ref in ["4", "0", "t_missing", other["id"]]:
+        with pytest.raises(ValueError, match="Unknown prerequisite"):
+            board.add("dm:lead", "invalid", created_by="lead", depends_on=[ref])
+    assert len(board.list("dm:lead")) == 3
+
+
+def test_legacy_numbered_and_unresolvable_dependencies_at_dispatch(rt, script):
+    from pland.team.delegation import delegate
+
+    rt.profiles.create("lead")
+    rt.profiles.create("writer")
+    board = rt.board
+    draft = board.add("dm:lead", "draft", created_by="lead")
+    card = board.add("dm:lead", "publish", created_by="lead")
+    other = board.add("dm:other", "private", created_by="other")
+    ctx = rt.agent("lead")._context()
+    task = {"to": "writer", "goal": "publish", "task_id": card["id"]}
+    for ref, error in [("missing", "Unknown prerequisite"), ("2", "Unknown prerequisite"),
+                       (other["id"], "does not belong"), ("1", "unfinished")]:
+        rt.shared.execute("UPDATE team_tasks SET depends_on=? WHERE id=?", (dumps([ref]), card["id"]))
+        result, = delegate(ctx, [task])
+        assert result["status"] == "rejected" and error in result["error"]
+    assert board.get(card["id"])["depends_on"] == [draft["id"]]
+    board.update(draft["id"], status="done", result="signed draft")
+    llm = script({"writer": [{"content": "published"}]})
+    result, = delegate(ctx, [task])
+    assert result["status"] == "completed"
+    assert any("signed draft" in m.get("content", "") for name, msgs in llm.calls
+               if name == "writer" for m in msgs if m["role"] == "user")
 
 
 def test_skill_usage_tracking(rt):

@@ -22,6 +22,7 @@ from typing import Any
 import yaml
 
 from .config import AgentSettings, global_settings, merge_settings, pland_home
+from .errors import NotFound
 from .store import DB, now, profile_db
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,31}$")
@@ -178,7 +179,7 @@ class ProfileManager:
         home = self.dir / name
         meta_path = home / "profile.yaml"
         if not meta_path.is_file():
-            raise KeyError(f"no such profile: {name}")
+            raise NotFound(f"no such profile: {name}")
         meta = yaml.safe_load(meta_path.read_text(encoding="utf-8")) or {}
         return Profile(name=name, home=home, meta=meta)
 
@@ -262,7 +263,7 @@ class ProfileManager:
         with self._lock:
             home = self.dir / name
             if not home.exists():
-                raise KeyError(name)
+                raise NotFound(name)
             db_path = (home / "state.db").resolve()
             with DB._registry_lock:
                 db = DB._registry.pop(db_path, None)

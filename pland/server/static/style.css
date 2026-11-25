@@ -27,7 +27,7 @@
   --border-2: #c9c2b2;
   --text: #1c1a16;        /* ink */
   --text-2: #4d493f;
-  --muted: #878173;
+  --muted: #686357;       /* ≥4.5:1 on --bg, --bg-2, --bg-3 and --side */
   --accent: var(--acc-l);
   --accent-2: var(--acc-ink-l);
   --accent-ink: var(--acc-ink-l);
@@ -37,11 +37,11 @@
   --ink-btn-text: #f7f4ec;
   --user: #e5dfd0;
   --user-text: #1c1a16;
-  --ok: #2d7a4c;
+  --ok: #2a7347;          /* ≥4.5:1 on --ok-soft */
   --ok-soft: #dcebdc;
   --err: #b3261e;
   --err-soft: #f4dad5;
-  --warn: #9c5d00;
+  --warn: #8f5500;        /* ≥4.5:1 on --warn-soft */
   --warn-soft: #f3e4c3;
   --code-bg: #ebe6da;
   --dots: rgba(28, 26, 22, .09);
@@ -81,6 +81,8 @@
 
 * { box-sizing: border-box; }
 html, body { height: 100%; }
+/* While the interface dictionary loads (index.html), the English static text stays hidden instead of flashing. */
+html.i18n-pending body { visibility: hidden; }
 body {
   margin: 0;
   background: var(--bg);
@@ -374,8 +376,11 @@ body.resizing iframe, body.resizing .main { pointer-events: none; }
   display: none;
   background: var(--bg-3);
 }
-.row:hover .row-del { display: inline-flex; }
-.row:hover .row-meta { visibility: hidden; }
+/* the delete button shows on hover, and for keyboard users while the row (or the button) has focus; :focus-within,
+   not :focus-visible, so it is still displayed at the moment Tab moves focus from the row onto it */
+.row:hover .row-del, .row:focus-within .row-del { display: inline-flex; }
+.row:hover .row-meta, .row:focus-within .row-meta { visibility: hidden; }
+.row:focus-visible { outline-offset: -2px; }
 
 /* stamps: states and labels in the machine's voice */
 .pill {
@@ -653,6 +658,8 @@ div.ev-note, .ev-note > summary { display: flex; align-items: baseline; gap: 6px
 .md table { border-collapse: collapse; font-size: .92em; }
 .md th, .md td { border-bottom: 1px solid var(--border); padding: 5px 12px 5px 0; text-align: left; vertical-align: top; }
 .md th { font: 600 10.5px/1.5 var(--mono); letter-spacing: .05em; text-transform: uppercase; color: var(--muted); border-bottom-color: var(--border-2); }
+.md th.al-center, .md td.al-center { text-align: center; }
+.md th.al-right, .md td.al-right { text-align: right; }
 .md input[type="checkbox"] { margin: 0 4px 0 0; vertical-align: -1px; accent-color: var(--accent); }
 .md-error { color: var(--err); }
 .md-muted { color: var(--muted); font-style: italic; }
@@ -1638,6 +1645,18 @@ dialog.dialog::backdrop { background: rgba(22, 20, 16, .36); backdrop-filter: bl
 .folder-chip:hover { background: var(--bg-3); color: var(--text); }
 .folder-chip.custom { color: var(--accent-ink); }
 .folder-chip.missing { color: var(--err); }
+.fast-chip {
+  padding: 3px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--accent-ink);
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.fast-chip:hover { background: var(--bg-3); }
 .folder-ico { display: inline-flex; width: 12px; height: 12px; flex: none; }
 .folder-ico svg { width: 12px; height: 12px; }
 .path-row { display: flex; gap: 6px; }
@@ -1653,3 +1672,8 @@ dialog.dialog::backdrop { background: rgba(22, 20, 16, .36); backdrop-filter: bl
 .thread-list { display: flex; flex-wrap: wrap; gap: 6px; }
 .chip-btn.on { border-color: var(--accent); color: var(--accent-ink); background: var(--accent-soft); }
 .folder-second { margin-top: 10px; }
+
+/* "Load earlier messages" at the top of a long transcript (paged: the newest page loads first) */
+.messages > .earlier { display: flex; justify-content: center; padding: 10px 0 4px; }
+/* the waiting-for-you tray takes focus when it opens (role=dialog); no ring around the whole panel for a click */
+.tray:focus:not(:focus-visible) { outline: none; }

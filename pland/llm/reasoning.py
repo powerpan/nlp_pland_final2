@@ -10,10 +10,12 @@ xhigh/ultra/max and 422s anything else; `none` does NOT switch thinking off (onl
 does), and with thinking disabled the field is ignored. On a counting puzzle low/medium/high thought for
 ~1.5–1.75k tokens and max for ~3k; leaving the field out landed in between.
 
-HKGAI (probed 2026-10-25 on t2_hkgai-v3_fp8_1m_e7): `reasoning_effort` is the only switch. It accepts
-none/minimal/low/medium/high/xhigh/max (400 for anything else); `none` and leaving the field out both mean
-no thinking, any level turns it on. There is no `thinking` field (sent, it is ignored). The reasoning text
-comes back as `reasoning`, not `reasoning_content`.
+HKGAI (probed 2026-11-20 on t2_hkgai-v3_fp8_1m_e7, which now serves DeepSeek V4.1): `reasoning_effort` is the only
+switch. It accepts none/low/high/xhigh/max; `minimal` and `medium`, accepted on 2026-10-25, are now a 400 (as are
+integers, which the gateway cannot parse). `none` means no thinking. Leaving the field out now thinks (in October it
+did not), so the level is always sent rather than relying on what an absent field means this month. There is no
+`thinking` field (sent, it is ignored); `chat_template_kwargs.enable_thinking=false` also switches thinking off. The
+reasoning text comes back as `reasoning`, not `reasoning_content`.
 """
 from __future__ import annotations
 
@@ -28,11 +30,12 @@ DEFAULT_WORDS = {"", "default", "auto", "reset", "unset"}
 # Levels each provider's wire accepts as `reasoning_effort` (empty: no effort knob).
 PROVIDER_LEVELS: dict[str, tuple[str, ...]] = {
     "deepseek": ("low", "medium", "high", "max"),
-    "hkgai": ("minimal", "low", "medium", "high", "xhigh", "max"),
+    "hkgai": ("low", "high", "xhigh", "max"),
 }
-# Providers that think only when asked: "default" (thinking on, no level chosen) sends this level, and
-# "off" sends the provider's own word for no thinking.
-PROVIDER_DEFAULT_LEVEL: dict[str, str] = {"hkgai": "medium"}
+# Providers whose only switch is the effort: "default" (thinking on, no level chosen) sends this level, and
+# "off" sends the provider's own word for no thinking. HKGAI's stand-in was "medium" until it stopped accepting
+# it; "high" is what the endpoint does when the field is absent (similar reasoning length in the probe).
+PROVIDER_DEFAULT_LEVEL: dict[str, str] = {"hkgai": "high"}
 PROVIDER_OFF_WORD: dict[str, str] = {"hkgai": "none"}
 # Declared vendor mappings consulted before clamping.
 PROVIDER_OVERRIDES: dict[str, dict[str, str]] = {
@@ -51,7 +54,7 @@ DESCRIPTIONS = {
 }
 PROVIDER_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "hkgai": {
-        "default": "thinking on at medium (HKGAI does not think unless a level is sent)",
+        "default": "thinking on at high (HKGAI's own depth when no level is sent)",
         "max": "thinking on, deepest reasoning",
     },
 }

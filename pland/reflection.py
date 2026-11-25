@@ -18,7 +18,9 @@ if TYPE_CHECKING:
 
 PROMPT = """You review an AI agent's finished task to extract reusable experience for its future tasks.
 Judge the outcome from the evidence in the transcript (tool errors, failing tests, missing files), not from the
-agent's claims. Return ONLY a JSON object:
+agent's claims. Keep a durable decision only when the transcript includes the deciding source or a check
+that distinguishes it from the alternative. Leave tentative interpretations out of lessons and procedures.
+Return ONLY a JSON object:
 {
   "outcome": "success" | "partial" | "failure",
   "summary": "<=2 sentences: what was asked and what actually happened",

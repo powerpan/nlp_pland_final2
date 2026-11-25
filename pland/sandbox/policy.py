@@ -8,7 +8,10 @@ from __future__ import annotations
 
 import os
 import re
+import shlex
+import tokenize
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 
 _F = re.IGNORECASE | re.MULTILINE
@@ -46,9 +49,6 @@ DANGEROUS: list[tuple[str, str]] = [
     (r"\bgit\s+push\b", "push to a remote repository"),
     (r"\bgit\s+reset\s+--hard\b", "discard uncommitted changes"),
     (r"\bgit\s+clean\s+-[^\s]*f", "delete untracked files"),
-    (r"\bDROP\s+(TABLE|DATABASE)\b", "SQL DROP"),
-    (r"\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)", "SQL DELETE without WHERE"),
-    (r"\bTRUNCATE\s+TABLE\b", "SQL TRUNCATE"),
     (r">\s*/etc/", "overwrite a system config file"),
     (r"\b(cp|mv|tee|install)\b[^\n]*\s/etc/", "write into /etc"),
     (r"(~|\$HOME|/Users/[^/\s]+|/home/[^/\s]+)/\.(ssh|aws|kube|gnupg|netrc|config/gh)\b", "touch credential files"),
@@ -69,6 +69,19 @@ DANGEROUS += [
 ]
 _HARDLINE = [(re.compile(p, _F), d) for p, d in HARDLINE]
 _DANGEROUS = [(re.compile(p, _F), d) for p, d in DANGEROUS]
+_SQL_DANGEROUS = [
+    (re.compile(r"\bDROP\s+(TABLE|DATABASE)\b", _F), "SQL DROP"),
+    (re.compile(r"\bDELETE\s+FROM\b(?![^\n]*\bWHERE\b)", _F), "SQL DELETE without WHERE"),
+    (re.compile(r"\bTRUNCATE\s+TABLE\b", _F), "SQL TRUNCATE"),
+]
+
+# A top-level Python command reading a literal heredoc, as used for short inline scripts.
+# Leave more general shell syntax to the original conservative text scan.
+_PYTHON_HEREDOC = re.compile(
+    r"""^[ \t]*(?:cd[ \t]+(?:'[^'\n]+'|"[^"\\$\x60\n]+"|[\w./~-]+)[ \t]+&&[ \t]+)?"""
+    r"""python(?:3(?:\.\d+)?)?[ \t]+-[ \t]+<<[ \t]*(?P<quote>['"])(?P<end>[a-zA-Z_]\w*)"""
+    r"""(?P=quote)[ \t]*\n"""
+)
 
 _PY_DANGEROUS = [
     (re.compile(r"\bshutil\.rmtree\s*\(", _F), "recursive delete (shutil.rmtree)"),
@@ -89,18 +102,112 @@ class CommandVerdict:
         return not self.blocked and not self.needs_approval
 
 
-def check_command(command: str) -> CommandVerdict:
+def _without_python_comments(source: str) -> str:
+    lines = source.split("\n")
+    try:
+        for token in tokenize.generate_tokens(StringIO(source).readline):
+            if token.type == tokenize.COMMENT:
+                row, start = token.start
+                _, end = token.end
+                line = lines[row - 1]
+                lines[row - 1] = line[:start] + " " * (end - start) + line[end:]
+    except (tokenize.TokenError, SyntaxError):
+        return source
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------- git push detection
+# `git push` is matched on tokens, not text, so options between `git` and the subcommand (`git -c k=v push`,
+# `git -C dir push`, `git --git-dir=… push`) and the plumbing that pushes (`send-pack`, `http-push`, the remote
+# helpers `remote-https`, `remote-ext`, …) are caught too. Still a rule match: it is the approval trigger for shells
+# without an OS sandbox, not a boundary (a subcommand hidden in a variable or alias defined elsewhere is not seen).
+_PUSH_REASON = "push to a remote repository"
+_GIT_OPTS_WITH_ARG = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--config-env", "--super-prefix",
+                      "--exec-path", "--attr-source", "--list-cmds"}
+_PUSH_SUBCOMMANDS = {"push", "send-pack", "http-push"}
+_SHELL_PUNCT = set(";&|()<>")
+
+
+def _shell_tokens(text: str) -> list[str]:
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=True)
+        lex.whitespace_split = True
+        lex.commenters = ""
+        return list(lex)
+    except ValueError:  # unbalanced quotes: fall back to a rough split
+        return [t for t in re.split(r"[\s'\"]+|([;&|()<>])", text) if t]
+
+
+def _is_push_subcommand(sub: str, rest: list[str]) -> bool:
+    if sub in _PUSH_SUBCOMMANDS or sub.startswith("remote-"):
+        return True
+    if sub in {"subtree", "lfs"} and "push" in rest[:3]:
+        return True
+    return "$" in sub or "`" in sub  # subcommand computed at run time: cannot tell, so ask
+
+
+def _git_pushes(text: str, depth: int = 0) -> bool:
+    """True when a shell command (or a string inside it, e.g. `sh -c '…'`) runs a git command that pushes."""
+    if depth > 3:
+        return False
+    tokens = _shell_tokens(text)
+    for i, raw in enumerate(tokens):
+        tok = raw.strip("`$({}")
+        if depth < 3 and any(c.isspace() for c in raw) and _git_pushes(raw, depth + 1):
+            return True  # quoted script: sh -c "git -C x push", eval '…', submodule foreach '…'
+        base = tok.rsplit("/", 1)[-1]
+        if base.startswith("git-") and _is_push_subcommand(base[4:], tokens[i + 1:i + 4]):
+            return True  # direct helper binary: git-push, git-send-pack, git-remote-https …
+        if base != "git":
+            continue
+        j = i + 1
+        while j < len(tokens) and tokens[j].startswith("-") and tokens[j] not in _SHELL_PUNCT:
+            opt = tokens[j]
+            if opt in _GIT_OPTS_WITH_ARG:
+                value = tokens[j + 1] if j + 1 < len(tokens) else ""
+                if opt == "-c" and value.lower().startswith("alias.") and "=" in value:
+                    body = value.split("=", 1)[1]
+                    if _git_pushes(body[1:] if body.startswith("!") else f"git {body}", depth + 1):
+                        return True  # git -c alias.p=push p
+                if opt == "--config-env" and value.lower().startswith("alias."):
+                    return True  # alias body comes from the environment: cannot tell
+                j += 2
+            else:
+                if opt.startswith("--config-env=alias."):
+                    return True
+                j += 1
+        if j < len(tokens) and tokens[j] not in _SHELL_PUNCT and _is_push_subcommand(tokens[j], tokens[j + 1:j + 4]):
+            return True
+    return False
+
+
+def _check_command(command: str, sql_source: str) -> CommandVerdict:
     text = command.replace("\\\n", " ")
     for rx, desc in _HARDLINE:
         if rx.search(text):
             return CommandVerdict(blocked=desc)
-    reasons = [desc for rx, desc in _DANGEROUS if rx.search(text)]
-    return CommandVerdict(needs_approval=sorted(set(reasons)) or None)
+    reasons = {desc for rx, desc in _DANGEROUS if rx.search(text)}
+    if "git" in text and _git_pushes(text):
+        reasons.add(_PUSH_REASON)
+    sql_source = sql_source.replace("\\\n", " ")
+    reasons.update(desc for rx, desc in _SQL_DANGEROUS if rx.search(sql_source))
+    return CommandVerdict(needs_approval=sorted(reasons) or None)
+
+
+def check_command(command: str) -> CommandVerdict:
+    header = _PYTHON_HEREDOC.match(command)
+    if header:
+        body = command[header.end():]
+        end = re.search(rf"(?m)^{re.escape(header['end'])}$", body)
+        if end:
+            sql_source = command[:header.end()] + _without_python_comments(body[:end.start()]) + body[end.start():]
+            return _check_command(command, sql_source)
+    return _check_command(command, command)
 
 
 def scan_python(code: str) -> CommandVerdict:
     """Python can bypass shell patterns, so scan the source and any shell strings embedded in it."""
-    hard = check_command(code)
+    hard = _check_command(code, _without_python_comments(code))
     if hard.blocked:
         return hard
     reasons = set(hard.needs_approval or [])

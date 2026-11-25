@@ -9,7 +9,7 @@ Turn-taking is designed so that collaboration produces real work:
   `[PASS]`), then the lead acts on the request with full tools — typically decomposing it on the
   team board and handing subtasks to teammates with `delegate_task`, which really executes them in
   the teammates' own profiles, then integrating the results.
-* Later rounds: bots @mentioned by bots get a turn; the room settles when a round is silent or
+* Later rounds: explicit bot handoffs get a turn; the room settles when a round is silent or
   limits are hit (max rounds / messages). A bot writing `@user` raises the room's "needs you" flag.
 * Every member keeps one persistent room session (its private view of the room) and sees only the
   room messages posted since its last turn, plus its own memory. Private Bot Chats stay separate.
@@ -19,12 +19,17 @@ from __future__ import annotations
 
 import re
 import threading
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
+from ..errors import NotFound
 from ..sessions import SessionStore
 from ..store import dumps, loads, new_id, now
 from ..workspace import chosen
+from .fast import FastMode, guidance
+from .fast import enabled as fast_enabled
+from .fast import is_reviewer as fast_reviewer
 
 if TYPE_CHECKING:
     from ..runtime import Runtime
@@ -33,6 +38,7 @@ MENTION = re.compile(r"(?<![\w.])@([a-z0-9][a-z0-9_-]{0,31})", re.IGNORECASE)
 PASS_TOKENS = {"[pass]", "pass", "[silent]", "no_reply", "[no_reply]"}
 MAX_ROUNDS = 3
 MAX_MESSAGES = 12
+DEFAULT_FAST_MODE = True
 
 
 class RoomManager:
@@ -41,6 +47,7 @@ class RoomManager:
         self.db = runtime.shared
         self._drive_locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
+        self._budgets: dict[str, Any] = {}  # the budget of each room's running drive (its Fast Mode rides on it)
 
     # ------------------------------------------------------------------ CRUD
     def _row(self, r: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -52,7 +59,8 @@ class RoomManager:
         r["needs_you"] = bool(r["needs_you"])
         return r
 
-    def create(self, name: str, members: list[str], *, lead: str | None = None) -> dict[str, Any]:
+    def create(self, name: str, members: list[str], *, lead: str | None = None,
+               fast_mode: bool = DEFAULT_FAST_MODE) -> dict[str, Any]:
         members = [m.lstrip("@") for m in members]
         missing = [m for m in members if not self.rt.profiles.exists(m)]
         if missing:
@@ -62,7 +70,8 @@ class RoomManager:
         if self.db.one("SELECT id FROM rooms WHERE name=?", (name,)):
             raise ValueError(f"a room named {name!r} already exists")
         rid = new_id("room_")
-        settings = {"lead": lead.lstrip("@") if lead else None, "max_rounds": MAX_ROUNDS, "max_messages": MAX_MESSAGES}
+        settings = {"lead": lead.lstrip("@") if lead else None, "max_rounds": MAX_ROUNDS,
+                    "max_messages": MAX_MESSAGES, "fast_mode": fast_mode}
         self.db.execute("INSERT INTO rooms(id, name, members, settings, created, updated) VALUES (?,?,?,?,?,?)",
                         (rid, name, dumps(members), dumps(settings), now(), now()))
         self.shared_dir(rid)
@@ -84,7 +93,7 @@ class RoomManager:
                settings: dict[str, Any] | None = None, needs_you: bool | None = None) -> dict[str, Any]:
         room = self.get(rid)
         if room is None:
-            raise KeyError(rid)
+            raise NotFound(rid)
         if name:
             self.db.execute("UPDATE rooms SET name=? WHERE id=?", (name, rid))
         if members is not None:
@@ -105,6 +114,7 @@ class RoomManager:
 
     def delete(self, rid: str) -> None:
         self.db.execute("DELETE FROM room_messages WHERE room_id=?", (rid,))
+        self.db.execute("DELETE FROM team_reviews WHERE task_id IN (SELECT id FROM team_tasks WHERE room_id=?)", (rid,))
         self.db.execute("DELETE FROM rooms WHERE id=?", (rid,))
         self.rt.bus.publish("room.deleted", room_id=rid)
 
@@ -125,7 +135,7 @@ class RoomManager:
         (members see all room messages since their last turn) and its `shared/` link is re-pointed then."""
         room = self.get(rid)
         if room is None:
-            raise KeyError(rid)
+            raise NotFound(rid)
         before = str(self.shared_dir(rid))
         updated = self.update(rid, settings={"workspace": folder})
         after = str(self.shared_dir(rid))
@@ -160,7 +170,7 @@ class RoomManager:
     def send(self, rid: str, text: str, *, hitl=None, background: bool = True) -> dict[str, Any]:
         room = self.get(rid)
         if room is None:
-            raise KeyError(rid)
+            raise NotFound(rid)
         msg = self.post(rid, "user", text)
         if room["needs_you"]:
             self.update(rid, needs_you=False)
@@ -190,30 +200,63 @@ class RoomManager:
             lines.append(f"[{who}{tag}]: {m['content'][:6000]}")
         lines.append("---")
         if role == "lead":
+            budget = self._budgets.get(room["id"])
+            if budget and budget.team_turn.inherited:
+                lines.append("Unresolved decisions carried over from earlier work: " +
+                             ", ".join(sorted(budget.team_turn.inherited)) +
+                             ". Inspect those cards. For a continuation, keep the relevant decisions open until "
+                             "verified. For a clearly independent new request, use team_tasks separate_request "
+                             "with the old task_id and a concrete reason it cannot affect the new answer.")
             lines.append(
                 "You lead the response to the latest request. Act on it now. For multi-part work: record the plan with "
-                "team_tasks, then hand each substantial subtask to the best-suited teammate with delegate_task (pass the "
+                "team_tasks. Base each blocking check on an explicit requirement or something the recipient needs to "
+                "use the result. Assign the decision or next step the work must support, and the evidence needed. "
+                "Give an intermediate file a hard size limit only if the user or its destination requires one. "
+                "Name that source and the file it applies to. Keep team estimates out of blocking checks. "
+                "Keep the audience and required outputs of this request. Make design choices freely; treat extra audiences, "
+                "formats and refinements as optional unless the request or actual use requires them. "
+                "Allow equivalent wording and implementations. "
+                "Delegate substantial independent work with delegate_task (pass the "
                 "board task_id; delegates execute with their own tools and report back; independent subtasks in one call run "
                 "in parallel; sequence dependent ones — a task whose prerequisites are unfinished is refused). When a room "
-                "member's role matches part of the request (research → researcher, tests → tester, review → reviewer), "
-                "delegate that part to them: the team exists so specialists do their parts. Do small glue work yourself. "
+                "member can verify a draft while another works on an independent aspect, send both in one batch. "
+                "For a simple request, read the inputs and deliver it directly. If a primary source answers a teammate's "
+                "preliminary question, proceed with that answer. Build extra tools or investigate additional claims "
+                "only when needed for a requested outcome. "
                 "Deliverables the team shares go in `shared/` (works in file tools and shell commands). Verify the integrated "
-                "result yourself, then post a concise final reply. Ask the human with ask_user only if a decision is "
-                "genuinely theirs."
+                "acceptance evidence and report each requested outcome, what supports it, and anything still open. Ask the human with ask_user before delegating work "
+                "that depends on their answer. Record actual prerequisites with depends_on. For an independent "
+                "file review, pass its planned task_id and exact shared input and report paths. If an outcome must "
+                "work in actual use, set review.observation to what the recipient should be able to do or obtain. "
+                "On revisions reuse the same task_id, omit criterion/observation, and describe the affected behavior in goal. "
+                "After PASS deliver when only optional polish remains. If a decision depends on research, pass the "
+                "decision as a question or make it a prerequisite. Preserve the user's chosen source/version. "
+                "Compare the returned evidence with instructions already given to workers. Correct affected work before delivery. "
+                "A question settled by reading the input belongs in the original result. Use a dispute card only for "
+                "a consequential disagreement still needing a decision. For a reusable rule, verify a case that "
+                "distinguishes the competing interpretations. During cleanup, leave reviewed inputs "
+                "and the signed report at their shared paths; copy them if you also need them elsewhere."
             )
         elif role == "member":
             lines.append(
                 "A teammate leads this request and will delegate the work. This is a discussion turn: do not start the work "
                 "(no file changes, code or web research now). Reply only if you add something useful — the part you are best "
-                "suited for, a risk, or information you already have — in at most 3 sentences. Otherwise reply exactly [PASS]."
+                "suited for or a concrete concern supported by information you already have — in at most 3 sentences. "
+                "If the assigned teammate can settle it just by reading the inputs, reply exactly [PASS]."
             )
         else:
             lines.append(
                 "You were @mentioned above. Do what was asked of you (use your tools if work is needed) and reply briefly. "
                 "Do not redo or re-verify work others already verified. If nothing is actually required of you, reply exactly [PASS]."
             )
-        lines.append("Write @name only when you need that teammate to act or answer now — never to thank, acknowledge, or say "
-                     "nothing is needed (every @mention costs that teammate a turn). Use @user only to hand a question to the human.")
+        fast = getattr(self._budgets.get(room["id"]), "fast", None)
+        if fast is not None and role in {"lead", "mentioned"}:
+            lines.append(guidance(fast, "lead" if role == "lead" else "delegate"))
+        lines.append("To ask another Bot for a public follow-up, start your reply with a line in the format "
+                     "!handoff @name followed by the action. Use one leading line per handoff. "
+                     "Plain @names in the rest of a reply are references. "
+                     + ("Flag questions for the lead to raise with the human." if role == "member"
+                        else "Use @user only to hand a question to the human."))
         return "\n".join(lines)
 
     def _member_turn(self, room: dict, member: str, role: str, hitl, budget=None) -> str | None:
@@ -235,14 +278,20 @@ class RoomManager:
         if not new_msgs:
             return None
         self.rt.bus.publish("room.member_turn", room_id=rid, member=member, role=role, state="thinking")
+        # The lead's turn is the drive's root: it shares the drive budget but keeps the last 10% for its summary.
         agent = Agent(self.rt, prof, sid, hitl=hitl or self.rt.default_hitl, room_id=rid, budget=budget,
-                      discussion_only=(role == "member"))
+                      budget_root=(role == "lead") if budget is not None else None, discussion_only=(role == "member"),
+                      review_turn=budget.team_turn if budget and role == "lead" else None)
         request = "\n".join(m["content"] for m in new_msgs if m["speaker"] == "user") or new_msgs[-1]["content"]
         # Only the lead's turn does the main work; a discussion turn is a few sentences and a turn caused by an
-        # @mention is a follow-up (a real run spent 30 minutes re-verifying finished work after a courtesy mention).
+        # a handoff is a follow-up, with a smaller budget than a lead turn.
         steps = {"member": 6, "mentioned": min(40, agent.settings.max_iterations)}.get(role)
+        deadline = None
+        if role == "mentioned" and getattr(budget, "fast", None) is not None and fast_reviewer(prof):
+            # Fast Mode: a reviewer's @mention turn gets a review's limits (a real run did an uncounted review there).
+            steps, deadline = min(steps, budget.fast.review_steps), time.time() + budget.fast.first_seconds
         result = agent.run(self._turn_prompt(room, member, new_msgs, role), meta={"room_turn": True, "role": role},
-                           task_text=request[:4000], max_iterations=steps)
+                           task_text=request[:4000], max_iterations=steps, deadline=deadline)
         seen = max(all_ids + [last_seen])
         store.patch_meta(sid, {"last_seen": seen})
         self.rt.bus.publish("room.member_turn", room_id=rid, member=member, role=role, state="done", status=result.status)
@@ -285,6 +334,17 @@ class RoomManager:
                 found.append(m)
         return found
 
+    def _handoffs(self, text: str, members: list[str]) -> list[str]:
+        targets = []
+        for line in text.lstrip().splitlines():
+            match = re.match(r"!handoff[ \t]+@([a-z0-9_-]+)[ \t]+\S", line, re.IGNORECASE)
+            if match is None:
+                break
+            name = match[1].lower()
+            if name in members and name not in targets:
+                targets.append(name)
+        return targets
+
     def drive(self, rid: str, human_msg: dict, *, hitl=None) -> dict[str, Any]:
         lock = self.drive_lock(rid)
         with lock:  # one drive per room at a time; later human messages queue behind it
@@ -299,43 +359,63 @@ class RoomManager:
             if mentioned and settings.get("lead") not in mentioned:
                 lead = mentioned[0]
             from ..budget import Budget
+            from .review import ReviewTurn
 
             lead_settings = self.rt.profiles.get(lead).settings()
             # One budget for the whole drive (all member turns and the work they delegate). Several agents share
             # it — a real implement/review loop ran out at 120 calls — so a drive gets twice the single-run budget.
             budget = Budget(lead_settings.max_run_calls * 2, lead_settings.max_run_tokens * 2)
+            # The group's mode at dispatch bounds checking for the whole request.
+            budget.fast = FastMode(self.rt, rid) if fast_enabled(room) else None
+            budget.team_turn = ReviewTurn(self.rt.board, rid, budget.fast, user_text=human_msg["content"])
+            self._budgets[rid] = budget
             posted = 0
             spoke: list[str] = []
             needs_you = False
             self.rt.bus.publish("room.drive", room_id=rid, state="started", lead=lead, addressed=addressed)
-            order = [(m, "member") for m in addressed if m != lead] + [(lead, "lead")]
-            for rnd in range(1, max_rounds + 1):
-                next_round: list[str] = []
-                round_posts = 0
-                pre: dict[str, str | None] = {}
-                if rnd == 1:
-                    discussants = [m for m, r in order if r == "member"]
-                    pre = dict(self._discussion_round(room, discussants, hitl, budget)) if discussants else {}
-                for member, role in order:
-                    if posted >= max_msgs:
+            # "settled" is published even if the drive fails: the server keeps a stopping room until it sees it.
+            try:
+                order = [(m, "member") for m in addressed if m != lead] + [(lead, "lead")]
+                for rnd in range(1, max_rounds + 1):
+                    next_round: list[str] = []
+                    round_posts = 0
+                    pre: dict[str, str | None] = {}
+                    if rnd == 1:
+                        discussants = [m for m, r in order if r == "member"]
+                        pre = dict(self._discussion_round(room, discussants, hitl, budget)) if discussants else {}
+                    for member, role in order:
+                        if posted >= max_msgs:
+                            break
+                        if budget.near_limit:
+                            break
+                        text = pre[member] if member in pre else self._member_turn(room, member, role, hitl, budget)
+                        if text is None:
+                            continue
+                        posted += 1
+                        round_posts += 1
+                        spoke.append(member)
+                        # A suggestion from the opening discussion is advice to the lead, not an open request.
+                        if role != "member" and re.search(r"(?<![\w.])@user\b", text, re.IGNORECASE):
+                            needs_you = True
+                        for m in self._handoffs(text, members):
+                            if m != member and m not in next_round:
+                                next_round.append(m)
+                    if needs_you or posted >= max_msgs or round_posts == 0 or not next_round:
                         break
-                    if budget.near_limit:
-                        break
-                    text = pre[member] if member in pre else self._member_turn(room, member, role, hitl, budget)
-                    if text is None:
-                        continue
-                    posted += 1
-                    round_posts += 1
-                    spoke.append(member)
-                    if re.search(r"(?<![\w.])@user\b", text, re.IGNORECASE):
-                        needs_you = True
-                    for m in self._mentions(text, members):
-                        if m != "@all" and m != member and m not in next_round:
-                            next_round.append(m)
-                if needs_you or posted >= max_msgs or round_posts == 0 or not next_round:
-                    break
-                order = [(m, "mentioned") for m in next_round]
-            if needs_you:
-                self.update(rid, needs_you=True)
-            self.rt.bus.publish("room.drive", room_id=rid, state="settled", posted=posted, speakers=spoke, needs_you=needs_you)
-            return {"posted": posted, "speakers": spoke, "lead": lead, "needs_you": needs_you, "budget": budget.snapshot()}
+                    order = [(m, "mentioned") for m in next_round]
+                needs_you = needs_you or bool(self.rt.broker.pending(room_id=rid))
+                if needs_you:
+                    self.update(rid, needs_you=True)
+                fast_status = budget.fast.status() if budget.fast is not None else None
+                if fast_status is not None:
+                    summary = budget.fast.summary(fast_status)
+                    if summary:
+                        self.post(rid, lead, summary, kind="activity", meta={"fast_mode": fast_status})
+                budget.team_turn.finish_learning(fast_status)
+            finally:
+                self._budgets.pop(rid, None)
+                self.rt.bus.publish("room.drive", room_id=rid, state="settled", posted=posted, speakers=spoke, needs_you=needs_you)
+            out = {"posted": posted, "speakers": spoke, "lead": lead, "needs_you": needs_you, "budget": budget.snapshot()}
+            if budget.fast is not None:
+                out["fast_mode"] = {**budget.fast.snapshot(), **fast_status}
+            return out

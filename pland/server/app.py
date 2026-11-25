@@ -40,14 +40,14 @@ Endpoints (all JSON):
     GET    /api/profiles/{name}/sessions/{sid}  session detail (incl. `todos`, the agent's plan)
     PATCH  /api/profiles/{name}/sessions/{sid}  rename
     DELETE /api/profiles/{name}/sessions/{sid}
-    GET    /api/profiles/{name}/sessions/{sid}/messages?after=&events_after=   items, activity, todos
+    GET    /api/profiles/{name}/sessions/{sid}/messages?after=&events_after=&before=&latest=   items, activity, todos (paged with latest/before)
     POST   /api/profiles/{name}/sessions/{sid}/messages   {text} -> run in background (409 if busy)
     POST   /api/profiles/{name}/sessions/{sid}/stop
     POST   /api/profiles/{name}/sessions/{sid}/resume     continue an interrupted run (Agent.resume)
     GET    /api/interrupted                     sessions that can be resumed
     GET    /api/rooms | POST /api/rooms
     GET    /api/rooms/{id} | PATCH | DELETE
-    GET    /api/rooms/{id}/messages?after=
+    GET    /api/rooms/{id}/messages?after=&before=&latest=
     POST   /api/rooms/{id}/messages             {text} -> room drive in background
     POST   /api/rooms/{id}/stop
     GET    /api/rooms/{id}/tasks                team board of the room
@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import json
+import logging
 import os
 import re
 import sys
@@ -83,6 +84,7 @@ from pydantic import BaseModel
 
 from .. import __version__
 from ..config import AgentSettings, ModelConfig, default_provider, load_dotenv
+from ..errors import NotFound
 from ..hitl import APPROVAL_CHOICES
 from .. import workspace as workspaces
 from .. import keys
@@ -91,10 +93,13 @@ from ..profiles import NAME_RE, Profile, slugify
 from ..runtime import Runtime
 from ..sandbox.backends import SANDBOX_EXEC
 from ..sessions import SessionStore
+from ..team.rooms import DEFAULT_FAST_MODE
 from ..llm.pricing import cost
 from . import files, views
 from .live import EventBridge, LiveState
 from .settings import patch as global_patch, view as global_view
+
+log = logging.getLogger("pland.server")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 CHAT_KINDS = ("chat", "bot_chat")
@@ -145,6 +150,10 @@ class SessionIn(BaseModel):
     kind: str = "chat"
 
 
+class RoleFileIn(BaseModel):
+    content: str
+
+
 class SessionPatch(BaseModel):
     title: str | None = None
     # this chat's thinking intensity (off|default|minimal…max); "" or "reset" = use the bot's setting
@@ -162,6 +171,7 @@ class RoomIn(BaseModel):
     name: str
     members: list[str]
     lead: str | None = None
+    fast_mode: bool = DEFAULT_FAST_MODE
 
 
 class RoomPatch(BaseModel):
@@ -172,6 +182,7 @@ class RoomPatch(BaseModel):
     max_rounds: int | None = None
     max_messages: int | None = None
     workspace: str | None = None  # absolute folder used as the group's shared folder; "" = the default one
+    fast_mode: bool | None = None  # Fast Mode for group tasks (pland/team/fast.py)
 
 
 class KeyIn(BaseModel):
@@ -360,6 +371,46 @@ class SameOriginGuard:
         await send({"type": "http.response.body", "body": body})
 
 
+# The web UI is all same-origin files (no inline script, no inline style attributes, no third-party hosts), so the
+# policy can be strict. `connect-src` names the WebSocket of the page's own host as well: 'self' covers ws:/wss: in
+# current browsers, older ones need it spelled out.
+CSP = ("default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data: blob:; font-src 'self'; "
+       "connect-src 'self'{ws}; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'")
+_HOST_TOKEN = re.compile(r"^[A-Za-z0-9.\-]+(:\d{1,5})?$|^\[[0-9A-Fa-f:.]+\](:\d{1,5})?$")
+
+
+def content_security_policy(host: str | None) -> str:
+    host = (host or "").strip()
+    ws = f" ws://{host} wss://{host}" if host and _HOST_TOKEN.match(host) else ""
+    return CSP.format(ws=ws)
+
+
+class SecurityHeaders:
+    """ASGI middleware: every HTTP response gets a Content-Security-Policy, `X-Content-Type-Options: nosniff` and
+    `Referrer-Policy: no-referrer` (headers a route set itself are kept)."""
+
+    def __init__(self, app: Any):
+        self.app = app
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        host = next((v.decode("latin-1") for k, v in scope.get("headers") or [] if k == b"host"), "")
+        extra = [(b"content-security-policy", content_security_policy(host).encode("latin-1")),
+                 (b"x-content-type-options", b"nosniff"), (b"referrer-policy", b"no-referrer")]
+
+        async def send_with_headers(message: dict[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                headers = list(message.get("headers") or [])
+                have = {k.lower() for k, _ in headers}
+                headers += [(k, v) for k, v in extra if k not in have]
+                message = {**message, "headers": headers}
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
 def seatbelt_available() -> bool:
     """macOS Seatbelt (`sandbox-exec`), which confines the local backend when `os_sandbox` is auto."""
     return sys.platform == "darwin" and os.path.exists(SANDBOX_EXEC)
@@ -413,13 +464,13 @@ class Server:
     def profile(self, name: str) -> Profile:
         try:
             return self.rt.profiles.get(name)
-        except KeyError:
+        except NotFound:
             raise HTTPException(404, f"no profile named {name!r}") from None
 
     def session(self, prof: Profile, sid: str):
         try:
             return SessionStore(prof).get(sid)
-        except KeyError:
+        except NotFound:
             raise HTTPException(404, f"no session {sid} in profile {prof.name}") from None
 
     def folder(self, prof: Profile, sid: str | None = None) -> Path:
@@ -519,7 +570,7 @@ class Server:
                 else:
                     self.rt.broker.answer(req["id"], text="The user stopped the run; do not continue.")
                 n += 1
-            except (KeyError, ValueError):
+            except (NotFound, ValueError):
                 pass
         return n
 
@@ -637,11 +688,12 @@ class Server:
                 p = self.rt.profiles.get(name)
                 members.append({"name": name, "title": p.title, "avatar": p.avatar, "description": p.description,
                                 "busy": self.profile_busy(name)})
-            except KeyError:
+            except NotFound:
                 members.append({"name": name, "title": name, "avatar": "#9ca3af", "description": "(deleted)",
                                 "busy": False, "missing": True})
         out = dict(room)
         out["lead"] = (room.get("settings") or {}).get("lead")
+        out["fast_mode"] = bool((room.get("settings") or {}).get("fast_mode"))
         out["member_info"] = members
         out["workspace"] = str(self.rt.rooms.shared_dir(rid))
         out["workspace_custom"] = bool(workspaces.chosen(room.get("settings")))
@@ -662,10 +714,17 @@ class Server:
         try:
             p = self.rt.profiles.get(req["profile"])
             row["profile_title"], row["avatar"] = p.title, p.avatar
-        except KeyError:
+        except NotFound:
             row["profile_title"], row["avatar"] = req["profile"], "#9ca3af"
         row["origin"] = self.live.origin(req["profile"], req["session_id"])
         return row
+
+
+def _internal_error(request: Request, exc: BaseException) -> JSONResponse:
+    """A 500 for an exception that is a bug rather than a client mistake; the traceback goes to the server log."""
+    log.error("%s %s failed: %s: %s", request.method, request.url.path, type(exc).__name__, exc,
+              exc_info=(type(exc), exc, exc.__traceback__))
+    return JSONResponse({"detail": f"internal server error ({type(exc).__name__})"}, status_code=500)
 
 
 # --------------------------------------------------------------------------- app factory
@@ -692,15 +751,23 @@ def create_app(runtime: Runtime | None = None, *, bind_host: str | None = None,
     app = FastAPI(title="PlanD", version=__version__, lifespan=lifespan)
     app.add_middleware(SameOriginGuard, enforce_host=bind_host is None or is_loopback_host(bind_host),
                        allowed_hosts={*(allowed_hosts or []), *([bind_host] if bind_host else [])})
+    app.add_middleware(SecurityHeaders)  # added last = outermost: the guard's refusals get the headers too
     app.state.runtime = rt
     app.state.server = srv
 
-    @app.exception_handler(KeyError)
-    async def _key_error(request: Request, exc: KeyError):  # missing objects deep in the core
+    # Error mapping. Starlette picks the handler of the most specific class in the exception's MRO.
+    @app.exception_handler(NotFound)
+    async def _not_found(request: Request, exc: NotFound):  # a store lookup found nothing (pland/errors.py)
         return JSONResponse({"detail": str(exc.args[0]) if exc.args else "not found"}, status_code=404)
+
+    @app.exception_handler(KeyError)
+    async def _key_error(request: Request, exc: KeyError):  # any other KeyError is a bug, not a missing object
+        return _internal_error(request, exc)
 
     @app.exception_handler(ValueError)
     async def _value_error(request: Request, exc: ValueError):  # validation errors raised by the core
+        if isinstance(exc, (UnicodeError, json.JSONDecodeError)):  # undecodable data is a bug or corruption, not bad input
+            return _internal_error(request, exc)
         return JSONResponse({"detail": str(exc)}, status_code=400)
 
     # ------------------------------------------------------------------ status
@@ -872,6 +939,17 @@ def create_app(runtime: Runtime | None = None, *, bind_host: str | None = None,
 
         return list_templates()
 
+    @app.post("/api/team-templates/import")
+    def import_team_file(body: RoleFileIn) -> dict[str, Any]:
+        from ..team.role_file import TeamFileConflict, import_role_file
+
+        try:
+            return import_role_file(rt, body.content)
+        except TeamFileConflict as exc:
+            raise HTTPException(409, str(exc)) from None
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from None
+
     @app.post("/api/team-templates/{tid}/apply", status_code=201)
     def apply_team_template(tid: str, update: bool = False) -> dict[str, Any]:
         from ..team.templates import apply_template
@@ -997,21 +1075,36 @@ def create_app(runtime: Runtime | None = None, *, bind_host: str | None = None,
         return {"deleted": sid}
 
     @app.get("/api/profiles/{name}/sessions/{sid}/messages")
-    def session_messages(name: str, sid: str, after: int = 0, events_after: int = 0) -> dict[str, Any]:
+    def session_messages(name: str, sid: str, after: int = 0, events_after: int = 0, before: int | None = Query(None, ge=1),
+                         latest: int | None = Query(None, ge=1, le=2000)) -> dict[str, Any]:
         """Transcript items after message id `after`, plus the session's activity events (memory
-        search, compaction, auto-approvals, …) after event id `events_after` for the UI to merge in."""
+        search, compaction, auto-approvals, …) after event id `events_after` for the UI to merge in.
+
+        Paging: `latest=N` (with `after=0`) returns only the newest N records, widened to whole turns
+        (`views.records_page`); `before=<id>&latest=N` the page before that id (no activity events then: the
+        client has them from its first load). `first_id` and `more` say where the page starts and whether
+        older records exist."""
         prof = srv.profile(name)
         sess = srv.session(prof, sid)
         store = SessionStore(prof)
-        records = store.records(sid, after_id=after)
-        events, last_event = views.session_activity(rt.shared, name, sid, after=events_after)
+        more = False
+        if before is not None or (latest and not after):
+            records, more = views.records_page(prof, sid, before=before, latest=latest or 150)
+        else:
+            records = store.records(sid, after_id=after)
+        if before is not None:
+            events, last_event = [], events_after
+        else:
+            events, last_event = views.session_activity(rt.shared, name, sid, after=events_after)
         busy = srv.busy(name, sid)
         pending = [srv.hitl_row(r) for r in rt.broker.pending(profile=name) if r["session_id"] == sid]
         return {
             "session": {**sess.to_dict(), "profile": name, "reasoning": (sess.meta or {}).get("reasoning"),
                         "model": (sess.meta or {}).get("model"), **_workspace_fields(prof.workspace, sess.meta)},
             "items": views.display_items(records),
-            "last_id": max([after] + [r["id"] for r in records]),
+            "last_id": after if before is not None else max([after] + [r["id"] for r in records]),
+            "first_id": records[0]["id"] if records else None,
+            "more": more,
             "activity": events,
             "last_event_id": last_event,
             "todos": views.session_todos(sess),
@@ -1082,7 +1175,7 @@ def create_app(runtime: Runtime | None = None, *, bind_host: str | None = None,
             raise HTTPException(400, f"the lead @{lead} must be a member")
         if rt.rooms.by_name(name):
             raise HTTPException(409, f"a group named {name!r} already exists")
-        return srv.room_row(rt.rooms.create(name, members, lead=lead))
+        return srv.room_row(rt.rooms.create(name, members, lead=lead, fast_mode=body.fast_mode))
 
     @app.get("/api/rooms/{rid}")
     def get_room(rid: str) -> dict[str, Any]:
@@ -1110,6 +1203,8 @@ def create_app(runtime: Runtime | None = None, *, bind_host: str | None = None,
                 if not 1 <= val <= 50:
                     raise HTTPException(400, f"{key} must be between 1 and 50")
                 settings[key] = val
+        if body.fast_mode is not None:
+            settings["fast_mode"] = body.fast_mode  # takes effect from the next message (a running request keeps its mode)
         folder_change = None
         if body.workspace is not None:
             if rt.rooms.drive_lock(rid).locked():
@@ -1132,13 +1227,23 @@ def create_app(runtime: Runtime | None = None, *, bind_host: str | None = None,
         return {"deleted": rid}
 
     @app.get("/api/rooms/{rid}/messages")
-    def room_messages(rid: str, after: int = 0, limit: int = Query(500, ge=1, le=2000)) -> dict[str, Any]:
+    def room_messages(rid: str, after: int = 0, limit: int = Query(500, ge=1, le=2000), before: int | None = Query(None, ge=1),
+                      latest: int | None = Query(None, ge=1, le=2000)) -> dict[str, Any]:
+        """Messages after id `after` (at most `limit`). Paging: `latest=N` (with `after=0`) returns the newest N,
+        `before=<id>&latest=N` the N before that id; `first_id` / `more` say where the page starts and whether
+        older messages exist."""
         room = srv.room(rid)
-        msgs = rt.rooms.messages(rid, after_id=after, limit=limit)
+        more = False
+        if before is not None or (latest and not after):
+            msgs, more = views.room_page(rt.shared, rid, before=before, latest=latest or 150)
+        else:
+            msgs = rt.rooms.messages(rid, after_id=after, limit=limit)
         return {
             "room": srv.room_row(room, preview=False),
             "messages": msgs,
-            "last_id": max([after] + [m["id"] for m in msgs]),
+            "last_id": after if before is not None else max([after] + [m["id"] for m in msgs]),
+            "first_id": msgs[0]["id"] if msgs else None,
+            "more": more,
             "pending_hitl": [srv.hitl_row(r) for r in rt.broker.pending(room_id=rid)],
         }
 
@@ -1161,8 +1266,15 @@ def create_app(runtime: Runtime | None = None, *, bind_host: str | None = None,
 
     @app.get("/api/rooms/{rid}/tasks")
     def room_tasks(rid: str) -> list[dict[str, Any]]:
-        srv.room(rid)
-        return rt.board.list(rid)
+        from ..team.fast import FastMode, enabled
+
+        room = srv.room(rid)
+        tasks = rt.board.list(rid)
+        if enabled(room):
+            fast = FastMode(rt, rid)
+            for task in tasks:
+                task["acceptance_checks"] = fast.board_checks(task["id"])
+        return tasks
 
     @app.get("/api/rooms/{rid}/files")
     def room_files(rid: str, path: str = "") -> dict[str, Any]:

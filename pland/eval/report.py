@@ -86,6 +86,9 @@ def render_report(s: dict[str, Any], records: list[dict[str, Any]]) -> str:
                 L.append(f"  - ✗ `{c['id']}`：{msg}")
             if r.get("error"):
                 L.append(f"  - 錯誤：{' '.join(r['error'].split())[:220]}")
+            if r.get("straggler"):
+                L.append("  - 取消後執行緒仍在運行（straggler）：它的工作階段保持取消，之後的模型用量與事件不計入其他任務，"
+                         "它仍在運行時不會在同一工作區開始新任務")
     else:
         L.append("無。")
     recovered = [r for r in records if r.get("internal_errors")]

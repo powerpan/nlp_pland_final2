@@ -37,7 +37,7 @@ def test_hkgai_configuration_from_env(monkeypatch):
     client = OpenAICompatClient(ModelConfig(provider="hkgai"))
     payload = client._payload([{"role": "user", "content": "hi"}], None, False, None)
     # no DeepSeek-only `thinking` switch: HKGAI thinks when reasoning_effort carries a level
-    assert "thinking" not in payload and payload["model"] == "hkgai-v1" and payload["reasoning_effort"] == "medium"
+    assert "thinking" not in payload and payload["model"] == "hkgai-v1" and payload["reasoning_effort"] == "high"
 
 
 def test_missing_configuration_fails_loudly(monkeypatch):

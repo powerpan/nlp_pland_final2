@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import shlex
+import time
 
 import pytest
 
@@ -54,6 +56,35 @@ def test_python_scan():
     assert scan_python("executor.shutdown(wait=True)").ok
 
 
+def test_newsroom_word_count_comment_does_not_request_approval(rt, script):
+    from pland.hitl import ScriptedHITL
+
+    workspace = rt.profiles.get("default").workspace
+    (workspace / "report.md").write_text("title\n| table row |\nnews article\n")
+    command = f"cd {shlex.quote(str(workspace))} && python3 - <<'PY'\n" + (
+        "import re\n"
+        "with open('report.md') as report:\n"
+        "    body = re.sub(r'^\\|.*$', '', report.read(), flags=re.M)  # drop table rows\n"
+        "print('word count:', len(body.split()))\n"
+        "PY"
+    )
+    script([{"tool_calls": [("run_shell", {"command": command})]}, {"content": "done"}])
+    hitl = ScriptedHITL(default_choice="deny")
+    agent = rt.agent("default", hitl=hitl)
+    agent.run("count the words outside the table")
+    assert hitl.log == []
+    result, = [m["content"] for m in agent.sessions.messages(agent.session_id) if m["role"] == "tool"]
+    assert "word count: 3" in result
+
+
+def test_python_sql_checks_skip_comments_and_keep_strings():
+    assert scan_python("print(1)  # drop table rows").ok
+    code = "statement = 'DROP TABLE example'  # part of a query"
+    assert scan_python(code).needs_approval == ["SQL DROP"]
+    assert check_command(f"python3 - <<'PY'\n{code}\nPY").needs_approval == ["SQL DROP"]
+    assert check_command('sqlite3 report.db "DROP TABLE example"').needs_approval == ["SQL DROP"]
+
+
 def test_local_backend_scrubs_secrets_and_times_out(tmp_path, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-not-real")
     monkeypatch.setenv("MY_TOKEN", "t")
@@ -83,6 +114,45 @@ def test_docker_backend_isolation(tmp_path):
         b.shutdown()
 
 
+@pytest.mark.skipif(not DockerBackend.available() or os.environ.get("PLAND_SKIP_DOCKER"), reason="docker not available")
+@pytest.mark.parametrize("python", [False, True], ids=["shell-cancel", "python-timeout"])
+def test_docker_stops_running_process_and_children(tmp_path, python):
+    backend = DockerBackend(SandboxConfig(backend="docker", docker_network="none"), "pytest-cancel", tmp_path)
+    script = (
+        "import os, pathlib, subprocess, sys, time\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "pathlib.Path('pids').write_text(f'{os.getpid()} {child.pid}')\n"
+        "print('started', flush=True)\n"
+        "time.sleep(30)\n"
+    )
+    try:
+        assert backend.run("true", tmp_path).exit_code == 0
+        start = time.monotonic()
+        if python:
+            result = backend.run_python(script, tmp_path, timeout=1)
+        else:
+            result = backend.run(f"python -c {shlex.quote(script)}", tmp_path, timeout=4,
+                                 cancel=(tmp_path / "pids").exists)
+        elapsed = time.monotonic() - start
+        assert result.timed_out and "started" in result.stdout
+        assert ("timeout" if python else "run cancelled") in result.stderr
+        assert elapsed < 3
+        pids = [int(pid) for pid in (tmp_path / "pids").read_text().split()]
+        probe = backend.run_python(
+            "from pathlib import Path\n"
+            f"for pid in {pids!r}:\n"
+            "    status = Path(f'/proc/{pid}/status')\n"
+            "    if status.exists():\n"
+            "        assert next(line for line in status.read_text().splitlines() "
+            "if line.startswith('State:')).split()[1] == 'Z', pid\n",
+            tmp_path,
+        )
+        assert probe.exit_code == 0, probe.render()
+    finally:
+        backend.shutdown()
+
+
 @pytest.mark.skipif(not os.path.exists("/usr/bin/sandbox-exec"), reason="macOS Seatbelt only")
 def test_seatbelt_confines_local_backend(tmp_path):
     home = tmp_path / "home"
@@ -107,6 +177,27 @@ def test_seatbelt_confines_local_backend(tmp_path):
     assert r.exit_code == 0 and (shared / "out.txt").read_text().strip() == "team"
     r = b.run("git init -q repo && cd repo && echo a > a && git add a && git commit -qm init && git log --oneline | wc -l", ws)
     assert r.exit_code == 0 and r.stdout.strip() == "1", r.render()
+
+
+@pytest.mark.skipif(not os.path.exists("/usr/bin/sandbox-exec"), reason="macOS Seatbelt only")
+def test_seatbelt_blocks_host_keychain_service_lookup(tmp_path):
+    backend = LocalBackend(SandboxConfig(), workspace=tmp_path)
+    result = backend.run_python(
+        """
+import ctypes as c
+lib = c.CDLL(None)
+lookup = lib.bootstrap_look_up
+lookup.argtypes = [c.c_uint32, c.c_char_p, c.POINTER(c.c_uint32)]
+lookup.restype = c.c_int
+bootstrap_port = c.c_uint32.in_dll(lib, 'bootstrap_port')
+for name in (b'com.apple.SecurityServer', b'com.apple.securityd.xpc'):
+    service = c.c_uint32()
+    assert lookup(bootstrap_port, name, c.byref(service)) != 0, name
+print('keychain services unavailable')
+""",
+        tmp_path,
+    )
+    assert result.exit_code == 0 and "keychain services unavailable" in result.stdout, result.render()
 
 
 @pytest.mark.parametrize("cmd,needs", [

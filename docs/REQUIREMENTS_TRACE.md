@@ -14,7 +14,7 @@
 | Bot 之間傳訊、共享資訊、協作 | `message_agent`、`delegate_task`、`share_file`、群組 `shared/`、任務看板 | `tests/test_team.py::test_message_agent`；評測 team 任務 |
 | 切換模式不遺失持久狀態 | CLI 與網頁操作同一個 Profile／會話；狀態全部持久化在 SQLite | `tests/test_agent.py::test_recover_interrupted_and_resume` |
 | CLI 與 Bot Mode 的邊界（不在 CLI 完整移植 Bot Mode） | 參考 Hermes：Bot Mode 在網頁；CLI 只到 Profile／會話層級 | 架構文件第 9 節 |
-| **§2.3 拆解、分工、委派、協調、整合**；不是輪流回覆 | 主導者以看板拆解、`delegate_task` 委派（受託者在自己的 Profile 中真正執行）、並行、前置任務交接、整合驗證 | 評測：v2 輪次 8 次團隊任務中 7 次真正委派（共 19 次，6 次並行），最終版本 5 個團隊任務全部委派（共 14 次）；`tests/test_agent_features.py::test_prerequisites_gate_and_handoff` |
+| **§2.3 拆解、分工、委派、協調、整合**；不是輪流回覆 | 主導者以看板拆解、`delegate_task` 委派（受託者在自己的 Profile 中真正執行）、並行、前置任務交接、整合驗證 | 評測：v2 輪次 8 次團隊任務中 7 次真正委派（共 19 次，5 個任務出現並行），最終版本 5 個團隊任務全部委派（共 14 次）；`tests/test_agent_features.py::test_prerequisites_gate_and_handoff` |
 | **§3 HITL**：歧義時暫停詢問 | `ask_user`；規則「結果相依的未說明參數要詢問」 | 評測 `mid-hitl-clarify-temps`、`dev-hitl-greeting`、`final-hitl-crm-export`；`tests/test_agent.py::test_clarification_resumes_same_run` |
 | 重要操作前請求授權、不可繞過 | 授權閘門（once/session/always/deny）、硬性封鎖、對外與破壞性操作一律問人、禁止繞過 | 評測 `mid-hitl-approve-delete`／`deny-delete`；`tests/test_agent.py::test_approval_deny_and_session_grant`、`test_hardline_block` |
 | 獲得答覆後繼續，不重新開始 | 請求在工具呼叫內等待，答覆後同一運行繼續；程式中斷後 `resume()` 從紀錄續跑 | `tests/test_agent.py::test_clarification_resumes_same_run`、`test_resume_after_interrupted_tool_call` |

@@ -70,6 +70,12 @@ Paths in checks: plain relative paths resolve in the *primary workspace* (single
 workspace; team: the lead bot's workspace). `shared/<p>` resolves in the group room's shared folder and
 `@<bot>/<p>` in that bot's workspace.
 
+`command`, `python`, `git_commits` and `git_clean` checks execute code, so they run inside the task's sandbox
+backend (local+Seatbelt on macOS, or the task's Docker container, where the workspace is `/workspace`, the
+room folder `/shared` and a referenced `@<bot>/` workspace `/bot-<bot>`), never unconfined on the host. A
+`python` check that needs host-only state (for example the runtime's `shared.db`) sets `host: true`: it runs on
+the host, outside the workspace and without it on `sys.path`, so it must not import the agent's code.
+
 Outcome per task (decided only by checks, never by the agent's own claims):
 - `success`  — every required check passed
 - `partial`  — at least one check passed but a required one failed

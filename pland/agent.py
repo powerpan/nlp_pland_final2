@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
 import traceback
 from dataclasses import dataclass, field, replace
@@ -29,13 +30,14 @@ from . import workspace as workspaces
 from .llm import reasoning
 from .llm.base import Usage
 from .memory import ExperienceStore
-from .prompts import build_system_prompt
+from .prompts import build_system_prompt, current_output_rules
 from .sandbox import PathPolicy
 from .sessions import SessionStore
-from .store import new_id
+from .store import loads, new_id
 from .tools.registry import ToolContext, execute, select_tools
 
 if TYPE_CHECKING:
+    from .team.review import ReviewTurn
     from .profiles import Profile
     from .runtime import Runtime
 
@@ -43,7 +45,7 @@ if TYPE_CHECKING:
 SUBAGENT_EXCLUDE = {"ask_user", "memory", "skill_save", "message_agent", "team_tasks"}
 # Tools that change state; refused during discussion-only room turns. (Refused at call time rather than removed
 # from the schema, so the session's prompt prefix — and DeepSeek's cache — stays stable across turns.)
-MUTATING_TOOLS = {"write_file", "edit_file", "delete_file", "run_shell", "run_python", "git_status", "git_commit",
+MUTATING_TOOLS = {"write_file", "edit_file", "delete_file", "run_shell", "run_python", "run_checks", "git_status", "git_commit",
                   "git_push", "delegate_task", "message_agent", "share_file", "memory", "skill_save",
                   # also no web research in a discussion turn: doing the work there is shallow (a real run posted a
                   # misread version number); research goes through delegation, where it is done and verified properly
@@ -89,6 +91,10 @@ class RunResult:
     error: str | None = None
     experience_ids: list[str] = field(default_factory=list)
     budget: dict[str, Any] = field(default_factory=dict)
+    # Set when the run never got the session lock: "cancelled" (stopped while waiting), "timeout" (the wait ran past
+    # its deadline) or "deadlock" (the session is held by a run that is itself waiting on this run's caller). Nothing
+    # was written to the session in these cases.
+    not_started: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -108,8 +114,68 @@ class LoopDetected(Exception):
     pass
 
 
+# A run waits for its session lock in slices of this many seconds, re-checking stop requests and wait cycles in between.
+LOCK_WAIT_SLICE = 0.25
+LOCK_WAIT_MAX = 1800.0  # overall cap on the wait when the caller gives no deadline
+
+
+class _LockRegistry:
+    """Who holds and who waits for each session lock (one registry per Runtime).
+
+    The delegation chain only catches A→B→A within one chain. Two independent chains (A messages B while B messages
+    A) would otherwise wait on each other's session lock. The wait-for graph has two kinds of edges: a run waiting for a
+    session points at the run holding it, and a caller blocked in delegate_task/message_agent points at its child
+    run. A new wait that would close a cycle is refused at once."""
+
+    def __init__(self) -> None:
+        self.guard = threading.Lock()
+        self.holder: dict[tuple[str, str], str] = {}  # (profile, session) -> run id holding its lock
+        self.waiting: dict[str, tuple[str, str]] = {}  # run id -> (profile, session) it is waiting for
+        self.parent: dict[str, str] = {}  # run id -> run id of the caller blocked on it
+
+    def would_deadlock(self, run_id: str, key: tuple[str, str]) -> list[str] | None:
+        """The run ids on the cycle if `run_id` waited for `key` (call with `guard` held), else None."""
+        start = self.holder.get(key)
+        if start is None:
+            return None
+        children: dict[str, list[str]] = {}
+        for child, parent in self.parent.items():
+            children.setdefault(parent, []).append(child)
+        stack, seen = [(start, [start])], {start}
+        while stack:
+            node, path = stack.pop()
+            if node == run_id:
+                return path
+            nxt = list(children.get(node, []))
+            waits = self.waiting.get(node)
+            if waits is not None and waits in self.holder:
+                nxt.append(self.holder[waits])
+            for n in nxt:
+                if n not in seen:
+                    seen.add(n)
+                    stack.append((n, path + [n]))
+        return None
+
+
+_REGISTRY_GUARD = threading.Lock()
+
+
+def lock_registry(runtime: Any) -> _LockRegistry:
+    with _REGISTRY_GUARD:
+        reg = getattr(runtime, "_session_lock_registry", None)
+        if reg is None:
+            reg = _LockRegistry()
+            runtime._session_lock_registry = reg
+        return reg
+
+
 # DeepSeek's own tool-call markup, which the model sometimes writes as plain text instead of a real tool call
 # (seen in a wrap-up report: "<｜｜DSML｜｜ calls> <｜｜DSML｜｜ invoke name=...>").
+# A first reply that only announces work ("I'll start by setting up the plan…") and stops without a tool call.
+# Seen in a real hard-suite run: the loop took the announcement as the final answer and nothing was built.
+ANNOUNCE_ONLY = re.compile(
+    r"^\s*(i'll|i will|i'm going to|i am going to|let me|let's|first,? i|now,? i|next,? i|i'm starting|i'll start|"
+    r"我(先|會|将|將|來|来|現在|这就|這就)|讓我|让我|首先)", re.IGNORECASE)
 TOOL_MARKUP = re.compile(r"<[|｜]{1,2}\s*DSML\s*[|｜]{1,2}|<[|｜]tool[▁_ ]calls?[▁_ ]begin[|｜]>|<[|｜]tool[▁_ ]call[▁_ ]begin[|｜]>")
 
 
@@ -144,9 +210,20 @@ class Agent:
         system_extra: str | None = None,
         reflect: bool | None = None,
         budget: Budget | None = None,
+        budget_root: bool | None = None,
         discussion_only: bool = False,
+        caller: "Agent | None" = None,
+        review_turn: "ReviewTurn | None" = None,
     ):
         self.runtime = runtime
+        self.review_turn = review_turn
+        self.review_spec: dict[str, Any] | None = None
+        # The agent whose tool call (delegate_task, message_agent) started this one and is blocked until it returns:
+        # a stop on the caller also stops this run, and lock waits are checked for cycles through it.
+        self.caller = caller
+        self.deadline: float | None = None  # absolute time after which the current run stops (message_agent timeout)
+        self.timed_out = False
+        self._deadline_cancelled = False  # the deadline timer set this session's stop flag
         self.profile = profile
         self.session_id = session_id
         self.hitl = hitl or runtime.default_hitl
@@ -167,6 +244,8 @@ class Agent:
             exclude |= {"delegate_task", "message_agent"}
         if not runtime.profiles.list(bots_only=True):
             exclude |= {"message_agent"}
+        if getattr(budget, "fast", None) is None:
+            exclude |= {"run_checks"}  # only a Fast Mode group drive has card checks to run
         self.tools = {t.name: t for t in select_tools(self.settings.toolsets, exclude)}
         # The conversation's folder (pland/workspace.py): one chosen for this session, else the private workspace.
         try:
@@ -183,11 +262,13 @@ class Agent:
         self.paths = PathPolicy(roots)
         self.used_experience_ids: set[str] = set()
         self.run_id = ""
-        # Delegates/subagents share the budget of the run that spawned them; a top-level run owns one.
-        self.is_root = budget is None
+        # Delegates/subagents share the budget of the run that spawned them; a top-level run owns one. A room lead
+        # shares its drive's budget yet is that drive's root (budget_root=True): it keeps the last 10% for its summary.
+        self.is_root = budget is None if budget_root is None else budget_root
         self.budget = budget or Budget(self.settings.max_run_calls, self.settings.max_run_tokens)
         self._call_sigs: dict[str, int] = {}
         self._result_sigs: dict[int, int] = {}
+        self._written_content_sigs: set[int] = set()
         self._stale_streak = 0
         self._hot_turns = 0  # remaining iterations sampled at a higher temperature to break repetition
         self.discussion_only = discussion_only
@@ -272,9 +353,86 @@ class Agent:
         if seen != current:
             self.sessions.patch_meta(self.session_id, {"workspace_seen": current})
 
+    def _cancel_requested(self) -> bool:
+        """A stop for this session, or for a caller blocked on this run (its stop must reach the work it waits for)."""
+        agent: Agent | None = self
+        seen: set[int] = set()
+        while agent is not None and id(agent) not in seen:
+            seen.add(id(agent))
+            if agent.runtime.is_cancelled(agent.profile.name, agent.session_id):
+                return True
+            agent = agent.caller
+        return False
+
     def _check_cancel(self) -> None:
-        if self.runtime.is_cancelled(self.profile.name, self.session_id):
+        if self.deadline is not None and time.time() >= self.deadline:
+            self.timed_out = True
             raise Cancelled()
+        if self._cancel_requested():
+            raise Cancelled()
+
+    def _acquire_session(self, lock: threading.Lock, deadline: float) -> tuple[str, str] | None:
+        """Take the session lock. Returns None once held, else (reason, message) with reason "cancelled", "timeout"
+        or "deadlock". The wait goes in short slices so a stop (of this session or of a caller) ends it promptly,
+        and a wait that would close a cycle with other waiting runs is refused instead of blocking."""
+        key = (self.profile.name, self.session_id)
+        reg = lock_registry(self.runtime)
+        if lock.acquire(blocking=False):
+            # The session was idle: a stop request left over from an earlier run is stale.
+            self.runtime.clear_cancel(*key)
+            with reg.guard:
+                reg.holder[key] = self.run_id
+            return None
+        # Busy: the stop flag now belongs to the run holding the session (or to this wait); it is not cleared.
+        try:
+            while True:
+                if self._cancel_requested():
+                    return "cancelled", "stopped while waiting for the session to become free"
+                with reg.guard:
+                    cycle = reg.would_deadlock(self.run_id, key)
+                    if cycle is None:
+                        reg.waiting[self.run_id] = key
+                if cycle is not None:
+                    return "deadlock", (
+                        f"@{self.profile.name}'s session {self.session_id} is busy with a run that is itself waiting, "
+                        "directly or through its own delegations and messages, for the conversation that sent this "
+                        "one (a cross-chain message cycle). Waiting would deadlock, so this was refused; answer in your "
+                        "own reply instead, or try again after that run has finished.")
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    return "timeout", f"@{self.profile.name}'s session {self.session_id} stayed busy until the deadline"
+                if lock.acquire(timeout=min(LOCK_WAIT_SLICE, remaining)):
+                    with reg.guard:
+                        reg.holder[key] = self.run_id
+                    return None
+        finally:
+            with reg.guard:
+                reg.waiting.pop(self.run_id, None)
+
+    def _release_session(self, lock: threading.Lock) -> None:
+        key = (self.profile.name, self.session_id)
+        reg = lock_registry(self.runtime)
+        with reg.guard:
+            if reg.holder.get(key) == self.run_id:
+                del reg.holder[key]
+        lock.release()
+
+    def _deadline_reached(self) -> None:
+        """Timer callback for a run with a deadline: stop it through the normal cancellation path, and answer a pending
+        human question of this session so a run blocked on it can observe the stop."""
+        self.timed_out = True
+        self._deadline_cancelled = True
+        self.runtime.cancel(self.profile.name, self.session_id)
+        try:
+            for req in self.runtime.broker.pending(profile=self.profile.name):
+                if req.get("session_id") != self.session_id:
+                    continue
+                if req.get("kind") == "approval":
+                    self.runtime.broker.answer(req["id"], text="The run timed out.", choice="deny")
+                else:
+                    self.runtime.broker.answer(req["id"], text="The run timed out; do not continue.")
+        except Exception:  # noqa: BLE001 - best effort; the step check still stops the run
+            pass
 
     # ------------------------------------------------------------------ context
     def _llm_messages(self) -> list[dict[str, Any]]:
@@ -287,6 +445,8 @@ class Agent:
         for r in self.sessions.records(self.session_id):
             m = r["message"]
             if m.get("role") == "system" or r["id"] > upto:
+                if m.get("role") == "system":
+                    m = {**m, "content": current_output_rules(m["content"])}
                 if m.get("role") == "tool" and r["id"] <= pruned and len(str(m.get("content") or "")) > 200:
                     m = {**m, "content": PRUNED_TOOL_OUTPUT}
                 msgs.append(m)
@@ -298,8 +458,15 @@ class Agent:
                 from .tools.plan import render
 
                 summary += "\n\n[Your task list, preserved across compaction]\n" + render(sess.meta["todos"])
-            msgs = sys_msgs + [{"role": "user", "content": summary},
-                               {"role": "assistant", "content": "Understood. Continuing from that summary."}] + rest
+            if sess.meta.get("task_note"):  # the request itself, when it was folded with no later user turn
+                summary += "\n\n[The request you are working on, verbatim]\n" + sess.meta["task_note"]
+            # A fabricated assistant turn has no reasoning_content to replay to DeepSeek in tool mode.
+            # Keep the summary at user priority and combine it with the first retained user turn when possible.
+            if rest and rest[0].get("role") == "user" and isinstance(rest[0].get("content"), str):
+                rest[0] = {**rest[0], "content": summary + "\n\n[Conversation continues]\n" + rest[0]["content"]}
+                msgs = sys_msgs + rest
+            else:
+                msgs = sys_msgs + [{"role": "user", "content": summary}] + rest
         return close_tool_calls(msgs)
 
     def _view_size(self) -> int:
@@ -307,14 +474,27 @@ class Agent:
 
     def _tail_start(self, live: list[dict[str, Any]], tail_budget: int) -> int:
         """Index in `live` where the protected tail begins: walk back until ~tail_budget chars, then move
-        forward to a user message so tool-call groups are never split."""
+        forward to a user message so tool-call groups are never split. A long tool-call chain after the task has
+        no user message in the tail: then cut at an assistant message instead (the start of a tool-call group), and
+        always keep at least the newest group, whose results the model has not seen yet."""
         size, i = 0, len(live)
         while i > 0 and size < tail_budget:
             i -= 1
             size += len(json.dumps(live[i]["message"], ensure_ascii=False))
+        start = i
         while i < len(live) and live[i]["message"].get("role") != "user":
             i += 1
-        return i
+        if i < len(live):
+            return i
+        i = start
+        while i < len(live) and live[i]["message"].get("role") != "assistant":
+            i += 1
+        if i < len(live):
+            return i
+        i = len(live)  # the tail budget ends inside the newest group: keep that whole group
+        while i > 0 and live[i - 1]["message"].get("role") not in ("assistant", "user"):
+            i -= 1
+        return max(0, i - 1)
 
     def _maybe_compact(self) -> None:
         """Two-phase compaction. Phase 1 (no model call): clear old tool
@@ -338,6 +518,19 @@ class Agent:
             return
         # Phase 2: structured summary of the middle, iteratively updating the previous summary
         old = live[:cut]
+        patch: dict[str, Any] = {}
+
+        def is_task(r: dict[str, Any]) -> bool:  # a request given to run(), not a [system] note
+            return r["message"].get("role") == "user" and "display" in r["meta"]
+
+        if any(is_task(r) for r in live[cut:]):
+            patch["task_note"] = None
+        else:
+            # The request is folded with no later one in the tail, so it would survive only inside the summary (the
+            # fallback summary may not even contain it): keep the latest request verbatim next to the summary.
+            task = next((r for r in reversed(old) if is_task(r)), None)
+            if task is not None:
+                patch["task_note"] = str(task["message"].get("content") or "")[:6000]
         digest = "\n".join(_digest_line(r["message"]) for r in old)[-160_000:]
         prev = sess.meta.get("summary") or ""
         prompt = [
@@ -349,7 +542,7 @@ class Agent:
             summary = self.chat(prompt, purpose="compaction", max_tokens=3000, thinking=False).content.strip()
         except (LLMError, BudgetExceeded):
             summary = (prev + "\n" + digest[-4000:]).strip()
-        self.sessions.patch_meta(self.session_id, {"compacted_upto": old[-1]["id"], "summary": summary})
+        self.sessions.patch_meta(self.session_id, {"compacted_upto": old[-1]["id"], "summary": summary, **patch})
         self.emit("context.compacted", folded=len(old), size=self._view_size())
 
     # ------------------------------------------------------------------ experience
@@ -396,17 +589,45 @@ class Agent:
 
     # ------------------------------------------------------------------ main loop
     def run(self, text: str | None, *, meta: dict[str, Any] | None = None, max_iterations: int | None = None,
-            task_text: str | None = None) -> RunResult:
+            task_text: str | None = None, deadline: float | None = None) -> RunResult:
         """Run one turn. `task_text` is the underlying request when `text` wraps it in protocol
-        boilerplate (room turns, delegations); it is what experience retrieval and reflection see."""
+        boilerplate (room turns, delegations); it is what experience retrieval and reflection see.
+        `deadline` (absolute time) bounds both the wait for the session and the run itself: past it the run is stopped
+        through the cancellation path (`timed_out` is then set)."""
         self.run_id = new_id("r_")
         start = time.time()
         usage = Usage()
         iterations = tool_calls = 0
+        self.deadline, self.timed_out, self._deadline_cancelled = None, False, False
+        reg = lock_registry(self.runtime)
+        if self.caller is not None and self.caller.run_id:
+            with reg.guard:
+                reg.parent[self.run_id] = self.caller.run_id
         lock = self.runtime.session_lock(self.profile.name, self.session_id)
-        if not lock.acquire(timeout=1800):
-            return RunResult(self.run_id, self.session_id, self.profile.name, "error", "", error="session is busy")
-        self.runtime.clear_cancel(self.profile.name, self.session_id)
+        try:
+            refused = self._acquire_session(lock, deadline if deadline is not None else start + LOCK_WAIT_MAX)
+        except BaseException:
+            with reg.guard:
+                reg.parent.pop(self.run_id, None)
+            raise
+        if refused is not None:
+            with reg.guard:
+                reg.parent.pop(self.run_id, None)
+            reason, message = refused
+            self.emit("run.not_started", reason=reason, error=message)
+            if reason == "timeout":
+                self.timed_out = True
+            status = "cancelled" if reason == "cancelled" else "error"
+            return RunResult(self.run_id, self.session_id, self.profile.name, status,
+                             "(stopped by user)" if reason == "cancelled" else "",
+                             duration=time.time() - start, error=None if reason == "cancelled" else message,
+                             budget=self.budget.snapshot(), not_started=reason)
+        timer: threading.Timer | None = None
+        if deadline is not None:
+            self.deadline = deadline
+            timer = threading.Timer(max(0.0, deadline - time.time()), self._deadline_reached)
+            timer.daemon = True
+            timer.start()
         final_text = ""
         status = "completed"
         error = None
@@ -432,6 +653,8 @@ class Agent:
             iterations, tool_calls, final_text, status = self._loop(usage, max_iterations or self.settings.max_iterations)
         except Cancelled:
             status, final_text = "cancelled", "(stopped by user)"
+            if self.timed_out:
+                final_text = "(stopped: the run reached the time limit its sender set)"
             self.sessions.append(self.session_id, {"role": "assistant", "content": final_text}, meta={"cancelled": True})
         except BudgetExceeded as exc:
             status, error = "budget_exceeded", str(exc)
@@ -458,8 +681,16 @@ class Agent:
             final_text = f"Internal error: {type(exc).__name__}: {exc}"
             self.sessions.append(self.session_id, {"role": "assistant", "content": final_text}, meta={"error": True})
         finally:
+            if timer is not None:
+                timer.cancel()
+                timer.join(5)
+                if self._deadline_cancelled:  # the stop flag was ours: do not leave it for the next run
+                    self.runtime.clear_cancel(self.profile.name, self.session_id)
+            self.deadline = None
             self.sessions.update(self.session_id, status="error" if status == "error" else "idle")
-            lock.release()
+            with reg.guard:
+                reg.parent.pop(self.run_id, None)
+            self._release_session(lock)
         result = RunResult(self.run_id, self.session_id, self.profile.name, status, final_text, iterations, tool_calls,
                            time.time() - start, usage, error, budget=self.budget.snapshot())
         trivial = self.discussion_only or final_text.strip().lower().strip(" .") in {"[pass]", "pass", "[silent]"}
@@ -476,11 +707,16 @@ class Agent:
                 except Exception as exc:  # reflection must never break the task result
                     self.emit("reflection.failed", error=str(exc))
 
-            if self.settings.background_reflection:
-                # The answer is returned now; learning happens afterwards.
-                self.runtime.track_reflection(self.runtime.spawn(_reflect, name="reflection"))
+            def start_reflection():
+                if self.settings.background_reflection:
+                    self.runtime.track_reflection(self.runtime.spawn(_reflect, name="reflection"))
+                else:
+                    _reflect()
+
+            if self.budget.team_turn:
+                self.budget.team_turn.defer_learning(self, start_reflection)
             else:
-                _reflect()
+                start_reflection()
         return result
 
     def resume(self) -> RunResult:
@@ -512,6 +748,18 @@ class Agent:
                                  meta={"tool": c["function"]["name"], **meta})
 
     def _run_tool_calls(self, calls: list[dict[str, Any]]) -> int:
+        names = [tc["function"]["name"] for tc in calls]
+        if ("ask_user" in names and "ask_user" in self.tools and not self.discussion_only
+                and {"delegate_task", "message_agent"}.intersection(names)):
+            index = names.index("ask_user")
+            # Arguments for this batch were generated before the answer was known.
+            # Close their tool calls without executing them and let the next turn plan from the answer.
+            try:
+                return self._run_tool_calls([calls[index]])
+            finally:
+                self._answer_unrun(calls[:index] + calls[index + 1:],
+                                   "Not run: this turn requested user clarification. Use the answer above and issue "
+                                   "fresh tool calls for the work that is still needed.", clarification_pending=True)
         n = 0
         for i, tc in enumerate(calls):
             try:
@@ -525,6 +773,21 @@ class Agent:
             self.emit("tool.started", tool=name, call_id=tc["id"], args=_preview_args(raw))
             started = time.time()
             sig = name + "\x00" + " ".join(raw.split())
+            if name == "run_checks" and (fast := getattr(self.budget, "fast", None)):
+                sig = name + "\x00" + fast.check_signature(raw)
+            elif name == "delegate_task" and self.room_id:
+                # Retrying an existing review after its state or inputs changed is a different operation.
+                request = loads(raw, {})
+                tasks = request.get("tasks") if isinstance(request, dict) else None
+                for task in tasks if isinstance(tasks, list) else ():
+                    if not isinstance(task, dict) or not task.get("review") or not isinstance(task.get("task_id"), str):
+                        continue
+                    try:
+                        card = self.runtime.board.get(task["task_id"])
+                    except KeyError:
+                        continue
+                    if card["room_id"] == self.room_id:
+                        sig += json.dumps(card.get("review"), sort_keys=True)
             self._call_sigs[sig] = self._call_sigs.get(sig, 0) + 1
             repeats = self._call_sigs[sig]
             stop: LoopDetected | None = None
@@ -534,8 +797,8 @@ class Agent:
                 out = f"ERROR: not run — {stop}. The loop guard is stopping this run."
             elif repeats >= REPEAT_WARN:
                 self._hot_turns = 2  # degeneration sign: loosen sampling for the next turns
-                out = (f"ERROR: you already made this exact {name} call {repeats - 1} times with identical arguments and "
-                       f"got the same result. Do not repeat it; change your approach or finish with what you have.")
+                out = (f"ERROR: you already made this exact {name} call {repeats - 1} times. "
+                       "Change your approach or finish with what you have.")
             elif t is None:
                 out = f"ERROR: unknown tool '{name}'. Available: {', '.join(sorted(self.tools))}"
             elif self.discussion_only and name in MUTATING_TOOLS:
@@ -552,12 +815,17 @@ class Agent:
                     out = f"ERROR: invalid JSON arguments for {name}: {exc}"
                 else:
                     out = execute(t, self._context(tc["id"]), args)
+                    if self.review_spec and name in WRITE_TOOLS and not out.startswith("ERROR"):
+                        from .team.review import review_write_feedback
+
+                        if note := review_write_feedback(self.review_spec, self.paths, args["path"]):
+                            out += f"\nReview report format: {note}"
             if len(out) > MAX_TOOL_RESULT:
                 out = (out[: MAX_TOOL_RESULT // 2] + f"\n... [{len(out) - MAX_TOOL_RESULT} chars cut from the middle of this "
                        "result; read files in parts with read_file offset/limit, or narrow the command] ...\n"
                        + out[-MAX_TOOL_RESULT // 2 :])
             if stop is None:
-                out, stop = self._progress_guard(name, raw, out)
+                out, stop = self._progress_guard(name, sig, out, args)
             # The result is recorded even when the guard stops the run here: the call did run (an edit is on disk).
             self.sessions.append(self.session_id, {"role": "tool", "tool_call_id": tc["id"], "content": out},
                                  meta={"tool": name, "duration": round(time.time() - started, 3)})
@@ -577,20 +845,29 @@ class Agent:
                 raise stop
         return n
 
-    def _progress_guard(self, name: str, raw: str, out: str) -> tuple[str, LoopDetected | None]:
-        """Detect a run that keeps getting the same results (near-identical calls, cosmetic variations). Returns the
-        result (with a nudge appended once the streak is long) and the exception that stops the run, if any.
-
-        A successful write or edit changes the workspace, so its confirmation ("Edited x (1 replacement)") is the
-        same text for every edit of a file without meaning "no progress": it is keyed by its arguments as well. The
-        very same write repeated still counts (and the identical-call guard catches it first)."""
-        if name in WRITE_TOOLS and not out.startswith("ERROR"):
+    def _progress_guard(self, name: str, raw: str, out: str, args: dict[str, Any] | None) -> tuple[str, LoopDetected | None]:
+        """Detect repeated tool outcomes even when the agent saves the same script under new names."""
+        duplicate_write = False
+        if name == "run_checks":
+            key = hash((name, raw, out))
+        elif name in WRITE_TOOLS and not out.startswith("ERROR"):
+            # A generic confirmation can hide a real edit, so keep the arguments in the result signature.
             key = hash((name, " ".join(raw.split()), out))
+            if name == "write_file" and args is not None and not args.get("append"):
+                content = args.get("content")
+                # The model may pass a JSON object or list as content (the tool writes it JSON-encoded).
+                content_key = hash(content if isinstance(content, str) else json.dumps(content, sort_keys=True, default=str))
+                duplicate_write = content_key in self._written_content_sigs
+                self._written_content_sigs.add(content_key)
         else:
             key = hash((name, out))
         seen = self._result_sigs.get(key, 0)
         self._result_sigs[key] = seen + 1
-        self._stale_streak = self._stale_streak + 1 if seen >= 1 else 0
+        if seen:
+            self._stale_streak += 1
+        elif not duplicate_write:
+            # Copying identical content to a new path is neutral. It does not grow the streak on its own.
+            self._stale_streak = 0
         if self._stale_streak >= STALE_STOP:
             stop = LoopDetected(f"the last {self._stale_streak} tool results repeated earlier results (no progress)")
             return out + f"\n\n[progress guard] {stop}; stopping this run.", stop
@@ -608,6 +885,9 @@ class Agent:
         self._schemas = schemas
         partial: list[str] = []  # text of replies cut off at the output limit, continued in the next step
         markup_retries = 0
+        announce_nudged = False
+        conflict_nudged = False
+        checkpoint_at = time.time() + 0.65 * (self.deadline - time.time()) if self.review_spec and self.deadline else None
         while iterations < max_iter:
             self._check_cancel()
             if self.is_root and self.budget.near_limit:
@@ -617,6 +897,12 @@ class Agent:
             iterations += 1
             self._step = iterations
             self._note_budget()
+            if checkpoint_at is not None and time.time() >= checkpoint_at:
+                checkpoint_at = None
+                self.sessions.append(self.session_id, {"role": "user", "content": (
+                    f"[system] Review time checkpoint. Save current evidence and outstanding checks to {self.review_spec['report']} "
+                    "now. Use Verdict: INCOMPLETE until the requirement is decided.")}, meta={"checkpoint": True})
+                self.emit("budget.checkpoint", reason="review_time", steps_left=max_iter - iterations + 1)
             self._remind_stale_plan(iterations)
             if max_iter >= 8 and iterations == int(max_iter * 0.8):
                 # Budget checkpoint: a chance to verify and wrap up before the hard cap.
@@ -644,20 +930,28 @@ class Agent:
             temp = 0.7 if (self._stale_streak >= 2 or self._hot_turns > 0) else None
             self._hot_turns = max(0, self._hot_turns - 1)
             streamer = _DeltaStreamer(self, iterations) if self.settings.stream else None
+            review_turn = self.review_turn if self.review_turn is not None and self.review_turn.active else None
             step_schemas = schemas
             if self._write_only_steps > 0:
                 self._write_only_steps -= 1
                 step_schemas = [s for s in schemas if s["function"]["name"] in WRITE_TOOLS]
+            def on_delta(kind: str, text: str) -> None:
+                self._check_cancel()
+                if streamer and (review_turn is None or kind != "content"):
+                    streamer.feed(kind, text)
+
             resp = self.chat(self._llm_messages(), step_schemas or None, temperature=temp,
-                             on_delta=streamer.feed if streamer else None,
+                             on_delta=on_delta if streamer or self.deadline is not None else None,
                              **self._turn_thinking())
             if streamer:
                 streamer.flush()
             usage.add(resp.usage)
             msg = resp.to_message()
-            self.sessions.append(self.session_id, msg, meta={"usage": resp.usage.__dict__, "finish": resp.finish_reason})
-            self.emit("assistant.message", content=resp.content[:4000], tool_calls=[
-                {"name": tc.name, "args": _preview_args(tc.arguments)} for tc in resp.tool_calls])
+            meta = {"usage": resp.usage.__dict__, "finish": resp.finish_reason}
+            if resp.tool_calls or review_turn is None:
+                self.sessions.append(self.session_id, msg, meta=meta)
+                self.emit("assistant.message", content=resp.content[:4000], tool_calls=[
+                    {"name": tc.name, "args": _preview_args(tc.arguments)} for tc in resp.tool_calls])
             if resp.tool_calls and resp.finish_reason == "length":
                 # The reply hit the output limit inside a tool call: its arguments are cut off, so it is not run.
                 self._refuse_truncated(msg["tool_calls"], resp.usage.completion_tokens)
@@ -676,7 +970,30 @@ class Agent:
                         "[system] Your reply was cut off at the output limit. Continue exactly where it stopped, without "
                         "repeating it.")}, meta={"length_note": True})
                     continue
-                return iterations, tool_calls, "".join(partial) + strip_tool_markup(resp.content), "completed"
+                text = (resp.content or "").strip()
+                if (not tool_calls and not announce_nudged and not partial and step_schemas and not self.discussion_only
+                        and len(text) < 600 and "```" not in text and ANNOUNCE_ONLY.search(text)):
+                    announce_nudged = True  # it said what it will do, then stopped: once, ask it to do it
+                    self.emit("announce_only.nudged")
+                    self.sessions.append(self.session_id, {"role": "user", "content": (
+                        "[system] You described what you are going to do but made no tool call, so nothing has been "
+                        "done yet. Carry out the task now with your tools; if no action is needed, give your final "
+                        "answer instead.")}, meta={"announce_note": True})
+                    continue
+                final = "".join(partial) + strip_tool_markup(resp.content)
+                if review_turn is not None:
+                    if not conflict_nudged and (open_cards := review_turn.unresolved()):
+                        conflict_nudged = True
+                        ids = ", ".join(c["id"] for c in open_cards)
+                        self.sessions.append(self.session_id, {"role": "user", "content":
+                            f"[system] Disputed evidence remains on {ids}. If it can be checked, delegate an independent "
+                            "review on that card with the deciding source and affected files. Otherwise report what is open."})
+                        continue
+                    final = review_turn.finalize(self, final)
+                    msg["content"] = final
+                    self.sessions.append(self.session_id, msg, meta=meta)
+                    self.emit("assistant.message", content=final[:4000], tool_calls=[])
+                return iterations, tool_calls, final, "completed"
             tool_calls += self._run_tool_calls(msg["tool_calls"])
         tool_calls += self._salvage_deliverables(usage, schemas)
         return iterations, tool_calls, self._wrap_up(usage, "The iteration limit was reached."), "max_iterations"
@@ -768,6 +1085,8 @@ class Agent:
         if not text:
             text = (f"(No final report: {why} The agent stopped before it could summarise; see this session's log "
                     "for what it did.)")
+        if self.review_turn is not None and self.review_turn.active:
+            text = self.review_turn.finalize(self, text, recheck=False)
         self.sessions.append(self.session_id, {"role": "assistant", "content": text})
         return text
 

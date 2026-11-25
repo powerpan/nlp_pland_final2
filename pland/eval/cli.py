@@ -9,7 +9,7 @@ from pathlib import Path
 def add_arguments(parser) -> None:
     sub = parser.add_subparsers(dest="eval_cmd", required=True)
     r = sub.add_parser("run", help="run a task suite (directory, task file, or a built-in suite name)")
-    r.add_argument("suite", help="dev | midterm | final | memory_evolution | <path>")
+    r.add_argument("suite", help="dev | midterm | final | hard | memory_evolution | <path>")
     r.add_argument("--out", help="output directory (default: $PLAND_HOME/eval_runs)")
     r.add_argument("--backend", choices=["local", "docker"], default="local")
     r.add_argument("--memory", choices=["on", "off"], default="on", help="off = ablation without experience/memory")
@@ -18,7 +18,7 @@ def add_arguments(parser) -> None:
     r.add_argument("--model", help="override the model id (e.g. deepseek-v4-pro)")
     r.add_argument("--thinking", dest="thinking", action="store_true", default=None, help="force DeepSeek thinking mode on")
     r.add_argument("--no-thinking", dest="thinking", action="store_false", help="force DeepSeek thinking mode off")
-    r.add_argument("--reasoning", metavar="LEVEL", help="thinking intensity: off|default|low|medium|high|max")
+    r.add_argument("--reasoning", metavar="LEVEL", help="thinking intensity: off|default|minimal|low|medium|high|xhigh|max")
     r.add_argument("--label", default="", help="label appended to the run directory name")
     ls = sub.add_parser("list", help="list built-in suites and their tasks")
     ls.add_argument("suite", nargs="?")

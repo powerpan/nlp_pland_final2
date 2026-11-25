@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 import threading
 import time
 from typing import Any
@@ -27,6 +28,22 @@ PROVIDER_THINKING = {"deepseek": True, "hkgai": True}  # providers that can thin
 
 class _StreamCut(Exception):
     """The stream broke after output had already been delivered; retrying would duplicate it."""
+
+
+class _BadBody(Exception):
+    """A 200 response whose body is not a completion (e.g. a proxy's HTML page); transient, so retried."""
+
+
+# Provider error bodies end up in the ledger, transcripts, events and the UI: never copy key material into them.
+# DeepSeek's 401 body names the key's last characters ("Your api key: ****abcd").
+_KEY_PATTERNS = (re.compile(r"(?i)(api[ _-]?key\s*[:=]?\s*)\*+\w*"), re.compile(r"sk-[A-Za-z0-9_-]{8,}"),
+                 re.compile(r"(?i)(bearer\s+)[A-Za-z0-9._~+/=-]{8,}"))
+
+
+def redact(text: str) -> str:
+    for pat in _KEY_PATTERNS:
+        text = pat.sub(lambda m: (m.group(1) if m.groups() else "") + "[redacted]", text)
+    return text
 
 
 class OpenAICompatClient:
@@ -95,7 +112,11 @@ class OpenAICompatClient:
                 if on_delta is None:
                     resp = self._http.post(self._url, headers=headers, content=json.dumps(payload))
                     if resp.status_code == 200:
-                        return self._parse(resp.json())
+                        try:
+                            data = resp.json()
+                        except ValueError as exc:
+                            raise _BadBody(resp.text[:200]) from exc
+                        return self._parse(data)
                     status, body = resp.status_code, resp.text[:800]
                 else:
                     with self._http.stream("POST", self._url, headers=headers, content=json.dumps(payload)) as resp:
@@ -107,11 +128,14 @@ class OpenAICompatClient:
                 # failures are common on long streams); listeners are told to discard the partial text.
                 last_err = LLMError(f"stream from {self.provider} broke mid-response: {exc}", retryable=True)
                 on_delta("reset", "")
+            except _BadBody as exc:
+                last_err = LLMError(f"{self.provider} returned a non-JSON response (HTTP 200): {redact(str(exc))}",
+                                    status=200, retryable=True)
             except (httpx.TimeoutException, httpx.TransportError) as exc:
-                last_err = LLMError(f"network error talking to {self.provider}: {exc}", retryable=True)
+                last_err = LLMError(f"network error talking to {self.provider}: {redact(str(exc))}", retryable=True)
             else:
                 retryable = status in _RETRY_STATUS
-                last_err = LLMError(f"{self.provider} HTTP {status}: {body}", status=status, retryable=retryable)
+                last_err = LLMError(f"{self.provider} HTTP {status}: {redact(body)}", status=status, retryable=retryable)
                 if not retryable:
                     raise last_err
             if attempt < self.cfg.max_retries:
@@ -128,6 +152,7 @@ class OpenAICompatClient:
         finish = model = None
         usage: dict[str, Any] = {}
         emitted = False
+        chunks = 0
         try:
             for line in resp.iter_lines():
                 if not line or not line.startswith("data:"):
@@ -136,6 +161,7 @@ class OpenAICompatClient:
                 if data == "[DONE]":
                     break
                 chunk = json.loads(data)
+                chunks += 1
                 model = chunk.get("model") or model
                 if chunk.get("usage"):
                     usage = chunk["usage"]
@@ -162,6 +188,8 @@ class OpenAICompatClient:
             if emitted:
                 raise _StreamCut(str(exc)) from exc
             raise httpx.TransportError(str(exc)) from exc
+        if not chunks:  # a 200 that is not an event stream at all (e.g. a proxy's HTML page)
+            raise _BadBody("no stream events in the response")
         message: dict[str, Any] = {"content": "".join(content)}
         if reasoning:
             message["reasoning_content"] = "".join(reasoning)

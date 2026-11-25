@@ -6,15 +6,21 @@ PlanD 是一個能理解自然語言指令、透過規劃與工具調用**實際
 - **需要時進入 Bot Mode**：自行建立任意數量、任意職責的 Bot，和單一 Bot 私聊，或把多個 Bot 與自己放進群組；
   Bot 之間會真正分工、委派、交換資訊並整合成果。
 - **一行指令啟動**：安裝後在任何資料夾輸入 `pland` 即可對話，`pland desktop` 以獨立視窗開啟網頁介面。
+- **Agent 認識自己所在的平台**：問它「你有哪些可配置項」「你如何與團隊協作」「這個平台是什麼」，它會先查內建的平台手冊
+  （唯讀工具 `platform_info`：手冊主題＋由程式產生的設定表與工具清單＋它自己目前的即時狀態）再回答，而不是憑印象猜；
+  見[系統架構說明 2.2 節](docs/ARCHITECTURE.md)。
 - **對話的工作資料夾**：每個對話可以指定自己的資料夾（在專案資料夾內啟動 `pland`、`-w`、`/workspace` 或網頁標題列的資料夾按鈕），
   資料夾存在對話資料中、不靠模型記憶；Bot 的 Bot Chat 每個資料夾一個，不同專案的脈絡不會混在一起。
 - **設定頁與版面**：網頁按 ⌘,（或側欄底部的 Settings）開啟設定頁：外觀、模型、Agent 行為、沙箱與資料夾、運行上限、用量、
   快捷鍵與關於，可搜尋所有設定。在 Model 頁可直接貼上 DeepSeek／HKGAI 的 API 金鑰（先以一次小調用驗證，只寫入 `.env`、
   之後不再顯示）、切換供應商、設定 HKGAI 端點與模型。模型、思考強度、授權、沙箱與上限是所有 Bot 共用的**全域預設**（`~/.pland/settings.yaml`），
   Bot 自己設定過的值優先；側欄可拖曳調整寬度、⌘B 隱藏，右側面板同樣可調寬。
+- **介面語言**：網頁介面可切換 English／繁體中文（設定頁 → Appearance → Language；「自動」跟隨瀏覽器語言）。介面本身與伺服器送出的文字
+  （錯誤訊息、金鑰提示、資料夾檢查結果、群組的系統訊息與委派活動列、範例團隊的說明）都會翻譯；對話訊息、Bot 與群組的名稱保持原樣。
 - **介面風格**：「工作日誌」式設計：紙色底、襯線標題、等寬字標示模型/路徑/狀態、印章式強調色；可切換淺色/深色、四種強調色與字級。
 - **思考強度**：每個 Bot 可設定思考強度，每個對話也能在輸入框右側的選單或 `/reasoning` 臨時切換。DeepSeek 為 off / default / low / medium / high / max；
-  HKGAI 為 off / default / minimal / low / medium / high / xhigh / max（HKGAI 不送等級就不思考，所以 default 送 medium）。
+  HKGAI 為 off / default / low / high / xhigh / max（HKGAI 只靠等級控制思考，default 明確送 high；2026-11-20 起端點不再接受 minimal 與 medium，
+  先前存成這兩個值的設定會送 low）。
 - **Human-in-the-Loop**：指令不清楚或缺少會影響結果的資訊時會先問你；刪檔、`git push` 等重要操作前會請你授權
   （once / session / always / deny，另有選用的 smart 模式以守門模型分流低風險指令）；答覆後從中斷處繼續，程式中斷後也能恢復。
 - **規劃與記憶**：多步驟工作會寫下 `todo` 工作計畫；每個 Agent 有自己的有界筆記、經驗庫（任務後背景反思、依驗證結果演化）、
@@ -83,6 +89,9 @@ pland serve              # 或在前景執行伺服器，自行開啟 http://127
 - **Settings**（⌘,）：外觀、API 金鑰與供應商、全域預設（模型、授權、沙箱、運行上限）、用量與快捷鍵；側欄可拖曳調寬或以 ⌘B 隱藏。
 - 群組中用 `@名稱` 指定對象，`@all` 對全體；在群組上傳的檔案放在共享資料夾 `shared/uploads/`，所有成員都能讀取。
   Bot 需要你時群組會出現 **needs you** 標記。
+- **快速模式**在新群組中預設開啟，可在群組設定中關閉。每個 Bot 維持自己的思考強度，只執行驗收所需的檢查——每個 Shell／Python 指令最多 25 秒、
+  整個團隊合計 90 秒。審查以驗收要求和檔案版本為準，每張卡可複核一次改稿，也可續查一次未完成的審查。設定頁可分別調整步數、首審及改稿時限（預設 16 步、首審 210 秒、改稿 120 秒）。
+  時間用完時，群組會列出已驗證的檔案與尚待檢查的項目。
 - 右側面板顯示任務看板、Bot 的記憶與經驗、工作區檔案；澄清與授權請求以卡片顯示在對話中。
 - 群組標題列的 **Chat / Board** 切換到全寬看板（`#/room/<id>/board`）：To do、In progress、Blocked、Failed、Done 五欄，
   卡片顯示編號、相依任務、負責人與結果摘要，點開看完整說明與結果；隊友正在處理的卡片會標示目前動作。看板唯讀，隨團隊工作即時更新。
@@ -106,6 +115,8 @@ pland team apply requirements-team      # 或在網頁側欄 Bots & groups → T
 
 同時建立兩個群組：**Build team**（五人，主導者 `lead`）與 **Research desk**（`researcher`、`writer`）。
 這些角色只是範本資料（`pland/team_templates/requirements-team.yaml`），系統本身不依賴任何固定角色。
+
+若已有 Mid_Test 格式的角色檔，在「Bot 與群組」的「群組」旁按「匯入團隊」，選擇 `01_role_initialization.md`。檔案的一級標題決定群名，`Agent ID | Role` 表格決定成員，第一列的 Bot 擔任主導者。每個 `## Role (id)` 標題下的程式碼區塊會存為該 Bot 的 SOUL。建好後會直接開啟群聊，可在這裡設定共享資料夾並貼上第一題。同一份設定再匯入會回到原群組，保留對話與記憶。
 
 也可以用 CLI 管理 Bot（它們就是 Profile）：
 
@@ -138,6 +149,8 @@ pland eval run path/to/closed_set/                  # 任意目錄（YAML / JSON
 | hard | 8 | 87.5% | 93.5% | 1980s | $0.65 |
 | memory_evolution 記憶開啟／關閉 | 12／6 | 100%／33.3% | 98.7%／47.4% | 190s／213s | $0.08／$0.06 |
 
+以上是 2026-10-21（`44fa24a`）的正式評測。2026-11-20 審查修正之後在 `7a4c0fd` 各重跑一次：midterm 93.3%、final 100%、hard 87.5%（hard 的失敗是 Agent 第一句話只宣告計畫就結束，已加入防護並重跑該題通過），細節見報告第 1 節。
+
 ## 已知限制
 
 以下是目前的實際邊界，其中標「待修正」的是 2026-10-21 團隊審查發現、經程式碼確認但尚未修正的問題
@@ -145,20 +158,23 @@ pland eval run path/to/closed_set/                  # 任意目錄（YAML / JSON
 
 - **Local 後端的範圍**：Seatbelt 只限制使用者家目錄與 `PLAND_HOME` 內的檔案存取；`/tmp` 等其他位置仍可讀寫，網路也不受限。
   Linux 上沒有 Seatbelt，Local 後端執行的程式可以讀寫使用者帳號能存取的任何檔案。需要強隔離時請用 Docker 後端。
-- **git 工具在沙箱外執行（待修正）**：`git_status`、`git_commit`、`git_push` 在主機上執行 git，而 Agent 可以修改倉庫的
-  `.git/config`；git 會依設定執行指令（例如 `core.fsmonitor`），因此 Agent 有機會藉此在沙箱外執行程式。在完成修正前，
-  請只在信任的倉庫中使用 git 工具，或改用 Docker 後端並避免讓 Agent 使用 git 工具。
-- **推送授權是規則比對（待修正）**：`git push` 會要求授權，但 `git -c … push`、`git send-pack` 等寫法不會觸發。macOS 上沙箱化的
-  shell 使用私有 HOME，拿不到 HTTPS 的憑證助手；但 **`SSH_AUTH_SOCK` 仍會傳進沙箱**（2026-10-24 稽核以真實 Seatbelt 確認），
-  若使用者的 ssh-agent 載有金鑰，Agent 仍可能透過 SSH 遠端推送或連線。Linux 的 Local 後端則會直接使用使用者的憑證。
+- **git 工具在主機上執行**：`git_status`、`git_commit`、`git_push` 在主機上執行 git，才能使用使用者的憑證。Agent 能寫入倉庫的
+  `.git/`，所以這些工具一律停用 hooks 與 `core.fsmonitor`，並在執行前檢查倉庫自己的設定：含會啟動程式的項目（filter、
+  `core.sshCommand`、credential helper、`include.path` 等）就拒絕並說明要移除哪個鍵（2026-11-20 修正）。代價是倉庫的 hooks
+  （包括 pre-commit 與 Git LFS 的 pre-push）不會在 Agent 的提交與推送時執行；仍有「檢查後、執行前」被其他 Bot 改設定的極短空窗。
+- **推送授權是規則比對**：shell 中的 `git push` 會要求授權，`git -c … push`、`git -C … push`、`send-pack`、`http-push`、
+  `sh -c '…'` 包起來的寫法也能辨識（2026-11-20），但透過變數或倉庫別名呼叫仍可能看不出來。macOS 上沙箱化的
+  shell 使用私有 HOME，拿不到 HTTPS 的憑證助手，也拿不到 ssh-agent（`SSH_AUTH_SOCK` 自 2026-11-20 起不再傳入沙箱）。
+  Linux 的 Local 後端沒有 OS 沙箱，指令仍能讀取使用者的 SSH 金鑰檔與憑證。
 - **工作計畫是 Agent 自己維護的清單**：系統不會依實際的工具呼叫自動勾選項目。計畫久未更新時會提醒 Agent 並在介面標示，
   但顯示的進度仍可能落後於實際完成的工作；以交付檔與看板狀態為準。
 - 其他邊界（容器以 root 執行、危險指令偵測可被刻意混淆繞過等）見[架構文件 6.3 節](docs/ARCHITECTURE.md)。
+- 完整的審查紀錄與仍未處理的項目：[2026-11-20 全面審查](docs/AUDIT_2026-11-20.md)、[2026-10-24 審查](docs/AUDIT_2026-10-24.md)。
 
 ## 開發
 
 ```bash
-.venv/bin/python -m pytest -q          # 184 項，全部使用腳本化模型，不需金鑰、不連網（Docker 測試在無 Docker 時跳過）
+.venv/bin/python -m pytest -q          # 409 項，全部使用腳本化模型，不需金鑰、不連網（Docker 測試在無 Docker 時跳過）
 ```
 
 GitHub Actions（`.github/workflows/ci.yml`）在 Python 3.10 與 3.12 上執行 `ruff check`（pyflakes 規則）與同一組測試；
@@ -169,7 +185,8 @@ GitHub Actions（`.github/workflows/ci.yml`）在 Python 3.10 與 3.12 上執行
 | `pland/agent.py` | Agent 執行循環（步數檢查點、截斷與標記處理、交付檔強制、迴圈與無進展護欄、計畫提醒、預算提示） |
 | `pland/workspace.py` | 對話與群組的工作資料夾（驗證、單一來源） |
 | `pland/llm/` | DeepSeek／HKGAI 客戶端、端點護欄、思考強度（`reasoning.py`）、價格 |
-| `pland/tools/` | 檔案、程式執行、網路、git、記憶、HITL、委派與團隊工具 |
+| `pland/tools/` | 檔案、程式執行、網路、git、記憶、HITL、委派與團隊工具，以及 `platform_info`（`about.py`） |
+| `pland/handbook/` | Agent 對平台自身的認識：手冊主題（`*.md`）、由程式產生的設定表與工具清單、即時狀態 |
 | `pland/team/` | 委派、Bot 間訊息、任務看板、群組 Room、團隊範本 |
 | `pland/team_templates/` | 範例團隊（`requirements-team.yaml`） |
 | `pland/memory.py`, `reflection.py` | 筆記、經驗庫、技能、任務後反思 |

@@ -206,6 +206,7 @@ checks:
     assert not bad, "; ".join(bad)
 - id: owner-consulted
   type: python
+  host: true
   code: |
     import json, sqlite3
     shared = path("shared").resolve()
