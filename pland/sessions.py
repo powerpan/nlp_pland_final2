@@ -137,7 +137,7 @@ class SessionStore:
             for r in rows
         ]
 
-    # ----------------------------------------------------------------- search (Hermes-style session_search)
+    # ----------------------------------------------------------------- search (session_search)
     def ensure_index(self) -> None:
         """Backfill the full-text index for databases created before it existed."""
         if self.db.one("SELECT 1 FROM messages_fts LIMIT 1") or not self.db.one("SELECT 1 FROM messages LIMIT 1"):

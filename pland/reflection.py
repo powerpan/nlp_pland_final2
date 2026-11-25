@@ -25,8 +25,11 @@ agent's claims. Return ONLY a JSON object:
   "lessons": ["<=4 short, specific, reusable lessons (what worked, what to avoid, root cause of failures)"],
   "procedure": "short numbered procedure that would solve this kind of task next time, or empty string",
   "tags": ["3-6 lowercase keywords for retrieval"],
-  "memory_notes": ["0-2 durable facts worth keeping in long-term notes (environment, user preferences); usually empty"]
-}"""
+  "memory_notes": ["0-2 durable facts worth keeping in long-term notes (environment, user preferences); usually empty"],
+  "memory_correction": null or {"old_text": "<distinctive substring of ONE existing note that this run's evidence
+                       shows is wrong or obsolete>", "action": "remove" | "replace", "content": "<corrected note if replace>"}
+}
+Only propose a memory_correction when the transcript gives clear evidence against an existing note; otherwise null."""
 
 
 def _digest(agent: "Agent", limit: int = 24000) -> str:
@@ -58,7 +61,7 @@ def _parse(text: str) -> dict:
 
 
 def _reflect_in_context(agent: "Agent", task_text: str, status_note: str, messages: list | None = None):
-    """Hermes-style review: replay the session as-is (same system prompt, tools and history, so the
+    """In-context review: replay the session as-is (same system prompt, tools and history, so the
     provider's prompt cache is reused) and append one reflection request. Returns None if the model
     does not answer with usable JSON, in which case the caller falls back to a separate digest prompt."""
     if agent.role == "subagent":
@@ -67,7 +70,10 @@ def _reflect_in_context(agent: "Agent", task_text: str, status_note: str, messag
     msgs.append({"role": "user", "content": "[reflection request — do not call tools; reply with JSON only]\n"
                  + PROMPT + f"\n\nReflect on the most recent task in this conversation: {task_text[:600]!r}\n{status_note}"})
     schemas = [t.schema() for t in agent.tools.values()] or None
-    resp = agent.chat(msgs, schemas, purpose="reflection", max_tokens=1200)
+    # same thinking setting as the session so the cached prefix (which includes reasoning) still matches;
+    # reasoning shares the output budget, hence the larger cap when thinking is on
+    budget = 4000 if agent.settings.model.thinking else 1200
+    resp = agent.chat(msgs, schemas, purpose="reflection", max_tokens=budget)
     if resp.tool_calls:
         return None
     try:
@@ -85,7 +91,7 @@ def reflect(agent: "Agent", task_text: str, result: "RunResult", messages: list 
             {"role": "system", "content": PROMPT},
             {"role": "user", "content": f"TASK:\n{task_text[:3000]}\n\n{status_note}\n\nTRANSCRIPT:\n{_digest(agent)}\n\nFINAL ANSWER:\n{result.text[:3000]}"},
         ]
-        resp = agent.chat(messages, None, purpose="reflection", json_mode=True, max_tokens=1200)
+        resp = agent.chat(messages, None, purpose="reflection", json_mode=True, max_tokens=1200, thinking=False)
         data = _parse(resp.content)
     else:
         resp, data = got
@@ -105,6 +111,17 @@ def reflect(agent: "Agent", task_text: str, result: "RunResult", messages: list 
     agent.sessions.patch_meta(agent.session_id, fn=lambda m: m.setdefault("feedback", []).append(
         {"used": used, "self_outcome": outcome, "experience": exp.id}))
     notes = NotesMemory(agent.profile)
+    corr = data.get("memory_correction")
+    if isinstance(corr, dict) and corr.get("old_text"):
+        # Self-correction of beliefs: at most one per task, logged like any memory write.
+        try:
+            if corr.get("action") == "replace" and corr.get("content"):
+                notes.replace("memory", str(corr["old_text"]), str(corr["content"]), agent.session_id)
+            elif corr.get("action") == "remove":
+                notes.remove("memory", str(corr["old_text"]), agent.session_id)
+            agent.emit("memory.corrected", action=corr.get("action"), old_text=str(corr["old_text"])[:200])
+        except MemoryError_:
+            pass  # the substring did not identify exactly one note: leave memory untouched
     for note in (data.get("memory_notes") or [])[:2]:
         try:
             notes.add("memory", str(note), agent.session_id)

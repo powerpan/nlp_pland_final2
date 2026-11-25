@@ -138,6 +138,7 @@ CREATE TABLE IF NOT EXISTS events (
     data TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_events_run ON events(run_id);
+CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, id);
 CREATE TABLE IF NOT EXISTS llm_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts REAL NOT NULL,

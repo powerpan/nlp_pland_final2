@@ -113,7 +113,7 @@ def session_search(ctx: ToolContext, a):
     for i, h in enumerate(hits):
         when = _time.strftime("%Y-%m-%d %H:%M", _time.localtime(h["when"]))
         lines = [f"session {h['session_id']} · {h['kind']} · {when} · {h['title'][:80]!r}", f"  match #{h['match_message_id']}: {h['snippet']}"]
-        if i == 0:  # the best hit gets its surrounding context, the rest stay compact (Hermes-style)
+        if i == 0:  # the best hit gets its surrounding context, the rest stay compact
             for m in store.window(h["session_id"], h["match_message_id"], 2):
                 lines.append(f"    #{m['id']} [{m['role']}] {m['text'][:500]}")
         blocks.append("\n".join(lines))

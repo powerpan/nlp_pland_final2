@@ -2,7 +2,7 @@
 
 Three layers, all stored inside the owning profile (never shared implicitly):
 
-1. Bounded notes (`memories/MEMORY.md`, `memories/USER.md`), Hermes-style: short entries
+1. Bounded notes (`memories/MEMORY.md`, `memories/USER.md`): short entries
    separated by `§`, injected into the system prompt as a frozen snapshot at session start and
    edited by the agent through the `memory` tool.
 2. Experiences (`experiences` table): after every task a reflection step distils the outcome,
@@ -17,6 +17,7 @@ All writes are logged in `memory_events` so the evaluation report can show how m
 
 from __future__ import annotations
 
+import json
 import math
 import re
 from collections import Counter
@@ -327,12 +328,46 @@ _FRONT = re.compile(r"^---\s*\n(.*?)\n---\s*\n", re.DOTALL)
 _SKILL_NAME = re.compile(r"^[a-z0-9][a-z0-9_-]{0,47}$")
 
 
+SKILL_TEMPLATE = """## When to Use
+<trigger conditions>
+
+## Procedure
+1. <step>
+
+## Pitfalls
+- <known failure modes and fixes>
+
+## Verification
+<how to confirm it worked>"""
+
+
 class SkillStore:
+    """Agent-written procedures in the SKILL.md style (frontmatter + When to Use / Procedure / Pitfalls /
+    Verification), with usage counters so stale skills can be spotted."""
+
     def __init__(self, profile: "Profile"):
         self.profile = profile
 
-    def list(self) -> list[dict[str, str]]:
+    @property
+    def _usage_path(self) -> Path:
+        return self.profile.skills_dir / ".usage.json"
+
+    def usage(self) -> dict[str, dict[str, Any]]:
+        try:
+            return json.loads(self._usage_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _bump(self, name: str, key: str) -> None:
+        data = self.usage()
+        entry = data.setdefault(name, {"views": 0, "saves": 0})
+        entry[key] = entry.get(key, 0) + 1
+        entry["last_" + key[:-1]] = now()
+        self._usage_path.write_text(json.dumps(data, indent=1), encoding="utf-8")
+
+    def list(self) -> list[dict[str, Any]]:
         out = []
+        usage = self.usage()
         for path in sorted(self.profile.skills_dir.glob("*.md")):
             text = path.read_text(encoding="utf-8")
             desc = ""
@@ -341,13 +376,15 @@ class SkillStore:
                 for line in m.group(1).splitlines():
                     if line.startswith("description:"):
                         desc = line.split(":", 1)[1].strip()
-            out.append({"name": path.stem, "description": desc})
+            u = usage.get(path.stem, {})
+            out.append({"name": path.stem, "description": desc, "views": u.get("views", 0), "saves": u.get("saves", 0)})
         return out
 
     def view(self, name: str) -> str:
         path = self.profile.skills_dir / f"{name}.md"
         if not path.is_file():
             raise KeyError(f"no skill named {name!r}")
+        self._bump(name, "views")
         return path.read_text(encoding="utf-8")
 
     def save(self, name: str, description: str, content: str, session_id: str | None = None) -> str:
@@ -356,5 +393,6 @@ class SkillStore:
         path = self.profile.skills_dir / f"{name}.md"
         existed = path.exists()
         path.write_text(f"---\nname: {name}\ndescription: {description.strip()}\n---\n\n{content.strip()}\n", encoding="utf-8")
+        self._bump(name, "saves")
         _log(self.profile, "skill", "replace" if existed else "add", {"name": name, "description": description}, session_id)
         return f"Skill '{name}' {'updated' if existed else 'saved'}."
